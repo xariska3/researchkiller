@@ -1,5 +1,6 @@
-# Runtime outputs: created by `rk`, never committed
-data/
+# Runtime outputs: created by `rk`, never committed (/data/ is the repo root's
+# data folder only; src/rk/data/ holds committed package data)
+/data/
 runs/
 mlruns/
 mlartifacts/

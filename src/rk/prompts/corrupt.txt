@@ -1,0 +1,17 @@
+You are helping to test a reviewer that checks whether research proposals match published papers.
+
+Below are the title and abstract of a paper and a research proposal that describes it faithfully. Rewrite the proposal with exactly one deliberate change, described below, and keep everything else as it is.
+
+Change: $change
+
+Rules:
+- Keep the style and length of the proposal: 2 to 4 sentences and 40 to 120 words of plain prose.
+- Make the change clearly, but keep the rewritten proposal plausible.
+- Do not mention that anything was changed.
+- Output only the rewritten proposal: no heading, no quotation marks, no commentary.
+
+Title: $title
+
+Abstract: $abstract
+
+Proposal: $proposal

@@ -3,10 +3,12 @@
 For each target the paraphraser writes a terminology-shifted research proposal
 from the title and abstract. A length check and a deterministic lexical-leak
 filter run first; then the judge (another model family) checks the two
-directions of equivalence in two separate calls. The first failing check is
-the rejection reason, and the next attempt's prompt quotes it. Every attempt is
+directions of equivalence in two separate calls, facet by facet (problem,
+method, domain or population, main claim). The first failing check is the
+rejection reason, and the next attempt's prompt quotes it. Every attempt is
 appended to test_a.jsonl (accepted) or rejections.jsonl (rejected) as it
 happens, which is also what makes a rerun resume where the last one stopped.
+validate_judge measures the judge on accepted pairs and deliberate corruptions.
 """
 
 from __future__ import annotations
@@ -26,13 +28,28 @@ from rk.config import Config
 from rk.corpus import CORPUS_FILE, load_frozen_corpus
 from rk.llm import ChatModel, Completion, Prompt, Usage, load_prompt, parse_json
 from rk.targets import Record, id_number
-from rk.text import STOPWORDS, content_stems, content_tokens, extract_acronyms, stem
+from rk.text import (
+    STOPWORDS,
+    content_stems,
+    content_tokens,
+    extract_acronyms,
+    find_domain_entities,
+    mask_domain_entities,
+    stem,
+)
 
 PROMPT_NAMES = ("paraphrase", "judge_captures", "judge_adds_nothing")
 MIN_SENTENCES, MAX_SENTENCES = 2, 4
 MIN_WORDS, MAX_WORDS = 40, 120
 IDF_TOP_TERMS = 20
 JUDGE_DIRECTIONS = ("captures", "adds_nothing")
+FACETS = ("problem", "method", "domain", "claim")  # the judge compares these one by one
+FACET_LABELS = {
+    "problem": "problem",
+    "method": "method",
+    "domain": "domain or population",
+    "claim": "main claim",
+}
 
 ACCEPTED_FILE = "test_a.jsonl"
 REJECTIONS_FILE = "rejections.jsonl"
@@ -149,6 +166,9 @@ class LeakFilter:
     4. more than a fraction max_overlap of the abstract's top-20 IDF stems;
     5. content-stem Jaccard with title + abstract above max_jaccard, generic
        science words excluded on both sides (text.is_generic).
+    Named languages, nationalities, countries and regions (rk/data/
+    domain_entities.txt) are blanked out of proposal, title and abstract first:
+    a proposal may keep them, and they never count as leaked terms.
     """
 
     def __init__(self, corpus: Iterable[Record], *, max_overlap: float, max_jaccard: float):
@@ -178,6 +198,7 @@ class LeakFilter:
     def check(
         self, proposal: str, title: str, abstract: str
     ) -> tuple[Rejection | None, dict[str, Any]]:
+        proposal, title, abstract = map(mask_domain_entities, (proposal, title, abstract))
         own_acronyms = extract_acronyms(proposal)
 
         source = set(extract_acronyms(title)) | set(extract_acronyms(abstract))
@@ -250,19 +271,59 @@ class LeakFilter:
         return None, stats
 
 
-def parse_verdict(text: str) -> dict[str, str] | None:
-    """{"verdict": "yes"|"no", "reason": ...} from a judge reply, or None if unreadable."""
+def _yes_no(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip().lower() in ("yes", "no"):
+        return value.strip().lower()
+    return None
+
+
+def _text(value: Any) -> str:
+    return value if isinstance(value, str) else ""
+
+
+def parse_judgment(text: str) -> dict[str, Any] | None:
+    """A facet-by-facet judge reply, or None if it can't be read.
+
+    Returns {"verdict", "failed", "match", "facets", "judge_verdict", "reason"}.
+    `verdict` is "yes" only if the judge answered yes AND every facet in FACETS
+    matched: a facet marked "no" rejects, whatever the judge concluded. A reply
+    without a yes/no for every facet and for the verdict is unreadable.
+    """
     try:
         data = parse_json(text)
     except ValueError:
         return None
-    if not isinstance(data, dict):
+    if not isinstance(data, dict) or not isinstance(data.get("match"), dict):
         return None
-    verdict = data.get("verdict")
-    if not isinstance(verdict, str) or verdict.strip().lower() not in ("yes", "no"):
+    match: dict[str, dict[str, str]] = {}
+    for facet in FACETS:
+        entry = data["match"].get(facet)
+        value = _yes_no(entry.get("match")) if isinstance(entry, dict) else None
+        if value is None:
+            return None
+        match[facet] = {"match": value, "reason": _text(entry.get("reason"))}
+    judge_verdict = _yes_no(data.get("verdict"))
+    if judge_verdict is None:
         return None
-    reason = data.get("reason")
-    return {"verdict": verdict.strip().lower(), "reason": reason if isinstance(reason, str) else ""}
+    failed = [facet for facet in FACETS if match[facet]["match"] == "no"]
+    facets = data.get("facets")
+    return {
+        "verdict": "yes" if judge_verdict == "yes" and not failed else "no",
+        "failed": failed,
+        "match": match,
+        "facets": facets if isinstance(facets, dict) else None,
+        "judge_verdict": judge_verdict,
+        "reason": _text(data.get("reason")),
+    }
+
+
+def judge_proposal(
+    judge: ChatModel, prompt: Prompt, title: str, abstract: str, proposal: str
+) -> tuple[dict[str, Any] | None, Completion]:
+    """One directional judge call: the parsed judgment (None if unreadable) and the reply."""
+    text = prompt.render(title=title, abstract=abstract, proposal=proposal)
+    reply = judge.complete([{"role": "user", "content": text}])
+    return parse_judgment(reply.text), reply
 
 
 @dataclass
@@ -276,9 +337,22 @@ class Attempt:
 
 
 _JUDGE_NO = {
-    "captures": "a reviewer found that it does not capture the paper's problem, method and claim",
-    "adds_nothing": "a reviewer found that it adds something the paper does not support",
+    "captures": "a reviewer found that it does not keep the paper's",
+    "adds_nothing": "a reviewer found that it changes or adds to the paper's",
 }
+
+
+def judge_rejection(direction: str, judgment: dict[str, Any]) -> Rejection:
+    """The rejection for a "no", naming each failed facet with the judge's reason."""
+    if judgment["failed"]:
+        names = ", ".join(FACET_LABELS[f] for f in judgment["failed"])
+        reasons = "; ".join(
+            f"{FACET_LABELS[f]}: {judgment['match'][f]['reason']}" for f in judgment["failed"]
+        )
+        message = f"{_JUDGE_NO[direction]} {names} ({reasons})"
+    else:  # every facet matched, but the judge still said no
+        message = f"{_JUDGE_NO[direction]} research idea ({judgment['reason']})"
+    return Rejection(f"judge_{direction}", message)
 
 
 def run_attempt(
@@ -300,7 +374,9 @@ def run_attempt(
             f"\nYour previous proposal was rejected because {previous}. "
             "Write a new proposal that fixes this and follows all the rules.\n"
         )
-    prompt = prompts["paraphrase"].render(title=title, abstract=abstract, feedback=feedback)
+    prompt = prompts["paraphrase"].render(
+        title=title, abstract=abstract, keep=keep_names_line(title), feedback=feedback
+    )
     completion = paraphraser.complete(
         [{"role": "user", "content": prompt}], seed=base_seed + attempt
     )
@@ -314,26 +390,31 @@ def run_attempt(
     verdicts: dict[str, Any] = {}
     if rejection is None:
         for direction in JUDGE_DIRECTIONS:  # separate calls: one answer can't anchor the other
-            judge_prompt = prompts[f"judge_{direction}"].render(
-                title=title, abstract=abstract, proposal=query
+            judgment, reply = judge_proposal(
+                judge, prompts[f"judge_{direction}"], title, abstract, query
             )
-            reply: Completion = judge.complete([{"role": "user", "content": judge_prompt}])
             usage["judge"] = usage["judge"] + reply.usage
             providers["judge"].append(reply.provider)
-            verdict = parse_verdict(reply.text)
-            if verdict is None:
+            if judgment is None:
                 verdicts[direction] = {"verdict": None, "raw": reply.text[:500]}
                 rejection = Rejection(
                     "judge_parse_error", "the reviewer's answer about it could not be read"
                 )
                 break
-            verdicts[direction] = verdict
-            if verdict["verdict"] == "no":
-                rejection = Rejection(
-                    f"judge_{direction}", f"{_JUDGE_NO[direction]} ({verdict['reason']})"
-                )
+            verdicts[direction] = judgment
+            if judgment["verdict"] == "no":
+                rejection = judge_rejection(direction, judgment)
                 break
     return Attempt(query, rejection, {**length_stats, **leak_stats}, verdicts, usage, providers)
+
+
+def keep_names_line(title: str) -> str:
+    """The paraphrase prompt's line naming the title's languages and places, or ""."""
+    names = find_domain_entities(title)
+    if not names:
+        return ""
+    pronoun = "it" if len(names) == 1 else "them"
+    return f"\nThe title names {', '.join(names)}: the proposal must keep {pronoun}.\n"
 
 
 def make_bench(
@@ -504,6 +585,11 @@ def bench_stats(
         if t not in accepted_ids and n >= cfg.bench.max_attempts_per_target
     ]
     reasons = Counter(r["reason"] for r in [*rejected_rows, *skip_rows])
+    failed_facets = {d: Counter[str]() for d in JUDGE_DIRECTIONS}
+    for r in rejected_rows:
+        if r["reason"] in (f"judge_{d}" for d in JUDGE_DIRECTIONS):
+            direction = r["reason"].removeprefix("judge_")
+            failed_facets[direction].update(r["judge_verdicts"][direction].get("failed", []))
     usage = {
         role: sum((Usage(**r["usage"][role]) for r in rows), Usage())
         for role in ("paraphraser", "judge")
@@ -521,6 +607,9 @@ def bench_stats(
         "rejected_by_reason": {reason: reasons[reason] for reason in REASONS},
         "attempts": len(rows),
         "exhausted": len(exhausted),
+        "judge_failed_facets": {  # per direction: judge rejections naming each facet
+            d: {f: failed_facets[d][f] for f in FACETS} for d in JUDGE_DIRECTIONS
+        },
         "skipped": len(skip_rows),  # targets that aren't research contributions
         "attempts_per_target": dict(sorted(per_target.items(), key=lambda kv: id_number(kv[0]))),
         "llm_usage": {role: dataclasses.asdict(u) for role, u in usage.items()},
@@ -577,3 +666,150 @@ def format_accepted(cfg: Config) -> str:
             f"  proposal: {row['query']}\n"
         )
     return "\n".join(blocks) if blocks else "(no accepted queries yet)\n"
+
+
+# --- judge validation ----------------------------------------------------------
+
+JUDGE_VALIDATION_DIR = Path("data/judge_validation")
+
+# One deliberate change each; the paraphraser applies them (prompts/corrupt.txt).
+CORRUPTIONS = {
+    "domain": (
+        "Move the work to a different domain or population, for example another language, "
+        "region, application field, data source or user group. Keep the problem, the method "
+        "and the main claim."
+    ),
+    "method": (
+        "Replace the method with a different but plausible method for the same problem. Keep "
+        "the problem, the domain or population and the main claim."
+    ),
+    "claim": (
+        "Reverse the main claim, or replace it with a clearly different claim. Keep the "
+        "problem, the method and the domain or population."
+    ),
+    "generalised": (
+        "Make the whole proposal so general that it no longer identifies this work: describe "
+        "the problem, method, domain and claim only in broad terms that would fit many papers "
+        "in the same field."
+    ),
+}
+VARIANTS = ("original", *CORRUPTIONS)
+
+
+def validate_judge(
+    cfg: Config,
+    paraphraser: ChatModel,
+    judge: ChatModel,
+    *,
+    n: int,
+    out_dir: Path = JUDGE_VALIDATION_DIR,
+) -> dict[str, Any]:
+    """Measure the judge on accepted pairs and on deliberate corruptions of them.
+
+    Takes the first `n` accepted queries of bench.out_dir in qid order. For each,
+    the paraphraser rewrites the proposal once per CORRUPTIONS entry, with exactly
+    that change; the judge then answers both directions (always both, to see which
+    one catches what) for the original and every corruption. A variant counts as
+    accepted only if both say yes. Writes pairs.jsonl, corruptions.jsonl,
+    verdicts.jsonl and summary.json to out_dir, replacing earlier ones (the LLM
+    cache makes a rerun free).
+
+    The originals passed this judge in make-bench, so with unchanged prompts and
+    models they are accepted by construction; the informative numbers are the
+    corruptions' rejection rates.
+    """
+    corpus, _, _ = load_frozen_corpus(cfg.corpus.out_dir)
+    by_id = {r["id"]: r for r in corpus}
+    accepted = sorted(_read_jsonl(cfg.bench.out_dir / ACCEPTED_FILE), key=lambda r: r["qid"])
+    if not accepted:
+        raise BenchError(
+            f"no accepted queries in {cfg.bench.out_dir}: run `python -m rk make-bench` first"
+        )
+    prompts = load_prompts()
+    corrupt = load_prompt("corrupt")
+    usage = {"paraphraser": Usage(), "judge": Usage()}
+    pairs: list[dict[str, Any]] = []
+    corruptions: list[dict[str, Any]] = []
+    verdicts: list[dict[str, Any]] = []
+    for row in accepted[:n]:
+        record = by_id[row["target_id"]]
+        title, abstract, original = record["title"], record["abstract"], row["query"]
+        ids = {"qid": row["qid"], "target_id": row["target_id"]}
+        pairs.append({**ids, "title": title, "proposal": original})
+        variants = {"original": original}
+        for kind, change in CORRUPTIONS.items():
+            text = corrupt.render(title=title, abstract=abstract, proposal=original, change=change)
+            reply = paraphraser.complete([{"role": "user", "content": text}])
+            usage["paraphraser"] += reply.usage
+            variants[kind] = clean_proposal(reply.text)
+            unchanged = variants[kind] == original  # the paraphraser ignored the instruction
+            corruptions.append(
+                {**ids, "kind": kind, "proposal": variants[kind], "unchanged": unchanged}
+            )
+        for variant, proposal in variants.items():
+            judgments: dict[str, Any] = {}
+            for direction in JUDGE_DIRECTIONS:
+                judgment, reply = judge_proposal(
+                    judge, prompts[f"judge_{direction}"], title, abstract, proposal
+                )
+                usage["judge"] += reply.usage
+                judgments[direction] = judgment or {"verdict": None, "raw": reply.text[:500]}
+            verdicts.append(
+                {
+                    **ids,
+                    "variant": variant,
+                    "proposal": proposal,
+                    "accepted": all(j["verdict"] == "yes" for j in judgments.values()),
+                    "judgments": judgments,
+                }
+            )
+
+    total = usage["paraphraser"] + usage["judge"]
+    by_variant = {v: [r for r in verdicts if r["variant"] == v] for v in VARIANTS}
+    summary = {
+        "bench_dir": str(cfg.bench.out_dir),
+        "n_pairs": len(pairs),
+        "variants": {v: _variant_stats(rows) for v, rows in by_variant.items()},
+        "unchanged_corruptions": dict(Counter(c["kind"] for c in corruptions if c["unchanged"])),
+        "corruption_instructions": CORRUPTIONS,
+        "prompt_hashes": {**{k: p.sha256 for k, p in prompts.items()}, "corrupt": corrupt.sha256},
+        "models": {"paraphraser": cfg.paraphraser.name, "judge": cfg.judge.name},
+        "llm_usage": {role: dataclasses.asdict(u) for role, u in usage.items()},
+        "method_cost": total.method_cost,
+        "money_spent": total.money_spent,
+    }
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for name, rows in (
+        ("pairs.jsonl", pairs),
+        ("corruptions.jsonl", corruptions),
+        ("verdicts.jsonl", verdicts),
+    ):
+        text = "".join(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n" for r in rows)
+        (out_dir / name).write_text(text, encoding="utf-8", newline="\n")
+    (out_dir / "summary.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return summary
+
+
+def _variant_stats(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Acceptance and rejection counts of one variant, with what the judge flagged."""
+    n = len(rows)
+    accepted = sum(r["accepted"] for r in rows)
+    flagged: Counter[str] = Counter()
+    for r in rows:  # each variant counts once per facet, whichever direction flagged it
+        flagged.update({f for j in r["judgments"].values() for f in j.get("failed", [])})
+    return {
+        "n": n,
+        "accepted": accepted,
+        "rejected": n - accepted,
+        "acceptance_rate": accepted / n if n else None,
+        "rejection_rate": (n - accepted) / n if n else None,
+        "rejected_by_direction": {
+            d: sum(r["judgments"][d]["verdict"] != "yes" for r in rows) for d in JUDGE_DIRECTIONS
+        },
+        "unreadable": sum(
+            any(j["verdict"] is None for j in r["judgments"].values()) for r in rows
+        ),
+        "flagged_facets": {f: flagged[f] for f in FACETS},
+    }

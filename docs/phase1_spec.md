@@ -24,6 +24,7 @@ researchkiller/
 ¦   +-- config.py         # YAML -> dataclasses
 ¦   +-- llm.py            # OpenAI-compatible client, cache, cost ledger, prompt loading
 ¦   +-- prompts/          # versioned prompt templates (*.txt)
+¦   +-- data/             # curated lists (domain_entities.txt)
 ¦   +-- text.py           # tokenising, stemming, stopwords, acronyms
 ¦   +-- corpus.py         # OpenAlex client, corpus build, dedupe, freeze
 ¦   +-- targets.py        # target selection
@@ -160,11 +161,18 @@ reason:
 1. **Paraphraser** gets the title and abstract and writes a research
    *proposal* (as if written before the work) with the same research question,
    method and claimed contribution, using different terminology. No model,
-   dataset or method names, no acronyms, no title words. Attempt `a` (from 0)
+   dataset, method or organisation names, no acronyms, no title words, with one
+   exception: a language, nationality, country or region the title names must
+   be kept (the prompt lists the ones found in the title). These named domain
+   entities come from a curated list, `src/rk/data/domain_entities.txt`
+   (matched whole-word and case-insensitively, except all-caps names and
+   names marked `=` because they are also common words). Attempt `a` (from 0)
    uses seed `paraphraser.seed + a`, so every attempt has its own cache key,
    and every retry prompt includes the previous attempt's rejection reason.
 2. **Length**: 2–4 sentences and 40–120 words, else `length`.
-3. **Lexical-leak filter** (deterministic), in this order:
+3. **Lexical-leak filter** (deterministic). Named domain entities are first
+   blanked out of proposal, title and abstract, so keeping one is never a
+   leak. Then, in this order:
    1. any acronym/named artefact in the proposal at all (`acronym_in_paraphrase`)
    2. any acronym/named artefact from the title or abstract, case-insensitive
       (`source_acronym`; ones spelling a stopword, like "IT" or "US", are skipped)
@@ -177,15 +185,38 @@ reason:
       generic science words excluded on both sides with the same rule as in
       3 (`content_jaccard`)
 4. **Equivalence filter**: the **judge** model (different family) answers
-   each direction in a **separate call**, so one answer can't anchor the other,
-   as JSON `{"verdict": "yes"|"no", "reason": "..."}`:
-   - Does the proposal capture the original's core problem, method and claim?
-     (`judge_captures` on "no")
-   - Does the proposal add nothing the original doesn't support?
-     (`judge_adds_nothing` on "no"; not asked after a first "no")
-   An unreadable answer is a rejection (`judge_parse_error`), never a pass.
-   **Never use embedding similarity as the filter**: it would keep only
-   paraphrases dense retrieval handles well and bias the benchmark.
+   each direction in a **separate call**, so one answer can't anchor the
+   other. In each call it first describes four facets of the paper and of the
+   proposal (problem; method; domain or population, including language or
+   region; main claim), then compares them facet by facet, and answers JSON
+   `{"facets": ..., "match": {facet: {"match": "yes"|"no", "reason"}}, "verdict",
+   "reason"}`:
+   - Does the proposal keep each facet? "no" if one is left out, changed, or
+     stated so generally that it no longer identifies the paper
+     (`judge_captures`).
+   - Does the proposal change or add to any facet? (`judge_adds_nothing`; not
+     asked after a first "no").
+   The verdict is "yes" only if the judge says yes **and** every facet
+   matches; a facet marked "no" rejects whatever the judge concluded, and the
+   rejection message (quoted in the retry prompt) names each failed facet with
+   its reason. A reply without a yes/no for every facet and the verdict is a
+   rejection (`judge_parse_error`), never a pass. `stats.json` counts judge
+   rejections per facet (`judge_failed_facets`). **Never use embedding
+   similarity as the filter**: it would keep only paraphrases dense retrieval
+   handles well and bias the benchmark.
+
+**Judge validation** (`python -m rk validate-judge --config ... --n 30`): for
+the first N accepted pairs (qid order), the paraphraser writes four
+corruptions of the proposal (`prompts/corrupt.txt`), each with exactly one
+change: a different domain or population, a different method, a reversed or
+different main claim, or so general it no longer identifies the work. The
+judge answers both directions for the originals and the corruptions (a
+variant passes only if both say yes). Outputs in `data/judge_validation/`:
+`pairs.jsonl`, `corruptions.jsonl`, `verdicts.jsonl` and `summary.json`
+(acceptance rate on originals, rejection rate per corruption type, which
+direction and facet caught it, cost). The originals passed this judge in
+make-bench, so they are accepted by construction; the corruptions' rejection
+rates are what measure the judge.
 
 A qid is the target's position in the seeded visiting order plus its id
 (`A0007-W123`), so sorting by qid gives the seeded order and the first N
@@ -276,6 +307,7 @@ dtype or max sequence length differs from the index's.
 python -m rk build-corpus  --config configs/phase1.yaml [--max-works N]
 python -m rk build-index   --config ...
 python -m rk make-bench    --config ... [--limit N] [--show]
+python -m rk validate-judge --config ... [--n 30] [--out-dir data/judge_validation]
 python -m rk run           --config ... [--configs B1,B4,B5] [--limit N] [--run-dir runs/<timestamp>] [--retry-errors]
 python -m rk report        runs/<timestamp>
 ```

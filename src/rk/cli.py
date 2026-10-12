@@ -11,7 +11,13 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from rk.bench import BenchError, format_accepted, make_bench
+from rk.bench import (
+    JUDGE_VALIDATION_DIR,
+    BenchError,
+    format_accepted,
+    make_bench,
+    validate_judge,
+)
 from rk.config import ConfigError, load_config
 from rk.corpus import CorpusError, OpenAlexClient, OpenAlexError, build_corpus
 from rk.evaluate import CONFIG_ORDER, SUMMARY_MD, EvalError, report, run_eval
@@ -77,6 +83,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--show",
         action="store_true",
         help="print title, abstract opening and proposal for each accepted target",
+    )
+
+    validate = sub.add_parser(
+        "validate-judge",
+        help="measure the judge on accepted pairs and on deliberately corrupted proposals",
+    )
+    validate.add_argument("--config", type=Path, required=True)
+    validate.add_argument(
+        "--n", type=_positive_int, default=30, help="use the first N accepted pairs (default 30)"
+    )
+    validate.add_argument(
+        "--out-dir",
+        type=Path,
+        default=JUDGE_VALIDATION_DIR,
+        help=f"where to write the results (default {JUDGE_VALIDATION_DIR})",
     )
 
     run = sub.add_parser("run", help="evaluate retrieval configurations on the benchmark")
@@ -153,6 +174,32 @@ def make_bench_command(config_path: Path, limit: int | None, show: bool) -> int:
     return 0
 
 
+def validate_judge_command(config_path: Path, n: int, out_dir: Path) -> int:
+    cfg = load_config(config_path)
+    with ExitStack() as stack:
+        cache = stack.enter_context(LLMCache(cfg.run.cache_path))
+        ledger = stack.enter_context(
+            Ledger(cfg.run.cache_path, cfg.run.budget_cap, command="validate-judge")
+        )
+        paraphraser = stack.enter_context(closing(LLMClient(cfg.paraphraser, cache, ledger)))
+        judge = stack.enter_context(closing(LLMClient(cfg.judge, cache, ledger)))
+        summary = validate_judge(cfg, paraphraser, judge, n=n, out_dir=out_dir)
+    lines = [f"rk validate-judge: {summary['n_pairs']} pairs from {summary['bench_dir']}"]
+    for variant, s in summary["variants"].items():
+        verb, count, rate = (
+            ("accepted", s["accepted"], s["acceptance_rate"])
+            if variant == "original"
+            else ("rejected", s["rejected"], s["rejection_rate"])
+        )
+        lines.append(f"  {variant:12} {verb} {count}/{s['n']} ({rate:.0%})")
+    lines.append(
+        f"method cost ${summary['method_cost']:.4f}, money spent ${summary['money_spent']:.4f}; "
+        f"outputs in {out_dir}"
+    )
+    print("\n".join(lines))
+    return 0
+
+
 def run_command(
     config_path: Path,
     configs: list[str] | None,
@@ -200,6 +247,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return build_index_command(args.config)
         if args.command == "make-bench":
             return make_bench_command(args.config, args.limit, args.show)
+        if args.command == "validate-judge":
+            return validate_judge_command(args.config, args.n, args.out_dir)
         if args.command == "run":
             return run_command(
                 args.config, args.configs, args.limit, args.run_dir, args.retry_errors

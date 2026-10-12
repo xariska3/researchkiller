@@ -1,6 +1,6 @@
-You are checking whether a research proposal captures a paper.
+You are checking, facet by facet, whether a research proposal keeps a paper's research idea.
 
-Question: does the proposal capture the paper's core research problem, its method and its main claimed contribution? The proposal deliberately uses different wording and was written as if before the work was done, so judge the meaning only. Answer "yes" only if all three (problem, method, claim) are there.
+The proposal deliberately uses different words and leaves out the names of models, datasets, methods and organisations, and it was written as a plan before the work was done, so its claim is an aim or expectation. Judge meaning, not wording: a method described without its name is the same method.
 
 Paper title: $title
 
@@ -8,5 +8,18 @@ Paper abstract: $abstract
 
 Proposal: $proposal
 
-Answer with JSON only, in exactly this form, where verdict is "yes" or "no":
-{"verdict": "yes", "reason": "one short sentence"}
+Step 1. Describe four facets of the paper and of the proposal, each in at most 15 words:
+- problem: the research problem or question
+- method: the method or approach
+- domain: the domain or population studied, including any language, region, data source or user group
+- claim: the main claimed contribution or finding
+
+Step 2. For each facet, does the proposal keep the paper's facet? Answer "no" if the proposal leaves it out, changes it, or states it so generally that it would fit many other papers and no longer identifies this one.
+
+Step 3. The verdict is "yes" only if all four facets are "yes".
+
+Answer with JSON only, in exactly this form, where each "match" and the "verdict" are "yes" or "no":
+{"facets": {"problem": {"paper": "...", "proposal": "..."}, "method": {"paper": "...", "proposal": "..."}, "domain": {"paper": "...", "proposal": "..."}, "claim": {"paper": "...", "proposal": "..."}},
+ "match": {"problem": {"match": "yes", "reason": "..."}, "method": {"match": "yes", "reason": "..."}, "domain": {"match": "yes", "reason": "..."}, "claim": {"match": "yes", "reason": "..."}},
+ "verdict": "yes",
+ "reason": "one short sentence"}

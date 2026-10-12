@@ -1,5 +1,6 @@
 """Text utilities: tokenising, stopwords, generic-science words, a crude stemmer,
-acronym extraction, title normalisation and OpenAlex abstract reconstruction.
+acronym extraction, named domain entities, title normalisation and OpenAlex
+abstract reconstruction.
 
 Everything here is deterministic and dependency-free so the lexical-leak filter
 and the corpus builder give identical results on every run.
@@ -7,11 +8,13 @@ and the corpus builder give identical results on every run.
 
 from __future__ import annotations
 
+import functools
 import html
 import itertools
 import re
 import unicodedata
 from collections.abc import Mapping, Sequence
+from importlib import resources
 
 STOPWORDS: frozenset[str] = frozenset({
     "a", "about", "above", "across", "after", "again", "against", "ain", "al", "all", "also",
@@ -210,6 +213,51 @@ def extract_acronyms(text: str) -> list[str]:
             if whole and (any(forms) or any(p.isdigit() for p in parts[1:])):
                 found.add(token)
     return sorted(found)
+
+
+@functools.lru_cache(maxsize=1)
+def domain_entities() -> tuple[str, ...]:
+    """Languages, nationalities, countries and regions from rk/data/domain_entities.txt.
+
+    A leading "=" in the file (kept here) marks a name matched only as written.
+    """
+    path = resources.files("rk").joinpath("data").joinpath("domain_entities.txt")
+    text = path.read_text(encoding="utf-8")
+    lines = (line.split("#", 1)[0].strip() for line in text.splitlines())
+    return tuple(line for line in lines if line)
+
+
+@functools.lru_cache(maxsize=1)
+def _domain_entity_re() -> re.Pattern[str]:
+    alternatives = []
+    for entry in sorted(domain_entities(), key=len, reverse=True):  # "South Africa" before "Africa"
+        name = entry.removeprefix("=")
+        body = r"\s+".join(re.escape(word) for word in name.split())
+        exact = entry.startswith("=") or name.isupper()
+        alternatives.append(body if exact else f"(?i:{body})")
+    return re.compile(r"(?<!\w)(?:" + "|".join(alternatives) + r")s?(?!\w)")
+
+
+def find_domain_entities(text: str) -> list[str]:
+    """Named languages, nationalities, countries and regions in `text`, first mention first.
+
+    Whole words only ("TurkColBERT" names a model, not Turkish); repeats that
+    differ only in case or a plural "s" are listed once.
+    """
+    found: dict[str, str] = {}
+    for match in _domain_entity_re().finditer(text):
+        name = " ".join(match.group().split())
+        found.setdefault(name.lower().removesuffix("s"), name)
+    return list(found.values())
+
+
+def mask_domain_entities(text: str) -> str:
+    """`text` with every named language, nationality, country and region blanked out.
+
+    The lexical-leak filter runs on masked text, so a proposal may keep the
+    language or region its paper names.
+    """
+    return _domain_entity_re().sub(" ", text)
 
 
 def normalize_title(title: str | None) -> str:

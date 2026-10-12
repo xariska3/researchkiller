@@ -1,0 +1,433 @@
+# Named domain entities: languages, nationalities, countries and regions.
+#
+# A proposal must keep these when the paper's title names them (a Turkish
+# retrieval paper is about Turkish), so the lexical-leak filter ignores them
+# (rk.text.mask_domain_entities). Model, dataset, method and organisation
+# names are NOT listed here and stay banned.
+#
+# Format: one name per line; '#' starts a comment. Matching is
+# case-insensitive and takes whole words (an optional plural "s" too), so
+# "TurkColBERT" doesn't match "Turk...". Exceptions, matched only as written:
+# all-caps names (US, UK) and names marked with a leading "=" because they are
+# also common lower-case words ("polish", "turkey", "china").
+
+# --- languages and language groups ---
+Afrikaans
+Albanian
+Amharic
+Arabic
+Armenian
+Assamese
+Azerbaijani
+Bangla
+Bantu
+Basque
+Belarusian
+Bengali
+Bosnian
+Bulgarian
+Burmese
+Cantonese
+Catalan
+Cebuano
+Celtic
+Chinese
+Croatian
+Czech
+Danish
+Dravidian
+Dutch
+English
+Esperanto
+Estonian
+Farsi
+Filipino
+Finnish
+French
+Galician
+Georgian
+German
+Germanic
+Greek
+Gujarati
+Hausa
+Hawaiian
+Hebrew
+Hindi
+Hmong
+Hungarian
+Icelandic
+Igbo
+Indic
+Indonesian
+Irish
+Italian
+Japanese
+Javanese
+Kannada
+Kazakh
+Khmer
+Kinyarwanda
+Korean
+Kurdish
+Kyrgyz
+Lao
+=Latin
+Latvian
+Lithuanian
+Luxembourgish
+Macedonian
+Malagasy
+Malay
+Malayalam
+Maltese
+Mandarin
+Maori
+Marathi
+Mongolian
+Nepali
+Norwegian
+Odia
+Oromo
+Pashto
+Persian
+=Polish
+Portuguese
+Punjabi
+Quechua
+Romanian
+Russian
+Sanskrit
+Semitic
+Serbian
+Shona
+Sindhi
+Sinhala
+Slavic
+Slovak
+Slovenian
+Somali
+Spanish
+Sundanese
+Swahili
+Swedish
+Tagalog
+Tajik
+Tamil
+Tatar
+Telugu
+Thai
+Tibetan
+Tigrinya
+Turkic
+Turkish
+Turkmen
+Ukrainian
+Urdu
+Uyghur
+Uzbek
+Vietnamese
+Welsh
+Wolof
+Xhosa
+Yiddish
+Yoruba
+Zulu
+
+# --- nationalities and peoples (those not already listed as languages) ---
+Afghan
+African
+Algerian
+American
+Arab
+Argentine
+Argentinian
+Asian
+Australian
+Austrian
+Bangladeshi
+Belgian
+Bolivian
+Brazilian
+British
+Cameroonian
+Canadian
+Caribbean
+Chilean
+Colombian
+Congolese
+Cuban
+Cypriot
+Ecuadorian
+Egyptian
+Emirati
+Ethiopian
+European
+Ghanaian
+Guatemalan
+Hispanic
+Indian
+Iranian
+Iraqi
+Israeli
+Jamaican
+Jordanian
+Kenyan
+Kuwaiti
+Latin American
+Lebanese
+Libyan
+Malaysian
+Mexican
+Middle Eastern
+Moroccan
+Nepalese
+Nigerian
+Nordic
+Pakistani
+Palestinian
+Peruvian
+Qatari
+Rwandan
+Saudi
+Scandinavian
+Scottish
+Senegalese
+Singaporean
+South African
+Sri Lankan
+Sudanese
+Swiss
+Syrian
+Taiwanese
+Tanzanian
+Tunisian
+Ugandan
+Venezuelan
+Yemeni
+Zambian
+Zimbabwean
+
+# --- countries and territories ---
+Afghanistan
+Albania
+Algeria
+Angola
+Argentina
+Armenia
+Australia
+Austria
+Azerbaijan
+Bahrain
+Bangladesh
+Belarus
+Belgium
+Benin
+Bhutan
+Bolivia
+Bosnia and Herzegovina
+Botswana
+Brazil
+Brunei
+Bulgaria
+Burkina Faso
+Burundi
+Cambodia
+Cameroon
+Canada
+Catalonia
+=Chad
+Chile
+=China
+Colombia
+Congo
+Costa Rica
+Croatia
+Cuba
+Cyprus
+Czech Republic
+Czechia
+Denmark
+Dominican Republic
+Ecuador
+Egypt
+El Salvador
+England
+Eritrea
+Estonia
+Eswatini
+Ethiopia
+Fiji
+Finland
+France
+Gabon
+Gambia
+=Georgia
+Germany
+Ghana
+Greece
+Greenland
+Guatemala
+=Guinea
+Haiti
+Honduras
+Hong Kong
+Hungary
+Iceland
+India
+Indonesia
+Iran
+Iraq
+Ireland
+Israel
+Italy
+Ivory Coast
+Jamaica
+=Japan
+=Jordan
+Kazakhstan
+Kenya
+Kosovo
+Kuwait
+Kyrgyzstan
+Laos
+Latvia
+Lebanon
+Lesotho
+Liberia
+Libya
+Lithuania
+Luxembourg
+Macau
+Madagascar
+Malawi
+Malaysia
+Maldives
+Mali
+Malta
+Mauritania
+Mauritius
+Mexico
+Moldova
+Mongolia
+Montenegro
+Morocco
+Mozambique
+Myanmar
+Namibia
+Nepal
+Netherlands
+New Zealand
+Nicaragua
+=Niger
+Nigeria
+North Korea
+North Macedonia
+Northern Ireland
+Norway
+Oman
+Pakistan
+Palestine
+Panama
+Papua New Guinea
+Paraguay
+Peru
+Philippines
+Poland
+Portugal
+Puerto Rico
+Qatar
+Romania
+Russia
+Rwanda
+Saudi Arabia
+Scotland
+Senegal
+Serbia
+Sierra Leone
+Singapore
+Slovakia
+Slovenia
+Somalia
+South Africa
+South Korea
+South Sudan
+Spain
+Sri Lanka
+Sudan
+Suriname
+Sweden
+Switzerland
+Syria
+Taiwan
+Tajikistan
+Tanzania
+Thailand
+Tibet
+Togo
+Trinidad and Tobago
+Tunisia
+=Turkey
+Türkiye
+Turkmenistan
+Uganda
+Ukraine
+United Arab Emirates
+United Kingdom
+United States
+Uruguay
+Uzbekistan
+Venezuela
+Vietnam
+Wales
+Yemen
+Zambia
+Zimbabwe
+EU
+UAE
+UK
+US
+USA
+
+# --- regions ---
+Africa
+Antarctica
+Arabian Peninsula
+Asia
+Balkans
+Baltic
+Caucasus
+Central Africa
+Central America
+Central Asia
+Central Europe
+East Africa
+East Asia
+Eastern Europe
+Europe
+Global North
+Global South
+Horn of Africa
+Latin America
+Levant
+Maghreb
+Mediterranean
+Melanesia
+Middle East
+North Africa
+North America
+Northern Europe
+Oceania
+Pacific Islands
+Polynesia
+Sahel
+Scandinavia
+South America
+South Asia
+Southeast Asia
+Southern Africa
+Southern Europe
+Sub-Saharan Africa
+West Africa
+West Asia
+Western Europe

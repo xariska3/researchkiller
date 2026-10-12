@@ -33,7 +33,7 @@ version = { attr = "rk.__version__" }
 where = ["src"]
 
 [tool.setuptools.package-data]
-rk = ["prompts/*.txt"]
+rk = ["prompts/*.txt", "data/*.txt"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,6 +1,6 @@
-You are checking whether a research proposal adds anything to a paper.
+You are checking, facet by facet, whether a research proposal changes or adds to a paper's research idea.
 
-Question: does the proposal add nothing that the paper does not support? Answer "yes" if every problem, method, claim and detail in the proposal is supported by the paper. Answer "no" if the proposal adds or changes anything: a different or extra method, a stronger or broader claim, results, datasets, or applications the paper does not mention. The proposal deliberately uses different wording, so judge the meaning only.
+The proposal deliberately uses different words and leaves out the names of models, datasets, methods and organisations, and it was written as a plan before the work was done, so its claim is an aim or expectation. Judge meaning, not wording: a method described without its name is the same method.
 
 Paper title: $title
 
@@ -8,5 +8,18 @@ Paper abstract: $abstract
 
 Proposal: $proposal
 
-Answer with JSON only, in exactly this form, where verdict is "yes" or "no":
-{"verdict": "yes", "reason": "one short sentence"}
+Step 1. Describe four facets of the paper and of the proposal, each in at most 15 words:
+- problem: the research problem or question
+- method: the method or approach
+- domain: the domain or population studied, including any language, region, data source or user group
+- claim: the main claimed contribution or finding
+
+Step 2. For each facet, is everything the proposal says about it supported by the paper? Answer "no" if the proposal changes the facet, adds something the paper does not support (a different or extra method, domain, population, language, region, data or result, or a stronger or broader claim), or states it so generally that it no longer identifies this paper.
+
+Step 3. The verdict is "yes" only if all four facets are "yes".
+
+Answer with JSON only, in exactly this form, where each "match" and the "verdict" are "yes" or "no":
+{"facets": {"problem": {"paper": "...", "proposal": "..."}, "method": {"paper": "...", "proposal": "..."}, "domain": {"paper": "...", "proposal": "..."}, "claim": {"paper": "...", "proposal": "..."}},
+ "match": {"problem": {"match": "yes", "reason": "..."}, "method": {"match": "yes", "reason": "..."}, "domain": {"match": "yes", "reason": "..."}, "claim": {"match": "yes", "reason": "..."}},
+ "verdict": "yes",
+ "reason": "one short sentence"}

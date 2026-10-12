@@ -6,12 +6,24 @@ from typing import Any
 
 import pytest
 import yaml
-from bench_data import ABSTRACTS, GOOD, LEAKY, T1, T2, T3, TITLES, corpus_records, target_rows
+from bench_data import (
+    ABSTRACTS,
+    GOOD,
+    LEAKY,
+    T1,
+    T2,
+    T3,
+    TITLES,
+    corpus_records,
+    judge_reply,
+    target_rows,
+)
 from conftest import FakeLLM, corpus_config_dict
 
 from rk import cli
 from rk.bench import (
     ACCEPTED_FILE,
+    CORRUPTIONS,
     REASONS,
     REJECTIONS_FILE,
     STATS_FILE,
@@ -19,17 +31,21 @@ from rk.bench import (
     LeakFilter,
     _visit_order,
     check_length,
+    keep_names_line,
     load_prompts,
     make_bench,
     make_qid,
     not_research_contribution,
-    parse_verdict,
+    parse_judgment,
+    validate_judge,
 )
 from rk.config import Config, config_from_dict
 from rk.corpus import CORPUS_FILE, CorpusError, freeze
+from rk.llm import load_prompt
+from rk.text import stem
 
-YES = '{"verdict": "yes", "reason": "same problem, method and claim"}'
-NO = '{"verdict": "no", "reason": "the method differs"}'
+YES = judge_reply()
+NO = judge_reply({"method": "the method differs"})
 PROMPTS = load_prompts()
 CAPTURES_FIRST_LINE = PROMPTS["judge_captures"].template.template.splitlines()[0]
 SEED = 7  # make_model_config's seed, so paraphraser.seed in these configs
@@ -249,8 +265,9 @@ def test_judge_no_in_either_direction_rejects(
 
     (rejection,) = _rows(cfg, REJECTIONS_FILE)
     assert (rejection["target_id"], rejection["reason"]) == (T2, f"judge_{direction}")
-    assert "the method differs" in rejection["detail"]
+    assert rejection["detail"].endswith("paper's method (method: the method differs)")
     assert rejection["judge_verdicts"][direction]["verdict"] == "no"
+    assert rejection["judge_verdicts"][direction]["failed"] == ["method"]
     if direction == "captures":  # the second question isn't asked after a "no"
         assert "adds_nothing" not in rejection["judge_verdicts"]
     assert {r["target_id"] for r in _rows(cfg, ACCEPTED_FILE)} == {T1, T2, T3}
@@ -403,21 +420,66 @@ def test_stats_add_up(tmp_path: Path, corpus_dir: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("text", "verdict"),
+    ("text", "verdict", "failed"),
     [
-        (YES, {"verdict": "yes", "reason": "same problem, method and claim"}),
-        (
-            '```json\n{"verdict": "No", "reason": "adds a dataset"}\n```',
-            {"verdict": "no", "reason": "adds a dataset"},
-        ),
-        ('{"verdict": "yes"}', {"verdict": "yes", "reason": ""}),
-        ('{"verdict": "maybe", "reason": "unsure"}', None),
-        ('{"answer": "yes"}', None),
-        ("yes", None),
+        (YES, "yes", []),
+        ("```json\n" + YES + "\n```", "yes", []),  # fenced
+        (judge_reply({"domain": "English became a foreign tongue"}), "no", ["domain"]),
+        # A facet marked "no" rejects even when the judge's own verdict says yes ...
+        (judge_reply({"claim": "reversed"}, verdict="yes"), "no", ["claim"]),
+        # ... and a "no" verdict stands even if every facet matched.
+        (judge_reply(verdict="no", reason="too vague overall"), "no", []),
+        (judge_reply({"problem": "a", "method": "b"}), "no", ["problem", "method"]),
     ],
 )
-def test_parse_verdict(text: str, verdict: dict[str, str] | None) -> None:
-    assert parse_verdict(text) == verdict
+def test_parse_judgment(text: str, verdict: str, failed: list[str]) -> None:
+    judgment = parse_judgment(text)
+    assert judgment is not None
+    assert (judgment["verdict"], judgment["failed"]) == (verdict, failed)
+    assert set(judgment["match"]) == {"problem", "method", "domain", "claim"}
+
+
+def _without(facet: str) -> str:
+    data = json.loads(YES)
+    del data["match"][facet]
+    return json.dumps(data)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '{"verdict": "yes", "reason": "the old one-line format"}',
+        _without("domain"),  # every facet needs a yes or no
+        YES.replace('"verdict": "yes"', '"verdict": "maybe"'),
+        YES.replace('"match": "yes"', '"match": "partly"', 1),
+        "yes",
+        "[1, 2]",
+    ],
+)
+def test_unreadable_judgments(text: str) -> None:
+    assert parse_judgment(text) is None
+
+
+def test_judge_rejection_quotes_each_failed_facet_for_the_retry(
+    tmp_path: Path, corpus_dir: Path
+) -> None:
+    cfg = _config(tmp_path)
+    failed = {"domain": "a foreign tongue is not English", "claim": "the claim is reversed"}
+    para = paraphraser()
+
+    make_bench(cfg, para, judge({(T2, "captures"): [judge_reply(failed)]}))
+
+    (rejection,) = _rows(cfg, REJECTIONS_FILE)
+    assert rejection["detail"] == (
+        "a reviewer found that it does not keep the paper's domain or population, main claim "
+        "(domain or population: a foreign tongue is not English; main claim: the claim is reversed)"
+    )
+    retry = [c[-1]["content"] for c in para.calls if TITLES[T2] in c[-1]["content"]][-1]
+    assert f"rejected because {rejection['detail']}." in retry
+    stats = _stats(cfg)
+    assert stats["judge_failed_facets"]["captures"] == {
+        "problem": 0, "method": 0, "domain": 1, "claim": 1,
+    }
 
 
 @pytest.mark.parametrize(
@@ -459,11 +521,172 @@ def test_content_jaccard_ignores_generic_science_words() -> None:
     assert stats["content_jaccard"] == 0.0
 
 
+def test_leak_filter_lets_a_proposal_keep_the_titles_language_and_country() -> None:
+    leak = LeakFilter(corpus_records(), max_overlap=1.0, max_jaccard=1.0)
+    title = "Dense retrieval for Turkish legal documents in the UK"
+    abstract = "We study Turkish court rulings filed in the UK and in Turkey."
+    rejection, stats = leak.check(
+        "We plan to search Turkish court rulings from the UK with learned vectors.", title, abstract
+    )
+    assert rejection is None
+    assert stats["acronyms_in_paraphrase"] == stats["title_words_found"] == []
+    assert stem("turkish") not in stats["idf_top_terms"]  # never a leaked term either
+
+
+@pytest.mark.parametrize(
+    ("title", "proposal", "reason", "found"),
+    [  # organisation and model names stay banned
+        ("Classifying Cochrane summaries by conclusiveness",
+         "We will sort Cochrane overviews by how firm their conclusions are.",
+         "title_stem", "cochrane"),
+        ("TurkColBERT for Turkish retrieval",
+         "We adapt TurkColBERT to search Turkish text.",
+         "acronym_in_paraphrase", "TurkColBERT"),
+    ],
+)
+def test_leak_filter_still_bans_organisation_and_model_names(
+    title: str, proposal: str, reason: str, found: str
+) -> None:
+    leak = LeakFilter(corpus_records(), max_overlap=1.0, max_jaccard=1.0)
+    rejection, _ = leak.check(proposal, title, "An abstract.")
+    assert rejection is not None and rejection.reason == reason and found in rejection.message
+
+
+def test_paraphrase_prompt_tells_the_model_which_title_names_to_keep(
+    tmp_path: Path,
+) -> None:
+    assert keep_names_line("Calibrated reward models") == ""
+    assert keep_names_line("Turkish retrieval in the Middle East") == (
+        "\nThe title names Turkish, Middle East: the proposal must keep them.\n"
+    )
+    records = corpus_records()
+    for record in records:
+        if record["id"] == T2:
+            record["title"] = TITLES[T2] + " in Kazakh"
+    freeze(tmp_path / "corpus", records, target_rows(), {})
+    para = paraphraser()
+
+    make_bench(_config(tmp_path), para, judge())
+
+    prompts = {_target_in(c[-1]["content"], "Title"): c[-1]["content"] for c in para.calls}
+    assert "The title names Kazakh: the proposal must keep it." in prompts[T2]
+    assert "The title names" not in prompts[T1]
+    rule = "if the title names a language, nationality, country or region, the proposal must keep"
+    assert rule in prompts[T1]
+
+
 def test_prompts_render_every_placeholder() -> None:
-    values = {"title": "T", "abstract": "A", "proposal": "P", "feedback": ""}
-    for prompt in PROMPTS.values():
+    values = {
+        "title": "T", "abstract": "A", "proposal": "P", "feedback": "", "keep": "", "change": "C",
+    }
+    for prompt in [*PROMPTS.values(), load_prompt("corrupt")]:
         assert "$" not in prompt.render(**values)
         assert len(prompt.sha256) == 64
+
+
+@pytest.mark.parametrize("name", ["judge_captures", "judge_adds_nothing"])
+def test_judge_prompts_compare_four_facets(name: str) -> None:
+    text = PROMPTS[name].template.template
+    for facet in ("problem", "method", "domain", "claim"):
+        assert f"- {facet}: " in text and f'"{facet}": {{"match": "yes"' in text
+    assert "including any language, region" in text
+    assert 'The verdict is "yes" only if all four facets are "yes".' in text
+
+
+# --- judge validation -----------------------------------------------------------
+
+
+def _corrupting_paraphraser() -> FakeLLM:
+    """Writes 'CORRUPTED-<kind> ...' for each corruption instruction it is given."""
+
+    def reply(messages: list[dict[str, str]]) -> str:
+        prompt = messages[-1]["content"]
+        kind = next(k for k, change in CORRUPTIONS.items() if f"Change: {change}" in prompt)
+        return f"CORRUPTED-{kind} proposal for {_target_in(prompt, 'Title')}."
+
+    return FakeLLM(reply)
+
+
+def _validation_judge() -> FakeLLM:
+    """Rejects the domain and method corruptions, can't be read on the claim ones, and
+    lets the generalised ones through."""
+
+    def reply(messages: list[dict[str, str]]) -> str:
+        prompt = messages[-1]["content"]
+        if "CORRUPTED-domain" in prompt:
+            return judge_reply({"domain": "another language"})
+        if "CORRUPTED-method" in prompt:
+            return judge_reply({"method": "another method", "claim": "follows from it"})
+        if "CORRUPTED-claim" in prompt:
+            return "garbled"
+        return YES
+
+    return FakeLLM(reply)
+
+
+def test_validate_judge_reports_acceptance_and_rejection_rates(
+    tmp_path: Path, corpus_dir: Path
+) -> None:
+    cfg = _config(tmp_path)
+    make_bench(cfg, paraphraser(), judge())  # three accepted pairs
+    para, jdg = _corrupting_paraphraser(), _validation_judge()
+    out = tmp_path / "judge_validation"
+
+    summary = validate_judge(cfg, para, jdg, n=2, out_dir=out)
+
+    first_two = sorted(_rows(cfg, ACCEPTED_FILE), key=lambda r: r["qid"])[:2]
+    assert summary["n_pairs"] == 2
+    assert len(para.calls) == 2 * 4  # one call per corruption
+    assert len(jdg.calls) == 2 * 5 * 2  # both directions for the original and each corruption
+    original_in_prompt = first_two[0]["query"]
+    assert original_in_prompt in para.calls[0][-1]["content"]
+    v = summary["variants"]
+    assert v["original"]["acceptance_rate"] == 1.0
+    rates = {kind: v[kind]["rejection_rate"] for kind in CORRUPTIONS}
+    assert rates == {"domain": 1.0, "method": 1.0, "claim": 1.0, "generalised": 0.0}
+    assert v["domain"]["rejected_by_direction"] == {"captures": 2, "adds_nothing": 2}
+    assert v["domain"]["flagged_facets"] == {"problem": 0, "method": 0, "domain": 2, "claim": 0}
+    assert v["method"]["flagged_facets"]["claim"] == 2
+    assert v["claim"]["unreadable"] == 2  # unreadable counts as rejected, as in make-bench
+    assert summary["money_spent"] > 0 and "corrupt" in summary["prompt_hashes"]
+
+    pairs = [json.loads(x) for x in (out / "pairs.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert [p["qid"] for p in pairs] == [r["qid"] for r in first_two]
+    corruptions = (out / "corruptions.jsonl").read_text(encoding="utf-8").splitlines()
+    verdicts = [
+        json.loads(x) for x in (out / "verdicts.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(corruptions) == 8 and len(verdicts) == 10
+    assert all(set(r["judgments"]) == {"captures", "adds_nothing"} for r in verdicts)
+    assert json.loads((out / "summary.json").read_text(encoding="utf-8")) == summary
+
+
+def test_validate_judge_needs_accepted_pairs(tmp_path: Path, corpus_dir: Path) -> None:
+    with pytest.raises(BenchError, match="no accepted queries"):
+        validate_judge(_config(tmp_path), paraphraser(), judge(), n=5, out_dir=tmp_path / "v")
+
+
+def test_cli_validate_judge(
+    tmp_path: Path,
+    corpus_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(_config_dict(tmp_path)), encoding="utf-8")
+    make_bench(_config(tmp_path), paraphraser(), judge())
+    fakes = {"para-model": _corrupting_paraphraser(), "judge-model": _validation_judge()}
+    monkeypatch.setattr(cli, "LLMClient", lambda model, cache, ledger: fakes[model.name])
+    out = tmp_path / "jv"
+
+    argv = ["validate-judge", "--config", str(config_path), "--n", "3", "--out-dir", str(out)]
+    assert cli.main(argv) == 0
+
+    printed = capsys.readouterr().out
+    assert "rk validate-judge: 3 pairs" in printed
+    assert "original     accepted 3/3 (100%)" in printed
+    assert "generalised  rejected 0/3 (0%)" in printed
+    assert (out / "summary.json").exists()
 
 
 # --- CLI ---------------------------------------------------------------------

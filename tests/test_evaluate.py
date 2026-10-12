@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 import yaml
-from bench_data import GOOD, T2, TITLES, corpus_records, target_rows
+from bench_data import GOOD, T2, TITLES, corpus_records, judge_reply, target_rows
 from conftest import FakeEncoder, FakeLLM, corpus_config_dict
 
 from rk import cli
@@ -37,7 +37,7 @@ from rk.retrieval import Result, Trace, build_index
 
 ORDER = [t["id"] for t in _visit_order(target_rows(), 7)]  # the bench seed in these configs
 Q2 = make_qid(ORDER.index(T2), T2)
-YES = '{"verdict": "yes", "reason": "same idea"}'
+YES = judge_reply()
 REWRITES = '{"queries": ["learned groups for efficient comparison", "memory saving condensation"]}'
 SEARCH = '{"action": "search", "query": "condensing long texts with learned groups"}'
 STOP = '{"action": "stop", "reason": "enough"}'

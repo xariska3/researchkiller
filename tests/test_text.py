@@ -4,13 +4,50 @@ import pytest
 
 from rk.text import (
     content_stems,
+    domain_entities,
     extract_acronyms,
+    find_domain_entities,
     is_generic,
+    mask_domain_entities,
     normalize_title,
     reconstruct_abstract,
     stem,
     tokenize,
 )
+
+
+def test_domain_entity_list_loads_from_package_data() -> None:
+    names = domain_entities()
+    assert len(names) > 300 and len(set(names)) == len(names)  # curated, no duplicates
+    for name in ("Turkish", "Arabic", "Kazakh", "English", "Middle East", "Sub-Saharan Africa"):
+        assert name in names
+    for name in ("Cochrane", "ColBERT", "PubMed", "South", "Western"):  # never exempt
+        assert name not in names
+
+
+@pytest.mark.parametrize(
+    ("text", "found"),
+    [
+        ("TurkColBERT: A Benchmark of Dense Models for Turkish Information Retrieval", ["Turkish"]),
+        ("Design of an english oral dialogue system", ["english"]),  # case-insensitive
+        ("Named Entity Recognition in Low-Resource Arabic Dialects", ["Arabic"]),
+        ("Chinese-English translation in the Middle East and South Africa",
+         ["Chinese", "English", "Middle East", "South Africa"]),  # hyphens split; longest first
+        ("Arabs and Kenyans, Arabic and Arab", ["Arabs", "Kenyans", "Arabic"]),  # plural "s"
+        ("Hospitals in the US and the UK", ["US", "UK"]),
+        ("This lets us polish the china set for the turkey dinner", []),  # case-exact names
+        ("Polish and Turkish corpora from China", ["Polish", "Turkish", "China"]),
+        ("Cochrane reviews and ColBERT on PubMed", []),  # organisations, models, datasets
+        ("South-western dialects of the West", []),  # parts of names don't count
+    ],
+)
+def test_find_domain_entities(text: str, found: list[str]) -> None:
+    assert find_domain_entities(text) == found
+
+
+def test_mask_domain_entities_blanks_whole_names_only() -> None:
+    masked = mask_domain_entities("Turkish retrieval with TurkColBERT in South Africa and the US.")
+    assert tokenize(masked) == ["retrieval", "with", "turkcolbert", "in", "and", "the"]
 
 
 def test_reconstruct_abstract_orders_words_by_position() -> None:
