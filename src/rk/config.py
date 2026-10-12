@@ -38,7 +38,7 @@ class CorpusConfig:
     min_abstract_words: int
     max_citers_per_target: int
     out_dir: Path
-    max_works_per_sweep: int = 25000  # per filter string; truncation order is deterministic
+    max_works_per_sweep: int = 25000  # per filter string, newest first; deterministic cut
     mailto_env: str | None = None  # env var holding the OpenAlex polite-pool email
     api_key_env: str | None = None  # env var holding an OpenAlex API key
 

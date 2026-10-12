@@ -35,7 +35,9 @@ STOPWORDS: frozenset[str] = frozenset({
 
 # Words that appear in almost any (AI/ML) abstract and so say nothing about a
 # specific paper. The leak filter ignores them when looking for distinctive
-# title terms. Tuned for the Phase 1 subfield sweeps; extend as the pilot shows.
+# title terms. Matched on the surface form before stemming, so list every
+# inflection that should count. Tuned for the Phase 1 subfield sweeps; extend as
+# the pilot shows.
 GENERIC_SCIENCE_WORDS: frozenset[str] = frozenset({
     "ability", "able", "accuracy", "accurate", "achieve", "achieves", "achieved", "address",
     "addresses", "advance", "advances", "algorithm", "algorithms", "analysis", "analyse", "analyze",
@@ -130,20 +132,22 @@ def stem(word: str) -> str:
     return w
 
 
-GENERIC_SCIENCE_STEMS: frozenset[str] = frozenset(stem(w) for w in GENERIC_SCIENCE_WORDS)
-
-
 def content_tokens(text: str) -> list[str]:
     """Tokens minus stopwords, bare numbers and single characters, in order."""
     return [t for t in tokenize(text) if len(t) > 1 and not t.isdigit() and t not in STOPWORDS]
 
 
 def content_stems(text: str, *, drop_generic: bool = False) -> list[str]:
-    """Stems of content tokens, in order; optionally minus generic-science stems."""
-    stems = [stem(t) for t in content_tokens(text)]
+    """Stems of content tokens, in order; optionally minus generic-science words.
+
+    Generic words are matched on the surface form, before stemming, so a stem
+    collision ("general", "generation" -> "gen") can't make a distinctive word
+    generic.
+    """
+    tokens = content_tokens(text)
     if drop_generic:
-        stems = [s for s in stems if s not in GENERIC_SCIENCE_STEMS]
-    return stems
+        tokens = [t for t in tokens if t not in GENERIC_SCIENCE_WORDS]
+    return [stem(t) for t in tokens]
 
 
 _WORD_RE = re.compile(r"[^\W_]+(?:-[^\W_]+)*")  # hyphenated compounds stay whole

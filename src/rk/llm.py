@@ -53,7 +53,15 @@ class _Closing:
 
 
 class LLMError(RuntimeError):
-    """A completion failed: bad request, malformed response, or retries exhausted."""
+    """A completion failed: bad request, malformed response, or retries exhausted.
+
+    `maybe_billed` is set when an attempt timed out, hit a transport error or got
+    a 5xx, since the provider may have processed (and billed) that request.
+    """
+
+    def __init__(self, message: str, *, maybe_billed: bool = False) -> None:
+        super().__init__(message)
+        self.maybe_billed = maybe_billed
 
 
 class BudgetExceeded(RuntimeError):
@@ -227,9 +235,10 @@ class Ledger(_Closing):
     and process using that file: the running total is read at startup. Before a
     real call the client reserves a pessimistic estimate (`charge`); afterwards it
     `record`s what the call cost, which releases the reservation and appends a
-    spend row. A call that fails is recorded at its estimate, since it may still
-    have been billed. Spend by a command running concurrently is only seen after
-    a restart, so run commands one at a time.
+    spend row. A failed call is recorded at its estimate if it may have been
+    billed (timeout, transport error or 5xx); otherwise (4xx, including 429) its
+    reservation is just `release`d. Spend by a command running concurrently is
+    only seen after a restart, so run commands one at a time.
     """
 
     def __init__(self, path: str | Path, cap: float = 20.0, *, command: str) -> None:
@@ -277,6 +286,10 @@ class Ledger(_Closing):
         self._conn.commit()
         self._reserved -= reserved
         self._recorded += cost
+
+    def release(self, reserved: float) -> None:
+        """Drop a reservation for a call that cost nothing."""
+        self._reserved -= reserved
 
     def close(self) -> None:
         self._conn.close()
@@ -357,15 +370,17 @@ class LLMClient(_Closing):
         self.ledger.charge(estimate, label=self.model.name)
         try:
             reply = _parse_reply(self._post(request, api_key), self.model.name)
-        except BaseException:
-            # The call may still have been billed: book it at its estimate.
-            self.ledger.record(
-                reserved=estimate,
-                model=self.model.name,
-                prompt_tokens=prompt_bound,
-                completion_tokens=self.model.max_tokens,
-                cost=estimate,
-            )
+        except BaseException as exc:
+            if isinstance(exc, LLMError) and exc.maybe_billed:
+                self.ledger.record(
+                    reserved=estimate,
+                    model=self.model.name,
+                    prompt_tokens=prompt_bound,
+                    completion_tokens=self.model.max_tokens,
+                    cost=estimate,
+                )
+            else:
+                self.ledger.release(estimate)
             raise
         self.ledger.record(
             reserved=estimate,
@@ -377,21 +392,31 @@ class LLMClient(_Closing):
         return reply
 
     def _post(self, request: dict[str, Any], api_key: str) -> Any:
-        """POST /chat/completions, retrying 429, 5xx and transport errors with backoff."""
+        """POST /chat/completions, retrying 429, 5xx and transport errors with backoff.
+
+        A raised LLMError has `maybe_billed` set if any attempt timed out, hit a
+        transport error (timeouts are transport errors in httpx) or got a 5xx.
+        """
         headers = {"Authorization": f"Bearer {api_key}"}
+        maybe_billed = False
         for attempt in range(self.max_retries + 1):
             retry_after: float | None = None
             try:
                 response = self._http.post("/chat/completions", json=request, headers=headers)
             except httpx.TransportError as exc:
                 problem = f"{type(exc).__name__}: {exc}"
+                maybe_billed = True
             else:
                 status = response.status_code
                 if status == 429 or status >= 500:
                     problem = f"HTTP {status}: {response.text[:300]}"
                     retry_after = _retry_after_seconds(response)
+                    maybe_billed = maybe_billed or status >= 500
                 elif response.is_error:
-                    raise LLMError(f"{self.model.name}: HTTP {status}: {response.text[:500]}")
+                    raise LLMError(
+                        f"{self.model.name}: HTTP {status}: {response.text[:500]}",
+                        maybe_billed=maybe_billed,
+                    )
                 else:
                     try:
                         return response.json()
@@ -400,7 +425,8 @@ class LLMClient(_Closing):
             if attempt == self.max_retries:
                 raise LLMError(
                     f"{self.model.name}: giving up after {attempt + 1} attempts; "
-                    f"last error: {problem}"
+                    f"last error: {problem}",
+                    maybe_billed=maybe_billed,
                 )
             delay = self.backoff_base * 2**attempt
             if retry_after is not None:

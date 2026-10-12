@@ -79,8 +79,11 @@ Build order:
 1. **Subfield sweeps**: each config filter string (e.g.
    `primary_topic.subfield.id:1702,from_publication_date:2023-01-01`),
    always add `has_abstract:true`. Request results sorted by publication_date
-   then id and stop after `corpus.max_works_per_sweep` (default 25000), so
-   truncation is deterministic. Rebuild abstracts from the inverted index.
+   **descending** (newest first, so targets always survive truncation), ties
+   by id, and stop after `corpus.max_works_per_sweep` (default 25000), so
+   truncation is deterministic. Check the OpenAlex docs for which sort fields
+   exist; if `id` isn't sortable, sort ties by (date, id) locally after
+   fetching. Rebuild abstracts from the inverted index.
    Drop docs under `min_abstract_words` or wrong language.
 2. **Dedupe**: merge two works only if they share a DOI, or if their
    normalised titles match AND the title has at least 5 content words AND
@@ -89,13 +92,15 @@ Build order:
 3. **Select targets** (`targets.py`): origin = sweep, published on or after
    `bench.target_from_date` (later than every model's `training_cutoff`, checked at load),
    abstract 100–450 words, at least 10 references. Seeded sample of
-   `1.5 × n_targets` (oversample; some will fail the filters).
+   `1.5 × n_targets` (oversample; some will fail the filters). Fail loudly if
+   no target candidates remain after selection.
 4. **Citation expansion**: fetch every target's references (batch
    `ids.openalex:W1|W2|...`, 50 per call) and up to `max_citers_per_target`
    citers (`cites:Wxxx`). References are the hard near-miss distractors.
    Dedupe again and re-map target ids through aliases.
 5. **Freeze**: write `corpus.jsonl`, `targets.jsonl`, `manifest.json`
-   (filters, counts by origin, API calls, sha256 of corpus file, timestamp).
+   (filters, counts by origin, API calls, sha256 of corpus file, timestamp,
+   and per sweep: `truncated` (bool), `oldest_date`, `newest_date`, `n_fetched`).
    Refuse to overwrite an existing manifest.
 
 ## Benchmark generation (`bench.py`), Test A only

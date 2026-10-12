@@ -87,6 +87,13 @@ def test_content_stems_drop_stopwords_numbers_and_optionally_generic_words() -> 
     assert content_stems(text, drop_generic=True) == ["transform", "seg"]
 
 
+def test_generic_words_are_matched_before_stemming() -> None:
+    # "general" is generic and stems to "gen" like "generation"; the title word must survive.
+    title = "Controllable Image Generation with Diffusion"
+    assert any(s.startswith("gen") for s in content_stems(title, drop_generic=True))
+    assert content_stems("a general method", drop_generic=True) == []
+
+
 def test_normalize_title_ignores_markup_case_punctuation_and_accents() -> None:
     a = normalize_title("Pre-Training <i>BERT</i>: A Naïve Study &amp; More.")
     b = normalize_title("pretraining BERT — a naive study & more")

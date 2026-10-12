@@ -11,7 +11,7 @@ corpus:
   language: en
   min_abstract_words: 50          # placeholder
   max_citers_per_target: 20       # placeholder
-  max_works_per_sweep: 25000      # per filter string, sorted by publication_date then id
+  max_works_per_sweep: 25000      # per filter string, newest first (publication_date desc)
   mailto_env: OPENALEX_MAILTO     # optional; env var holding the polite-pool email
   api_key_env: OPENALEX_API_KEY   # optional; env var holding an OpenAlex API key
   out_dir: data/corpus

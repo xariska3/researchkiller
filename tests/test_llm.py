@@ -253,30 +253,83 @@ def test_client_errors_are_not_retried(
     assert len(seen) == 1 and sleeps == []
 
 
-def test_gives_up_after_max_retries_and_books_the_estimate(
-    db_path: Path, llm_cache: LLMCache, make_ledger: MakeLedger, api_key: str
+Outcome = int | type[httpx.TransportError]
+
+
+def _failing_transport(*outcomes: Outcome) -> httpx.MockTransport:
+    """Answer each request with the next status code or transport error; the last repeats."""
+    queue = list(outcomes)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        outcome = queue.pop(0) if len(queue) > 1 else queue[0]
+        if isinstance(outcome, int):
+            return httpx.Response(outcome, json={"error": "simulated"})
+        raise outcome("simulated failure", request=request)
+
+    return httpx.MockTransport(handler)
+
+
+def _failing_client(
+    llm_cache: LLMCache, ledger: Ledger, *outcomes: Outcome, sleeps: list[float] | None = None
+) -> LLMClient:
+    return LLMClient(
+        make_model_config(),
+        llm_cache,
+        ledger,
+        transport=_failing_transport(*outcomes),
+        max_retries=2,
+        sleep=(sleeps if sleeps is not None else []).append,
+    )
+
+
+def test_gives_up_after_max_retries(
+    llm_cache: LLMCache, make_ledger: MakeLedger, api_key: str
+) -> None:
+    sleeps: list[float] = []
+    client = _failing_client(llm_cache, make_ledger(), 500, sleeps=sleeps)
+    with pytest.raises(LLMError, match="giving up after 3 attempts"):
+        client.complete(MSGS)
+    assert sleeps == [1.0, 2.0]
+    assert len(llm_cache) == 0
+
+
+@pytest.mark.parametrize("failure", [500, 503, httpx.ReadTimeout, httpx.ConnectError])
+def test_failed_call_is_booked_for_timeouts_transport_errors_and_5xx(
+    failure: Outcome, db_path: Path, llm_cache: LLMCache, make_ledger: MakeLedger, api_key: str
 ) -> None:
     model = make_model_config()
     ledger = make_ledger()
-    sleeps: list[float] = []
-    client = LLMClient(
-        model,
-        llm_cache,
-        ledger,
-        transport=httpx.MockTransport(lambda request: httpx.Response(500)),
-        max_retries=2,
-        sleep=sleeps.append,
-    )
-    with pytest.raises(LLMError, match="giving up after 3 attempts"):
-        client.complete(MSGS)
+    with pytest.raises(LLMError) as exc_info:
+        _failing_client(llm_cache, ledger, failure).complete(MSGS)
 
     estimate = pessimistic_cost(model, MSGS)
-    assert sleeps == [1.0, 2.0]
+    assert exc_info.value.maybe_billed
     assert ledger.spent == pytest.approx(estimate)
     assert _spend_rows(db_path) == [
         ("test", "fake-model", prompt_token_bound(MSGS), model.max_tokens, estimate)
     ]
-    assert len(llm_cache) == 0
+
+
+@pytest.mark.parametrize("failure", [400, 401, 404, 429])
+def test_failed_call_is_not_booked_for_4xx_including_429(
+    failure: int, db_path: Path, llm_cache: LLMCache, make_ledger: MakeLedger, api_key: str
+) -> None:
+    ledger = make_ledger()
+    with pytest.raises(LLMError) as exc_info:
+        _failing_client(llm_cache, ledger, failure).complete(MSGS)
+
+    assert not exc_info.value.maybe_billed
+    assert ledger.spent == 0.0  # reservation released
+    assert _spend_rows(db_path) == []
+
+
+def test_failed_call_is_booked_if_any_attempt_may_have_been_billed(
+    db_path: Path, llm_cache: LLMCache, make_ledger: MakeLedger, api_key: str
+) -> None:
+    ledger = make_ledger()
+    with pytest.raises(LLMError, match="HTTP 400"):
+        _failing_client(llm_cache, ledger, 503, 400).complete(MSGS)
+    assert len(_spend_rows(db_path)) == 1
 
 
 def test_missing_api_key_fails_before_charging(
