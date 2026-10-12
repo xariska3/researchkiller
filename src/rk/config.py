@@ -22,6 +22,8 @@ import yaml
 
 T = TypeVar("T")
 
+ENCODER_DTYPES = ("float32", "float16", "bfloat16")  # torch dtype names
+
 
 class ConfigError(ValueError):
     """The configuration is invalid."""
@@ -80,11 +82,21 @@ class RetrievalConfig:
     index_dir: Path
     encoder_revision: str  # Hugging Face commit hash of the encoder, for reproducibility
     encoder: str = "BAAI/bge-small-en-v1.5"
+    encoder_dtype: str = "float32"  # weights and activations; one of ENCODER_DTYPES
+    encoder_max_seq_length: int | None = None  # longer inputs are truncated; None: model default
 
     def __post_init__(self) -> None:
         _require(
             re.fullmatch(r"[0-9a-f]{40}", self.encoder_revision) is not None,
             "encoder_revision must be a 40-character Hugging Face commit hash",
+        )
+        _require(
+            self.encoder_dtype in ENCODER_DTYPES,
+            f"encoder_dtype must be one of {list(ENCODER_DTYPES)}, got {self.encoder_dtype!r}",
+        )
+        _require(
+            self.encoder_max_seq_length is None or self.encoder_max_seq_length >= 1,
+            "encoder_max_seq_length must be >= 1 (or null for the model's default)",
         )
         _require(self.max_queries >= 1, "max_queries must be >= 1")
         _require(self.max_llm_calls_agent >= 1, "max_llm_calls_agent must be >= 1")
@@ -126,10 +138,17 @@ class ModelConfig:
     max_tokens: int
     seed: int
     training_cutoff: date  # targets must be published after this
+    # OpenRouter endpoint slug to pin (e.g. "openai", "novita/fp8"), sent with fallbacks
+    # disabled; None lets OpenRouter route.
+    provider: str | None = None
 
     def __post_init__(self) -> None:
         _require(bool(self.name.strip()), "name must not be empty")
         _require(bool(self.family.strip()), "family must not be empty")
+        _require(
+            self.provider is None or bool(self.provider.strip()),
+            "provider must not be empty (leave it out to let OpenRouter route)",
+        )
         _require(self.price_in_per_m >= 0 and self.price_out_per_m >= 0, "prices must be >= 0")
         _require(self.temperature >= 0, "temperature must be >= 0")
         _require(self.max_tokens >= 1, "max_tokens must be >= 1")

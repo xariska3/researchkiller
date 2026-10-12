@@ -15,6 +15,7 @@ researchkiller/
 +-- README.md
 +-- pyproject.toml
 +-- .gitignore            # data/, runs/, .env, .venv/, __pycache__/, *.sqlite, mlflow.db, mlartifacts/
++-- .env.example          # the API key variables, empty; copy to .env (git-ignored)
 +-- .github/workflows/ci.yml  # Python 3.10: ruff check, then pytest
 +-- configs/phase1.yaml
 +-- docs/phase1_spec.md
@@ -39,14 +40,21 @@ researchkiller/
 `data/` and `runs/` are created at runtime and git-ignored.
 
 ## Dependencies
-Core: `httpx`, `numpy`, `pyyaml`, `bm25s`, `faiss-cpu`, `mlflow`.
-Optional extras: `dense = [sentence-transformers]`, `dev = [pytest, ruff]`.
+Core: `httpx`, `numpy`, `pyyaml`, `bm25s`, `faiss-cpu`, `mlflow`, `python-dotenv`.
+Optional extras: `dense = [sentence-transformers>=2.7.0, transformers>=4.51.0]`
+(the Qwen3-Embedding model card's minimums), `dev = [pytest, ruff]`.
 
 ## Config (`configs/phase1.yaml`)
 Sections: `corpus`, `bench`, `retrieval`, `run`, and three model roles:
 `paraphraser`, `judge`, `agent`. Each model has `name, family, base_url,
 api_key_env, price_in_per_m, price_out_per_m, temperature, max_tokens, seed,
-training_cutoff` (ISO date).
+training_cutoff` (ISO date), and an optional OpenRouter `provider` (see LLM
+client).
+
+API keys are read from the environment variables the config names. At
+startup `python -m rk` also loads `.env` from the working directory (the repo
+root) with python-dotenv; variables already set in the environment win.
+`.env.example` lists the variables with empty values.
 
 **Model-independence check (fail loudly):** `paraphraser`, `judge` and `agent`
 must all come from different families. Reason: a same-family agent can "undo"
@@ -58,12 +66,21 @@ than every model's `training_cutoff`.
 
 ## LLM client (`llm.py`)
 - OpenAI-compatible `/chat/completions` over httpx (works with local vLLM or a hosted API).
-- SQLite cache keyed by hash of (model, messages, temperature, seed, max_tokens).
+- SQLite cache keyed by hash of (model, messages, temperature, seed, max_tokens),
+  plus the provider routing when a provider is pinned.
+- **Provider pinning (OpenRouter):** a model's `provider` (an endpoint slug
+  from OpenRouter's provider list, e.g. `novita/fp8`) is sent as
+  `"provider": {"order": [slug], "allow_fallbacks": false}`, so only that
+  endpoint serves the model. Every request sends `X-OpenRouter-Metadata:
+  enabled`; the provider OpenRouter reports (the `selected` endpoint in
+  `openrouter_metadata`, else the top-level `provider` string) is stored with
+  the cached reply, returned on cache hits too, and recorded in every trace
+  and spend row.
 - Usage tracking returns two numbers: **method cost** (counted even on cache
   hits, so reported cost reflects the method) and **money spent** (real calls only).
 - `Ledger` with a hard cap (`run.budget_cap`, default 20) on spend **cumulative
   across all commands**: every real call appends a row (timestamp, command,
-  model, prompt_tokens, completion_tokens, cost) to a `spend` table in the same
+  model, prompt_tokens, completion_tokens, cost, provider) to a `spend` table in the same
   SQLite database as the cache, and the ledger reads the running total at
   startup. Charge a pessimistic estimate *before* each real call; raise
   `BudgetExceeded` if over.
@@ -160,9 +177,10 @@ queries (`run --limit N`) are a seeded random sample, not the lowest ids.
 
 Outputs in `bench.out_dir`: `test_a.jsonl` (`qid, target_id, target_aliases,
 query, attempt, leak_stats, judge_verdicts, prompt_hashes`, plus the attempt's
-LLM `usage`), `rejections.jsonl` (one row per rejected attempt with `reason`
-and `detail`), and `stats.json` (accepted, rejected by reason, attempts per
-target, LLM usage and method cost). Rows are appended as attempts finish, so a
+LLM `usage` and, per role, the `providers` that served its calls),
+`rejections.jsonl` (one row per rejected attempt with `reason` and `detail`),
+and `stats.json` (accepted, rejected by reason, attempts per target, LLM usage,
+calls per provider and method cost). Rows are appended as attempts finish, so a
 rerun resumes: targets already accepted or exhausted are skipped, an
 interrupted target continues with its next attempt, and outputs made with other
 prompts, models or another corpus are refused. Stop at `n_targets` accepted
@@ -170,14 +188,14 @@ queries. The BM25 rank of each target is not computed here (see Evaluation).
 
 ## Retrieval configurations (`retrieval.py`, `agent.py`)
 All implement one interface, `retrieve(query)`, returning a ranked list of up
-to 100 doc ids plus a trace (queries issued, LLM calls, prompt/completion
-tokens, method cost, latency, errors, prompt hashes). Every ranking breaks ties
-by doc id.
+to 100 doc ids plus a trace (queries issued, LLM calls and the provider that
+served each, prompt/completion tokens, method cost, latency, errors, prompt
+hashes). Every ranking breaks ties by doc id.
 
 | ID | Strategy |
 |---|---|
 | B1 | BM25 (`bm25s`), single query; only docs with a positive score |
-| B2 | Dense: sentence-transformers (default `BAAI/bge-small-en-v1.5`, pinned to the Hugging Face commit `retrieval.encoder_revision`, query prefix from config), normalised float32 vectors, FAISS `IndexFlatIP` |
+| B2 | Dense: sentence-transformers (default `BAAI/bge-small-en-v1.5`; `configs/phase1.yaml` uses `Qwen/Qwen3-Embedding-0.6B`), pinned to the Hugging Face commit `retrieval.encoder_revision`, run in `encoder_dtype` (default float32) with inputs truncated at `encoder_max_seq_length` tokens (default: the model's own). Queries get `query_prefix` (for Qwen3-Embedding, the model card's `Instruct: <task>\nQuery:` format), documents no prefix. Normalised float32 vectors, FAISS `IndexFlatIP` |
 | B3 | Hybrid: reciprocal rank fusion (k=60) of B1 and B2 top-100 |
 | B4 | One agent-model call returns JSON `{"queries": [...]}`: at most `max_queries - 1` rewrites, duplicates removed. Run B3 on the original + rewrites; RRF-fuse all lists. On a parse failure, the original query alone, with the error recorded |
 | B5 | The original query runs first with no LLM call. Each agent step sees the queries so far with the top-10 titles of each (titles only, to bound tokens) and returns `{"action": "search", "query": ...}` or `{"action": "stop", "reason": ...}`. Hard limits: `max_queries` queries in total and `max_llm_calls_agent` calls. A repeated query counts toward the budget but isn't re-run; a parse failure stops the loop and is recorded. Fused with exactly the same function as B4 |
@@ -191,9 +209,10 @@ BM25 gets the project's own tokenisation (`content_tokens` + `stem`). The
 encoder sits behind a small interface (`encode_queries`, `encode_docs`) so
 tests use a deterministic fake; it runs on the GPU if torch sees CUDA. Indexes
 are built once per frozen corpus and saved to `data/index/` with a manifest
-(corpus sha256, encoder and revision, device, doc count, build time); loading
-refuses an index whose corpus sha256 doesn't match the frozen corpus, and dense
-retrieval refuses an encoder or revision other than the index's.
+(corpus sha256, encoder, revision, dtype and max sequence length, device, doc
+count, build time); loading refuses an index whose corpus sha256 doesn't match
+the frozen corpus, and dense retrieval refuses an encoder whose name, revision,
+dtype or max sequence length differs from the index's.
 
 ## Evaluation (`evaluate.py`)
 - **Runner** (`python -m rk run`): loads the frozen corpus, index and bench (all

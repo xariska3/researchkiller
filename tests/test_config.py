@@ -70,12 +70,25 @@ def _write(tmp_path: Path, data: dict[str, Any]) -> Path:
 def test_repo_config_loads() -> None:
     cfg = load_config(REPO_CONFIG)
     assert isinstance(cfg, Config)
-    assert cfg.run.budget_cap == 20.0
-    assert cfg.retrieval.encoder == "BAAI/bge-small-en-v1.5"
-    assert isinstance(cfg.bench.target_from_date, date)
-    assert isinstance(cfg.corpus.filters, tuple) and cfg.corpus.filters
+    assert cfg.run.budget_cap == 12.0
+    assert (cfg.bench.n_targets, cfg.bench.target_from_date) == (500, date(2026, 1, 1))
+    assert cfg.corpus.filters and all("language:en" in f for f in cfg.corpus.filters)
     assert len({m.family for m in cfg.models().values()}) == 3
     assert all(isinstance(m.training_cutoff, date) for m in cfg.models().values())
+    assert all(m.provider for m in cfg.models().values())  # every role is pinned
+
+
+def test_repo_config_uses_qwen3_embedding_as_its_model_card_says() -> None:
+    r = load_config(REPO_CONFIG).retrieval
+    assert (r.encoder, r.encoder_dtype, r.encoder_max_seq_length) == (
+        "Qwen/Qwen3-Embedding-0.6B",
+        "float16",
+        512,
+    )
+    # "Instruct: {task_description}\nQuery:{query}" with a one-sentence task.
+    task = r.query_prefix.removeprefix("Instruct: ").removesuffix("\nQuery:")
+    assert r.query_prefix == f"Instruct: {task}\nQuery:"
+    assert task and "\n" not in task and not task.endswith(".")
 
 
 def test_load_coerces_types_and_applies_defaults(tmp_path: Path) -> None:
@@ -89,8 +102,10 @@ def test_load_coerces_types_and_applies_defaults(tmp_path: Path) -> None:
     assert cfg.run.results_db == Path("data/results.sqlite")
     assert cfg.run.mlflow_tracking_uri == "sqlite:///mlflow.db"
     assert cfg.retrieval.encoder == "BAAI/bge-small-en-v1.5"
+    assert (cfg.retrieval.encoder_dtype, cfg.retrieval.encoder_max_seq_length) == ("float32", None)
     assert cfg.corpus.max_works_per_sweep == 25000
     assert cfg.corpus.mailto_env is None
+    assert cfg.agent.provider is None  # OpenRouter routes freely unless pinned
 
 
 def test_date_may_be_a_quoted_string() -> None:
@@ -135,6 +150,8 @@ def test_missing_section_raises() -> None:
         ("corpus", "filters", [1702]),
         ("paraphraser", "temperature", None),
         ("judge", "training_cutoff", "late 2024"),
+        ("retrieval", "encoder_max_seq_length", "512"),
+        ("agent", "provider", ["openai"]),
     ],
 )
 def test_wrong_types_raise(section: str, key: str, value: Any) -> None:
@@ -156,6 +173,10 @@ def test_wrong_types_raise(section: str, key: str, value: Any) -> None:
         ("judge", "max_tokens", 0),
         ("retrieval", "encoder_revision", "main"),
         ("retrieval", "encoder_revision", "5C38EC7C405EC4B44B94CC5A9BB96E735B38267A"),
+        ("retrieval", "encoder_dtype", "fp16"),  # torch names only
+        ("retrieval", "encoder_dtype", "int8"),
+        ("retrieval", "encoder_max_seq_length", 0),
+        ("agent", "provider", " "),
     ],
 )
 def test_out_of_range_values_raise(section: str, key: str, value: Any) -> None:
@@ -167,7 +188,7 @@ def test_out_of_range_values_raise(section: str, key: str, value: Any) -> None:
 
 def test_duplicate_keys_raise(tmp_path: Path) -> None:
     text = REPO_CONFIG.read_text(encoding="utf-8").replace(
-        "  budget_cap: 20.0", "  budget_cap: 20.0\n  budget_cap: 500.0"
+        "  budget_cap: 12.0", "  budget_cap: 12.0\n  budget_cap: 500.0"
     )
     path = tmp_path / "dup.yaml"
     path.write_text(text, encoding="utf-8")

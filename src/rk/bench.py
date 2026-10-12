@@ -245,6 +245,7 @@ class Attempt:
     leak_stats: dict[str, Any]
     judge_verdicts: dict[str, Any]
     usage: dict[str, Usage]
+    providers: dict[str, list[str | None]]  # per role, who served each call, in order
 
 
 _JUDGE_NO = {
@@ -277,6 +278,7 @@ def run_attempt(
         [{"role": "user", "content": prompt}], seed=base_seed + attempt
     )
     usage = {"paraphraser": completion.usage, "judge": Usage()}
+    providers: dict[str, list[str | None]] = {"paraphraser": [completion.provider], "judge": []}
     query = clean_proposal(completion.text)
 
     length_rejection, length_stats = check_length(query)
@@ -290,6 +292,7 @@ def run_attempt(
             )
             reply: Completion = judge.complete([{"role": "user", "content": judge_prompt}])
             usage["judge"] = usage["judge"] + reply.usage
+            providers["judge"].append(reply.provider)
             verdict = parse_verdict(reply.text)
             if verdict is None:
                 verdicts[direction] = {"verdict": None, "raw": reply.text[:500]}
@@ -303,7 +306,7 @@ def run_attempt(
                     f"judge_{direction}", f"{_JUDGE_NO[direction]} ({verdict['reason']})"
                 )
                 break
-    return Attempt(query, rejection, {**length_stats, **leak_stats}, verdicts, usage)
+    return Attempt(query, rejection, {**length_stats, **leak_stats}, verdicts, usage, providers)
 
 
 def make_bench(
@@ -418,6 +421,7 @@ def _row(
         judge_verdicts=result.judge_verdicts,
         prompt_hashes=prompt_hashes,
         usage={role: dataclasses.asdict(u) for role, u in result.usage.items()},
+        providers=result.providers,
     )
     return row
 
@@ -445,6 +449,10 @@ def bench_stats(
         for role in ("paraphraser", "judge")
     }
     total = usage["paraphraser"] + usage["judge"]
+    providers = {
+        role: dict(Counter(str(p) for r in rows for p in r.get("providers", {}).get(role, [])))
+        for role in ("paraphraser", "judge")
+    }
     return {
         "n_targets_goal": cfg.bench.n_targets,
         "targets_available": n_available,
@@ -455,6 +463,7 @@ def bench_stats(
         "exhausted": len(exhausted),
         "attempts_per_target": dict(sorted(per_target.items(), key=lambda kv: id_number(kv[0]))),
         "llm_usage": {role: dataclasses.asdict(u) for role, u in usage.items()},
+        "llm_providers": providers,  # calls per reported provider; "None" if not reported
         "method_cost": total.method_cost,
         "money_spent": total.money_spent,
         **meta,

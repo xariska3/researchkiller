@@ -7,6 +7,11 @@ client charges a pessimistic estimate to the Ledger, which refuses calls that
 could take cumulative spend (across all commands, persisted next to the cache)
 over its cap. Cache hits never touch the network, the ledger or the API key, so
 a cached run replays offline and for free.
+
+On OpenRouter, a model's `provider` pins one endpoint with fallbacks disabled
+(https://openrouter.ai/docs/guides/routing/provider-selection), and every
+request asks for router metadata (https://openrouter.ai/docs/guides/features/router-metadata)
+so the provider that served each call is stored with the reply and its spend row.
 """
 
 from __future__ import annotations
@@ -34,6 +39,8 @@ if TYPE_CHECKING:  # annotation only: typing.Self needs Python 3.11
     from typing_extensions import Self
 
 Message = Mapping[str, str]  # {"role": ..., "content": ...}
+
+METADATA_HEADER = {"X-OpenRouter-Metadata": "enabled"}  # other servers ignore it
 
 
 class _Closing:
@@ -93,6 +100,7 @@ class Completion:
     cached: bool
     model: str
     finish_reason: str | None
+    provider: str | None = None  # who served it, as OpenRouter reports (also on cache hits)
 
 
 class ChatModel(Protocol):
@@ -146,16 +154,27 @@ def pessimistic_cost(model: ModelConfig, messages: Sequence[Message]) -> float:
 
 
 def cache_key(
-    model: str, messages: Sequence[Message], temperature: float, seed: int, max_tokens: int
+    model: str,
+    messages: Sequence[Message],
+    temperature: float,
+    seed: int,
+    max_tokens: int,
+    provider: Mapping[str, Any] | None = None,
 ) -> str:
-    """sha256 of the canonical JSON of (model, messages, temperature, seed, max_tokens)."""
-    payload = {
+    """sha256 of the canonical JSON of (model, messages, temperature, seed, max_tokens).
+
+    A provider pin (OpenRouter routing) is part of the key when set, so replies
+    from one provider are never served for another; without one the key is unchanged.
+    """
+    payload: dict[str, Any] = {
         "model": model,
         "messages": [dict(m) for m in messages],
         "temperature": float(temperature),
         "seed": int(seed),
         "max_tokens": int(max_tokens),
     }
+    if provider is not None:
+        payload["provider"] = dict(provider)
     blob = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
@@ -166,6 +185,7 @@ class CachedReply:
     finish_reason: str | None
     prompt_tokens: int
     completion_tokens: int
+    provider: str | None = None
 
 
 _SCHEMA = """
@@ -177,7 +197,8 @@ CREATE TABLE IF NOT EXISTS completions (
     finish_reason TEXT,
     prompt_tokens INTEGER NOT NULL,
     completion_tokens INTEGER NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    provider TEXT
 )
 """
 
@@ -189,7 +210,8 @@ CREATE TABLE IF NOT EXISTS spend (
     model TEXT NOT NULL,
     prompt_tokens INTEGER NOT NULL,
     completion_tokens INTEGER NOT NULL,
-    cost REAL NOT NULL
+    cost REAL NOT NULL,
+    provider TEXT
 )
 """
 
@@ -215,7 +237,7 @@ class LLMCache(_Closing):
 
     def get(self, key: str) -> CachedReply | None:
         row = self._conn.execute(
-            "SELECT text, finish_reason, prompt_tokens, completion_tokens"
+            "SELECT text, finish_reason, prompt_tokens, completion_tokens, provider"
             " FROM completions WHERE key = ?",
             (key,),
         ).fetchone()
@@ -224,7 +246,9 @@ class LLMCache(_Closing):
     def put(self, key: str, request: Mapping[str, Any], reply: CachedReply) -> None:
         """Store a reply with its full request, committing at once so paid calls survive a crash."""
         self._conn.execute(
-            "INSERT OR REPLACE INTO completions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO completions (key, model, request, text, finish_reason,"
+            " prompt_tokens, completion_tokens, created_at, provider)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 key,
                 request["model"],
@@ -234,6 +258,7 @@ class LLMCache(_Closing):
                 reply.prompt_tokens,
                 reply.completion_tokens,
                 _utc_now(),
+                reply.provider,
             ),
         )
         self._conn.commit()
@@ -295,11 +320,13 @@ class Ledger(_Closing):
         prompt_tokens: int,
         completion_tokens: int,
         cost: float,
+        provider: str | None = None,
     ) -> None:
-        """Release a reservation and persist what the call cost."""
+        """Release a reservation and persist what the call cost, and who served it if known."""
         self._conn.execute(
-            "INSERT INTO spend VALUES (?, ?, ?, ?, ?, ?)",
-            (_utc_now(), self.command, model, prompt_tokens, completion_tokens, cost),
+            "INSERT INTO spend (timestamp, command, model, prompt_tokens, completion_tokens,"
+            " cost, provider) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (_utc_now(), self.command, model, prompt_tokens, completion_tokens, cost, provider),
         )
         self._conn.commit()
         self._reserved -= reserved
@@ -352,6 +379,8 @@ class LLMClient(_Closing):
             "max_tokens": self.model.max_tokens,
             "seed": self.model.seed if seed is None else seed,
         }
+        if self.model.provider is not None:
+            request["provider"] = provider_routing(self.model.provider)
         key = cache_key(**request)
         reply = self.cache.get(key)
         cached = reply is not None
@@ -374,6 +403,7 @@ class LLMClient(_Closing):
             cached=cached,
             model=self.model.name,
             finish_reason=reply.finish_reason,
+            provider=reply.provider,
         )
 
     def _real_call(self, request: dict[str, Any]) -> CachedReply:
@@ -407,6 +437,7 @@ class LLMClient(_Closing):
             prompt_tokens=reply.prompt_tokens,
             completion_tokens=reply.completion_tokens,
             cost=token_cost(self.model, reply.prompt_tokens, reply.completion_tokens),
+            provider=reply.provider,
         )
         return reply
 
@@ -417,7 +448,7 @@ class LLMClient(_Closing):
         4xx response clears that again. `billing` carries the verdict out, even
         when the call ends in an exception.
         """
-        headers = {"Authorization": f"Bearer {api_key}"}
+        headers = {"Authorization": f"Bearer {api_key}", **METADATA_HEADER}
         for attempt in range(self.max_retries + 1):
             retry_after: float | None = None
             billed_before = billing.possible
@@ -490,7 +521,29 @@ def _parse_reply(data: Any, model_name: str) -> CachedReply:
         finish_reason=choice.get("finish_reason"),
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
+        provider=served_provider(data),
     )
+
+
+def provider_routing(slug: str) -> dict[str, Any]:
+    """OpenRouter's `provider` request field: only this endpoint, no fallbacks."""
+    return {"order": [slug], "allow_fallbacks": False}
+
+
+def served_provider(data: Mapping[str, Any]) -> str | None:
+    """The provider OpenRouter reports as having served a completion, else None.
+
+    The documented place is the `selected` entry of
+    openrouter_metadata.endpoints.available (sent because of METADATA_HEADER);
+    responses also carry a top-level "provider" string, used as the fallback.
+    """
+    try:
+        available = data["openrouter_metadata"]["endpoints"]["available"]
+        selected = [e["provider"] for e in available if e.get("selected") is True]
+    except (KeyError, TypeError, AttributeError):
+        selected = []
+    provider = selected[0] if selected else data.get("provider")
+    return provider if isinstance(provider, str) else None
 
 
 def retry_after_seconds(response: httpx.Response) -> float | None:

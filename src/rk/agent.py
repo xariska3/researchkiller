@@ -107,7 +107,7 @@ class AgentRetriever:
             )
             reply = self.agent.complete([{"role": "user", "content": text}])
             calls += 1
-            trace.usage += reply.usage
+            trace.add_call(reply)
             try:
                 action = parse_action(reply.text)
             except (ValueError, TypeError) as exc:

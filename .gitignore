@@ -8,6 +8,7 @@ mlflow.db
 # Secrets
 .env
 .env.*
+!.env.example
 
 # Caches and local databases (includes the LLM cache)
 *.sqlite

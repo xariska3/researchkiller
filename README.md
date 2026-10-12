@@ -18,6 +18,11 @@ encoding on Windows, first install a CUDA build of torch
 (`pip install torch --index-url https://download.pytorch.org/whl/cu128`), since
 the PyPI wheel is CPU-only.
 
+API keys go in `.env` at the repo root (copy `.env.example`; `.env` is
+git-ignored): `OPENROUTER_API_KEY` for the paraphraser, judge and agent, and
+optionally `OPENALEX_API_KEY`. `python -m rk` loads the file at startup;
+variables already set in the environment take precedence.
+
 ## Running
 
 ```

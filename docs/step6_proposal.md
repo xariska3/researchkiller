@@ -463,3 +463,42 @@ families, and `target_from_date` later than every cutoff.
   (2026-01-01) narrows this risk.
 - **Growing counts:** all counts are from 2026-10-12 and will grow until the
   build date.
+
+## Step 6b: what was applied
+
+The proposal was approved with changes, and `configs/phase1.yaml` now holds:
+
+- `target_from_date: 2026-01-01`, which leaves ≈ 2,015 eligible targets
+  (≈ 1,950 after the abstract-length rule).
+- `n_targets: 500`, so 750 targets are sampled.
+- `budget_cap: 12`.
+- `language:en` in every filter string.
+
+**Encoder:**
+- **dtype and length:** `encoder_dtype: float16` and `encoder_max_seq_length: 512`, both recorded in the index manifest.
+- **Queries:** the model card's format, `Instruct: <task>\nQuery:<query>`.
+- **Documents:** no prefix.
+- **Requirements:** the card requires `transformers>=4.51.0` and `sentence-transformers>=2.7.0`. These are now the lower bounds of the dense extra; 5.19.0 and 6.1.0 are installed.
+
+**Pinned OpenRouter providers**, from each model's endpoint list on 2026-10-12. Each is sent with fallbacks disabled.
+
+| Role | Endpoint | $/M in / out | Why |
+|---|---|---|---|
+| Paraphraser | `novita/fp8` | 0.27 / 0.85 | Cheapest endpoint that lists `seed`. DigitalOcean ($0.188 / $0.652) doesn't list it; Parasail fp8 and Google Vertex cost more. |
+| Judge | `openai` | 0.40 / 1.60 | First party. Azure has the same price. |
+| Agent | `parasail/fp8` | 0.14 / 0.80 | 100% uptime over the last 30 minutes. DeepInfra fp8 ($0.09 / $0.55) was degraded (status −5, 53% uptime). GMICloud ($0.087 / $0.35) had no uptime data. |
+
+The proposal's estimate assumed the cheapest endpoints. Here it is again with the pinned prices and the same token counts:
+
+| | 30 queries (pilot) | 500 queries (full) |
+|---|---|---|
+| Bench, pessimistic ($0.000773 per attempt) | $0.08 | $1.29 |
+| Run, worst case ($0.005195 per query) | $0.16 | $2.60 |
+| **Total** | **≈ $0.23** | **≈ $3.89** |
+
+**OpenAlex calls for the build**, scaled from section 4 to 750 sampled targets:
+- ≈ 420 sweep pages;
+- ≈ 420 reference batches;
+- ≈ 1,170 citer queries.
+
+That is ≈ 2,000 calls ≈ $0.20, within the keyed daily budget.

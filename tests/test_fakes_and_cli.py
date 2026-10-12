@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import runpy
 import sys
 from pathlib import Path
@@ -7,8 +8,10 @@ from pathlib import Path
 import numpy as np
 import pytest
 from conftest import FakeEncoder, FakeLLM
+from dotenv import dotenv_values
 
-from rk.cli import main
+from rk.cli import load_env_file, main
+from rk.config import load_config
 
 
 def test_fake_llm_reports_usage_and_records_prompts() -> None:
@@ -56,11 +59,39 @@ def test_cli_rejects_bad_run_arguments(
     assert message in capsys.readouterr().err
 
 
-def test_python_dash_m_rk_runs_the_cli(
+def test_python_dash_m_rk_loads_dotenv_then_runs_the_cli(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    monkeypatch.chdir(tmp_path)  # .env is read from the working directory, never the repo's here
+    (tmp_path / ".env").write_text("RK_TEST_FROM_FILE=loaded\n", encoding="utf-8")
+    monkeypatch.delenv("RK_TEST_FROM_FILE", raising=False)  # unset again after the test
     monkeypatch.setattr(sys, "argv", ["rk", "report", str(tmp_path / "no-such-run")])
     with pytest.raises(SystemExit) as exit_info:
         runpy.run_module("rk", run_name="__main__")
     assert exit_info.value.code == 1
     assert "is not a run directory" in capsys.readouterr().err
+    assert os.environ["RK_TEST_FROM_FILE"] == "loaded"
+
+
+def test_env_file_never_overrides_the_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = tmp_path / ".env"
+    env.write_text("RK_TEST_FROM_FILE=file\nRK_TEST_ALREADY_SET=file\n", encoding="utf-8")
+    monkeypatch.delenv("RK_TEST_FROM_FILE", raising=False)
+    monkeypatch.setenv("RK_TEST_ALREADY_SET", "environment")
+
+    assert load_env_file(env)
+    assert os.environ["RK_TEST_FROM_FILE"] == "file"
+    assert os.environ["RK_TEST_ALREADY_SET"] == "environment"
+    assert not load_env_file(tmp_path / "missing.env")
+
+
+def test_env_example_lists_every_variable_the_config_reads_with_empty_values() -> None:
+    root = Path(__file__).resolve().parents[1]
+    cfg = load_config(root / "configs" / "phase1.yaml")
+    read = {m.api_key_env for m in cfg.models().values()}
+    read |= {cfg.corpus.api_key_env, cfg.corpus.mailto_env}
+    example = dotenv_values(root / ".env.example")
+    assert read == set(example)
+    assert not any(example.values())

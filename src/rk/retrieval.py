@@ -23,7 +23,7 @@ import numpy as np
 
 from rk.config import Config, RetrievalConfig
 from rk.corpus import CORPUS_FILE, load_frozen_corpus
-from rk.llm import ChatModel, Prompt, Usage, parse_json
+from rk.llm import ChatModel, Completion, Prompt, Usage, parse_json
 from rk.targets import Record, id_number
 from rk.text import content_tokens, stem
 
@@ -58,6 +58,8 @@ class Encoder(Protocol):
     name: str
     revision: str  # model version (a Hugging Face commit hash)
     device: str
+    dtype: str  # torch dtype the model runs in
+    max_seq_length: int | None  # inputs are truncated to this many tokens
 
     def encode_queries(self, texts: Sequence[str]) -> np.ndarray: ...
 
@@ -65,10 +67,21 @@ class Encoder(Protocol):
 
 
 class SentenceTransformerEncoder:
-    """A sentence-transformers model at a pinned revision, on the GPU if torch sees CUDA."""
+    """A sentence-transformers model at a pinned revision, on the GPU if torch sees CUDA.
+
+    Queries get `query_prefix` (for Qwen3-Embedding, the model card's
+    "Instruct: <task>\\nQuery:" format); documents get no prefix.
+    """
 
     def __init__(
-        self, model_name: str, *, revision: str, query_prefix: str = "", batch_size: int = 64
+        self,
+        model_name: str,
+        *,
+        revision: str,
+        query_prefix: str = "",
+        dtype: str = "float32",
+        max_seq_length: int | None = None,
+        batch_size: int = 64,
     ):
         try:
             import torch
@@ -81,11 +94,18 @@ class SentenceTransformerEncoder:
         self.name = model_name
         self.revision = revision
         self.device = f"cuda ({torch.cuda.get_device_name(0)})" if cuda else "cpu"
+        self.dtype = dtype
         self.query_prefix = query_prefix
         self.batch_size = batch_size
         self._model = SentenceTransformer(
-            model_name, revision=revision, device="cuda" if cuda else "cpu"
+            model_name,
+            revision=revision,
+            device="cuda" if cuda else "cpu",
+            model_kwargs={"dtype": getattr(torch, dtype)},
         )
+        if max_seq_length is not None:
+            self._model.max_seq_length = max_seq_length
+        self.max_seq_length = self._model.max_seq_length  # the effective limit
 
     def encode_queries(self, texts: Sequence[str]) -> np.ndarray:
         return self._encode([self.query_prefix + t for t in texts])
@@ -106,8 +126,21 @@ class SentenceTransformerEncoder:
 
 def make_encoder(cfg: RetrievalConfig) -> Encoder:
     return SentenceTransformerEncoder(
-        cfg.encoder, revision=cfg.encoder_revision, query_prefix=cfg.query_prefix
+        cfg.encoder,
+        revision=cfg.encoder_revision,
+        query_prefix=cfg.query_prefix,
+        dtype=cfg.encoder_dtype,
+        max_seq_length=cfg.encoder_max_seq_length,
     )
+
+
+ENCODER_SETTINGS = ("encoder", "encoder_revision", "encoder_dtype", "encoder_max_seq_length")
+
+
+def encoder_settings(encoder: Encoder) -> dict[str, Any]:
+    """What makes two encoders' vectors comparable; recorded in the index manifest."""
+    values = (encoder.name, encoder.revision, encoder.dtype, encoder.max_seq_length)
+    return dict(zip(ENCODER_SETTINGS, values))
 
 
 def _unit_rows(vectors: np.ndarray) -> np.ndarray:
@@ -159,8 +192,7 @@ def build_index(cfg: Config, encoder: Encoder) -> dict[str, Any]:
     (out_dir / DOC_IDS_FILE).write_text(json.dumps(doc_ids), encoding="utf-8")
     manifest = {
         "corpus_sha256": corpus_manifest["files"][CORPUS_FILE]["sha256"],
-        "encoder": encoder.name,
-        "encoder_revision": encoder.revision,
+        **encoder_settings(encoder),
         "device": encoder.device,
         "dim": int(vectors.shape[1]),
         "n_docs": len(doc_ids),
@@ -256,17 +288,24 @@ class Trace:
     queries: list[str] = field(default_factory=list)  # queries actually run, in order
     budget_used: int = 0  # queries counted against max_queries (repeats count)
     usage: Usage = field(default_factory=Usage)
+    providers: list[str | None] = field(default_factory=list)  # who served each LLM call
     latency_s: float = 0.0
     errors: list[str] = field(default_factory=list)
     prompt_hashes: dict[str, str] = field(default_factory=dict)
     steps: list[dict[str, Any]] = field(default_factory=list)  # agent decisions (B5)
     stop_reason: str | None = None  # why an agent loop ended (B5)
 
+    def add_call(self, reply: Completion) -> None:
+        """Count an LLM call's usage and the provider that served it."""
+        self.usage += reply.usage
+        self.providers.append(reply.provider)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "queries": self.queries,
             "budget_used": self.budget_used,
             "llm_calls": self.usage.calls,
+            "providers": self.providers,
             "prompt_tokens": self.usage.prompt_tokens,
             "completion_tokens": self.usage.completion_tokens,
             "method_cost": self.usage.method_cost,
@@ -320,12 +359,16 @@ class DenseRetriever(_SingleQuery):
     name = "B2"
 
     def __init__(self, index: Index, encoder: Encoder) -> None:
-        built = (index.manifest["encoder"], index.manifest.get("encoder_revision"))
-        if (encoder.name, encoder.revision) != built:
+        settings = encoder_settings(encoder)
+        differ = [
+            f"{key} {index.manifest.get(key)!r} in the index but {value!r} now"
+            for key, value in settings.items()
+            if index.manifest.get(key) != value
+        ]
+        if differ:
             raise RetrievalError(
-                f"the index was built with encoder {built[0]!r} at revision {built[1]!r}, "
-                f"not {encoder.name!r} at {encoder.revision!r}: rebuild it or change "
-                "retrieval.encoder / encoder_revision"
+                f"the index was built with other encoder settings ({'; '.join(differ)}): "
+                "rebuild the index or change the retrieval settings back"
             )
         self.index = index
         self.encoder = encoder
@@ -388,7 +431,7 @@ class RewriteRetriever:
         if n_rewrites > 0:
             text = self.prompt.render(proposal=query, n_queries=str(n_rewrites))
             reply = self.agent.complete([{"role": "user", "content": text}])
-            trace.usage += reply.usage
+            trace.add_call(reply)
             try:
                 rewrites = parse_rewrites(reply.text, original=query, limit=n_rewrites)
             except (ValueError, TypeError) as exc:  # fall back to the original query alone

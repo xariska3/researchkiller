@@ -21,6 +21,8 @@ from rk.llm import (
     parse_json,
     pessimistic_cost,
     prompt_token_bound,
+    provider_routing,
+    served_provider,
     token_cost,
 )
 
@@ -101,6 +103,73 @@ def test_cache_key_covers_every_request_field(change: dict[str, Any]) -> None:
     }
     assert cache_key(**base) == cache_key(**{**base, "temperature": 0})  # int vs float
     assert cache_key(**base) != cache_key(**{**base, **change})
+
+
+def test_cache_key_covers_a_provider_pin_and_is_unchanged_without_one() -> None:
+    base: dict[str, Any] = {
+        "model": "m",
+        "messages": MSGS,
+        "temperature": 0.0,
+        "seed": 7,
+        "max_tokens": 64,
+    }
+    unpinned = cache_key(**base)
+    assert cache_key(**base, provider=None) == unpinned
+    novita = cache_key(**base, provider=provider_routing("novita/fp8"))
+    parasail = cache_key(**base, provider=provider_routing("parasail/fp8"))
+    assert len({unpinned, novita, parasail}) == 3
+
+
+def test_pinned_provider_is_sent_without_fallbacks_and_the_served_one_is_recorded(
+    db_path: Path, llm_cache: LLMCache, make_ledger: MakeLedger, api_key: str
+) -> None:
+    fake = FakeLLM(["reply"], provider="Novita")
+    model = make_model_config(provider="novita/fp8")
+    client = LLMClient(model, llm_cache, make_ledger(), transport=fake.transport)
+
+    first = client.complete(MSGS)
+    second = client.complete(MSGS)  # from the cache
+
+    assert fake.requests[0]["provider"] == {"order": ["novita/fp8"], "allow_fallbacks": False}
+    assert fake.headers[0]["X-OpenRouter-Metadata"] == "enabled"
+    assert (first.provider, second.cached, second.provider) == ("Novita", True, "Novita")
+    with closing(sqlite3.connect(db_path)) as conn:
+        spend = conn.execute("SELECT model, provider FROM spend").fetchall()
+        stored = conn.execute("SELECT provider, request FROM completions").fetchall()
+    assert spend == [("fake-model", "Novita")]
+    assert stored[0][0] == "Novita" and '"allow_fallbacks": false' in stored[0][1]
+
+
+def test_unpinned_requests_have_no_provider_field(
+    db_path: Path, llm_cache: LLMCache, make_ledger: MakeLedger, api_key: str
+) -> None:
+    fake = FakeLLM(["reply"])  # like a server that doesn't report a provider
+    client = LLMClient(make_model_config(), llm_cache, make_ledger(), transport=fake.transport)
+    assert client.complete(MSGS).provider is None
+    assert "provider" not in fake.requests[0]
+    assert fake.headers[0]["X-OpenRouter-Metadata"] == "enabled"  # harmless elsewhere
+    with closing(sqlite3.connect(db_path)) as conn:
+        assert conn.execute("SELECT provider FROM spend").fetchall() == [(None,)]
+
+
+def _metadata(*endpoints: tuple[str, bool]) -> dict[str, Any]:
+    available = [{"provider": p, "model": "m", "selected": s} for p, s in endpoints]
+    return {"endpoints": {"total": len(available), "available": available}}
+
+
+@pytest.mark.parametrize(
+    ("data", "expected"),
+    [
+        ({"openrouter_metadata": _metadata(("A", False), ("B", True)), "provider": "C"}, "B"),
+        ({"provider": "Liquid"}, "Liquid"),  # the top-level field, without metadata
+        ({"openrouter_metadata": _metadata(("A", False)), "provider": "Liquid"}, "Liquid"),
+        ({"openrouter_metadata": {"endpoints": "garbled"}}, None),
+        ({"provider": 5}, None),
+        ({}, None),
+    ],
+)
+def test_served_provider(data: dict[str, Any], expected: str | None) -> None:
+    assert served_provider(data) == expected
 
 
 def test_seed_override_is_a_separate_cache_entry(

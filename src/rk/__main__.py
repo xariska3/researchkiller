@@ -1,6 +1,6 @@
 """`python -m rk <command>`: same as the `rk` console script."""
 
-from rk.cli import main
+from rk.cli import entry
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(entry())

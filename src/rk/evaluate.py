@@ -31,7 +31,7 @@ from rk.bench import ACCEPTED_FILE, STATS_FILE
 from rk.config import Config, RunConfig
 from rk.corpus import CORPUS_FILE, load_frozen_corpus
 from rk.llm import ChatModel, LLMError, load_prompt
-from rk.retrieval import TOP_K, Encoder, Result, load_index
+from rk.retrieval import ENCODER_SETTINGS, TOP_K, Encoder, Result, load_index
 
 CONFIG_ORDER = ("B1", "B2", "B3", "B4", "B5", "B5-U")
 PAIRS = (("B4", "B3"), ("B5", "B4"), ("B5-U", "B5"))
@@ -511,7 +511,7 @@ def _fingerprint(meta: dict[str, Any]) -> dict[str, Any]:
     return {
         "corpus_sha256": meta["corpus_sha256"],
         "bench_sha256": meta["bench_sha256"],
-        "index": {k: meta["index"].get(k) for k in ("corpus_sha256", "encoder", "encoder_revision")},
+        "index": {k: meta["index"].get(k) for k in ("corpus_sha256", *ENCODER_SETTINGS)},
         "retrieval": config["retrieval"],
         "agent": config["agent"],
         "retrieval_prompts": meta["prompt_hashes"]["retrieval"],
@@ -565,8 +565,7 @@ def run_eval(
             "paraphraser": cfg.paraphraser.name,
             "judge": cfg.judge.name,
             "agent": cfg.agent.name,
-            "encoder": index.manifest["encoder"],
-            "encoder_revision": index.manifest.get("encoder_revision"),
+            **{key: index.manifest.get(key) for key in ENCODER_SETTINGS},
         },
         "config": _jsonable(dataclasses.asdict(cfg)),
         "seed": cfg.run.seed,

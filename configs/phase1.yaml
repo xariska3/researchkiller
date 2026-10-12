@@ -1,24 +1,27 @@
-# Phase 1 configuration (see docs/phase1_spec.md).
+# Phase 1 configuration (see docs/phase1_spec.md; choices in docs/step6_proposal.md).
 # Loading is strict: unknown, duplicate or missing keys and wrong types raise.
 # Values marked "placeholder" are not fixed by the spec; calibrate them in the
-# Step 6 pilot.
+# Step 6 pilot. API keys come from the environment or from .env (see .env.example).
 
 corpus:
-  # OpenAlex /works filter strings, one subfield sweep each.
-  # `has_abstract:true` is always added by the corpus builder.
+  # OpenAlex /works filter strings, one sweep per topic.
+  # `has_abstract:true` and `to_publication_date:<build date>` are always added.
   filters:
-    - "primary_topic.subfield.id:1702,from_publication_date:2023-01-01"
+    - "primary_topic.id:T10028,language:en,from_publication_date:2025-01-01"   # Topic Modeling (LLM applications)
+    - "primary_topic.id:T10181,language:en,from_publication_date:2025-01-01"   # NLP Techniques
+    - "primary_topic.id:T12031,language:en,from_publication_date:2025-01-01"   # Speech and dialogue systems
+    - "primary_topic.id:T10286,language:en,from_publication_date:2025-01-01"   # Information Retrieval and Search Behavior
   language: en
   min_abstract_words: 50          # placeholder
   max_citers_per_target: 20       # placeholder
-  max_works_per_sweep: 25000      # per filter string, newest first (publication_date desc)
+  max_works_per_sweep: 35000      # safety net; the largest sweep (T10028) had ~29k on 2026-10-12
   mailto_env: OPENALEX_MAILTO     # optional; OpenAlex has ignored mailto since Feb 2026
   api_key_env: OPENALEX_API_KEY   # optional, but a free key gives 10x the daily budget
   out_dir: data/corpus
 
 bench:
-  n_targets: 200                  # placeholder (the Step 6 pilot uses ~30)
-  target_from_date: 2025-06-01    # must be later than every model's training_cutoff
+  n_targets: 500                  # the pilot is the first 30 in seeded order (--limit 30)
+  target_from_date: 2026-01-01    # must be later than every model's training_cutoff
   max_attempts_per_target: 3      # placeholder
   max_distinctive_overlap: 0.15   # fraction of the abstract's top-20 IDF terms (0.15 = 3)
   max_content_jaccard: 0.15       # placeholder
@@ -26,9 +29,13 @@ bench:
   out_dir: data/bench
 
 retrieval:
-  encoder: BAAI/bge-small-en-v1.5
-  encoder_revision: 5c38ec7c405ec4b44b94cc5a9bb96e735b38267a   # HF commit (main as of 2024-02-22)
-  query_prefix: "Represent this sentence for searching relevant passages: "
+  encoder: Qwen/Qwen3-Embedding-0.6B
+  encoder_revision: 97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3   # HF commit (main on 2026-10-12)
+  encoder_dtype: float16          # same Hit@1 as float32 in the Step 6a check, ~4x faster
+  encoder_max_seq_length: 512     # model default is 32k; abstracts are ~430 tokens at p90
+  # Model card format for queries: "Instruct: <one-sentence task>\nQuery:<query>".
+  # Documents get no prefix.
+  query_prefix: "Instruct: Given a research proposal, retrieve scientific papers that describe the same research idea\nQuery:"
   max_queries: 5                          # placeholder; B4 and B5
   max_llm_calls_agent: 6                  # placeholder; B5
   max_queries_unconstrained: 15           # placeholder; B5-U
@@ -39,48 +46,52 @@ run:
   out_dir: runs
   cache_path: data/cache/llm.sqlite   # LLM cache + cumulative spend table
   seed: 42
-  budget_cap: 20.0                # USD; hard cap on real LLM spend across all commands
+  budget_cap: 12.0                # USD; hard cap on real LLM spend across all commands
   results_db: data/results.sqlite # runs + query_results tables, read by `rk report`
   mlflow_tracking_uri: sqlite:///mlflow.db   # repo root; artifacts go to mlartifacts/ beside it
   mlflow_experiment: researchkiller-phase1
 
 # Model roles. All three must come from different model families, and
 # bench.target_from_date must be later than every training_cutoff (both checked
-# at load time). Names, endpoints, prices and cutoffs are placeholders: verify
-# them before Step 6. Where no cutoff is published, the release date is used,
-# since it bounds the cutoff from above.
+# at load time). Where no cutoff is published, the release date is used, since
+# it bounds the cutoff from above. `provider` pins one OpenRouter endpoint with
+# fallbacks disabled; prices are that endpoint's OpenRouter prices on 2026-10-12.
+# Every pinned endpoint lists `seed` among its supported parameters.
 paraphraser:
-  name: qwen/qwen-2.5-72b-instruct
-  family: qwen
-  base_url: https://openrouter.ai/api/v1
-  api_key_env: OPENROUTER_API_KEY
-  price_in_per_m: 0.40
-  price_out_per_m: 0.40
-  temperature: 0.7
-  max_tokens: 400
-  seed: 42
-  training_cutoff: 2024-09-19     # release date; no published cutoff
-
-judge:
-  name: google/gemma-3-27b-it
-  family: gemma
-  base_url: https://openrouter.ai/api/v1
-  api_key_env: OPENROUTER_API_KEY
-  price_in_per_m: 0.20
-  price_out_per_m: 0.40
-  temperature: 0.0
-  max_tokens: 300
-  seed: 42
-  training_cutoff: 2024-08-31     # model card: August 2024
-
-agent:
-  name: meta-llama/llama-3.3-70b-instruct
+  name: meta-llama/llama-4-maverick
   family: llama
   base_url: https://openrouter.ai/api/v1
   api_key_env: OPENROUTER_API_KEY
-  price_in_per_m: 0.20
-  price_out_per_m: 0.40
+  provider: novita/fp8            # cheapest endpoint that honours seed (DigitalOcean doesn't)
+  price_in_per_m: 0.27
+  price_out_per_m: 0.85
+  temperature: 0.7
+  max_tokens: 400
+  seed: 42
+  training_cutoff: 2024-08-31     # model card: "a cutoff of August 2024"
+
+judge:
+  name: openai/gpt-4.1-mini
+  family: openai
+  base_url: https://openrouter.ai/api/v1
+  api_key_env: OPENROUTER_API_KEY
+  provider: openai                # first party
+  price_in_per_m: 0.40
+  price_out_per_m: 1.60
+  temperature: 0.0
+  max_tokens: 300
+  seed: 42
+  training_cutoff: 2024-06-01     # OpenAI docs: "Jun 01, 2024 knowledge cutoff"
+
+agent:
+  name: qwen/qwen3-235b-a22b-2507
+  family: qwen
+  base_url: https://openrouter.ai/api/v1
+  api_key_env: OPENROUTER_API_KEY
+  provider: parasail/fp8          # 100% uptime; the cheaper DeepInfra endpoint was degraded
+  price_in_per_m: 0.14
+  price_out_per_m: 0.80
   temperature: 0.0
   max_tokens: 400
   seed: 42
-  training_cutoff: 2023-12-31     # model card: December 2023
+  training_cutoff: 2025-07-21     # release date (HF createdAt); no published cutoff

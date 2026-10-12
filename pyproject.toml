@@ -15,14 +15,16 @@ dependencies = [
     "bm25s",
     "faiss-cpu",
     "mlflow",
+    "python-dotenv",
 ]
 
 [project.optional-dependencies]
-dense = ["sentence-transformers"]
+# Lower bounds from the Qwen3-Embedding model card (transformers < 4.51 can't load qwen3).
+dense = ["sentence-transformers>=2.7.0", "transformers>=4.51.0"]
 dev = ["pytest", "ruff==0.17.0"]  # ruff pinned: its default rule set changes between releases
 
 [project.scripts]
-rk = "rk.cli:main"
+rk = "rk.cli:entry"
 
 [tool.setuptools.dynamic]
 version = { attr = "rk.__version__" }

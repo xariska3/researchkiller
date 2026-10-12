@@ -9,6 +9,8 @@ from collections.abc import Sequence
 from contextlib import ExitStack, closing
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 from rk.bench import BenchError, format_accepted, make_bench
 from rk.config import ConfigError, load_config
 from rk.corpus import CorpusError, OpenAlexClient, OpenAlexError, build_corpus
@@ -16,6 +18,20 @@ from rk.evaluate import CONFIG_ORDER, SUMMARY_MD, EvalError, report, run_eval
 from rk.llm import BudgetExceeded, Ledger, LLMCache, LLMClient, LLMError
 from rk.retrieval import RetrievalError, build_index, make_encoder
 from rk.targets import TargetSelectionError
+
+ENV_FILE = Path(".env")  # API keys; relative to the repo root, like the config's paths
+
+
+def load_env_file(path: Path = ENV_FILE) -> bool:
+    """Load KEY=value lines from `path` into the environment, if the file exists.
+
+    Variables already set in the environment win over the file. Returns
+    whether a file was found.
+    """
+    if not path.is_file():
+        return False
+    load_dotenv(path, override=False)
+    return True
 
 
 def _positive_int(text: str) -> int:
@@ -203,5 +219,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
 
+def entry() -> int:
+    """Process entry point (`python -m rk` and the `rk` script): load .env, then run main()."""
+    load_env_file()
+    return main()
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(entry())

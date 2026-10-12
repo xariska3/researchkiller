@@ -137,6 +137,20 @@ def test_accepts_clean_proposals_and_writes_full_rows(tmp_path: Path, corpus_dir
     assert ORDER != sorted(ORDER)  # (the seeded order isn't just id order here)
 
 
+def test_rows_and_stats_record_who_served_each_call(tmp_path: Path, corpus_dir: Path) -> None:
+    cfg = _config(tmp_path)
+    para, jdg = paraphraser(**{ORDER[0]: [LEAKY["length"]]}), judge()
+    para.provider, jdg.provider = "Novita", "OpenAI"
+
+    stats = make_bench(cfg, para, jdg)
+
+    (rejected,) = _rows(cfg, REJECTIONS_FILE)
+    assert rejected["providers"] == {"paraphraser": ["Novita"], "judge": []}  # never judged
+    for row in _rows(cfg, ACCEPTED_FILE):
+        assert row["providers"] == {"paraphraser": ["Novita"], "judge": ["OpenAI", "OpenAI"]}
+    assert stats["llm_providers"] == {"paraphraser": {"Novita": 4}, "judge": {"OpenAI": 6}}
+
+
 # --- rejections --------------------------------------------------------------
 
 
