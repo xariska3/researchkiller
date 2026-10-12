@@ -13,6 +13,7 @@ import itertools
 import re
 import types
 import typing
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -211,10 +212,31 @@ def check_training_cutoffs(target_from_date: date, models: dict[str, ModelConfig
         )
 
 
-def load_config(path: str | Path) -> Config:
-    """Read a YAML config file into a validated Config."""
+def load_config(path: str | Path, overrides: Sequence[str] = ()) -> Config:
+    """Read a YAML config file into a validated Config.
+
+    `overrides` are "section.key=value" strings (the CLI's --set), applied before
+    validation; values are parsed as YAML, so numbers and dates keep their types.
+    """
     text = Path(path).read_text(encoding="utf-8")
-    return config_from_dict(yaml.load(text, Loader=_UniqueKeyLoader))
+    data = yaml.load(text, Loader=_UniqueKeyLoader)
+    for override in overrides:
+        apply_override(data, override)
+    return config_from_dict(data)
+
+
+def apply_override(data: Any, override: str) -> None:
+    """Set one "section.key=value" in a parsed config mapping, in place."""
+    dotted, sep, raw = override.partition("=")
+    keys = dotted.strip().split(".")
+    if not sep or not all(keys):
+        raise ConfigError(f"override {override!r}: expected section.key=value")
+    node = data
+    for key in keys[:-1]:
+        if not isinstance(node, dict) or not isinstance(node.get(key), dict):
+            raise ConfigError(f"override {override!r}: no section {key!r}")
+        node = node[key]
+    node[keys[-1]] = yaml.load(raw, Loader=_UniqueKeyLoader)
 
 
 def config_from_dict(data: Any) -> Config:

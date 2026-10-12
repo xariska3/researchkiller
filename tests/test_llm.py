@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Callable
 from contextlib import closing
@@ -155,6 +156,61 @@ def test_unpinned_requests_have_no_provider_field(
     assert fake.headers[0]["X-OpenRouter-Metadata"] == "enabled"  # harmless elsewhere
     with closing(sqlite3.connect(db_path)) as conn:  # nothing reported, nothing invented
         assert conn.execute("SELECT billed_cost, provider FROM spend").fetchall() == [(None, None)]
+
+
+SCHEMA = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "answer",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {"verdict": {"type": "string"}},
+            "required": ["verdict"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+def test_response_format_is_sent_and_is_part_of_the_cache_key(
+    llm_cache: LLMCache, make_ledger: MakeLedger, api_key: str
+) -> None:
+    fake = FakeLLM(['{"verdict": "yes"}', "free text"])
+    ledger = make_ledger(cap=1.0)
+    client = LLMClient(make_model_config(), llm_cache, ledger, transport=fake.transport)
+
+    structured = client.complete(MSGS, response_format=SCHEMA)
+    free = client.complete(MSGS)  # same messages, no schema: not served from the cache
+
+    assert fake.requests[0]["response_format"] == SCHEMA
+    assert "response_format" not in fake.requests[1]
+    assert (structured.text, free.text, free.cached) == ('{"verdict": "yes"}', "free text", False)
+    assert client.complete(MSGS, response_format=SCHEMA).cached
+    base: dict[str, Any] = {
+        "model": "m", "messages": MSGS, "temperature": 0.0, "seed": 7, "max_tokens": 64,
+    }
+    assert cache_key(**base) == cache_key(**base, response_format=None)
+    assert cache_key(**base) != cache_key(**base, response_format=SCHEMA)
+
+
+def test_the_reservation_covers_the_schema_too(
+    llm_cache: LLMCache, make_ledger: MakeLedger, api_key: str
+) -> None:
+    model = make_model_config()
+    seen: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(ledger.spent)  # the reservation while the call is in flight
+        return FakeLLM(["ok"]).handle(request)
+
+    ledger = make_ledger(cap=1.0)
+    client = LLMClient(model, llm_cache, ledger, transport=httpx.MockTransport(handler))
+    client.complete(MSGS, response_format=SCHEMA)
+    schema_bytes = len(json.dumps(SCHEMA).encode("utf-8"))
+    assert seen[0] == pytest.approx(
+        token_cost(model, prompt_token_bound(MSGS) + schema_bytes, model.max_tokens)
+    )
 
 
 def _metadata(*endpoints: tuple[str, bool]) -> dict[str, Any]:

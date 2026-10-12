@@ -3,12 +3,15 @@ from __future__ import annotations
 import pytest
 
 from rk.text import (
+    capitalised_words,
     content_stems,
     domain_entities,
+    domain_fields,
     extract_acronyms,
-    find_domain_entities,
+    find_domain_terms,
     is_generic,
-    mask_domain_entities,
+    lowercase_words,
+    mask_domain_terms,
     normalize_title,
     reconstruct_abstract,
     stem,
@@ -39,15 +42,36 @@ def test_domain_entity_list_loads_from_package_data() -> None:
         ("Polish and Turkish corpora from China", ["Polish", "Turkish", "China"]),
         ("Cochrane reviews and ColBERT on PubMed", []),  # organisations, models, datasets
         ("South-western dialects of the West", []),  # parts of names don't count
+        ("Global trends in physics information-seeking", ["physics"]),  # fields too
+        ("Maritime situational awareness from Legal and clinical texts",
+         ["Maritime", "Legal", "clinical"]),
+        ("Energy-based models and feature engineering", []),  # ML words aren't fields
     ],
 )
-def test_find_domain_entities(text: str, found: list[str]) -> None:
-    assert find_domain_entities(text) == found
+def test_find_domain_terms(text: str, found: list[str]) -> None:
+    assert find_domain_terms(text) == found
 
 
-def test_mask_domain_entities_blanks_whole_names_only() -> None:
-    masked = mask_domain_entities("Turkish retrieval with TurkColBERT in South Africa and the US.")
+def test_mask_domain_terms_blanks_whole_names_only() -> None:
+    masked = mask_domain_terms("Turkish retrieval with TurkColBERT in South Africa and the US.")
     assert tokenize(masked) == ["retrieval", "with", "turkcolbert", "in", "and", "the"]
+
+
+def test_domain_field_list_is_curated() -> None:
+    fields = domain_fields()
+    assert len(set(fields)) == len(fields)
+    for field in ("physics", "maritime", "medical", "clinical", "legal", "finance", "ecology"):
+        assert field in fields
+    for word in ("energy", "engineering", "learning", "retrieval", "Cochrane"):
+        assert word not in fields
+
+
+def test_capitalised_words_mid_sentence_skips_sentence_starts() -> None:
+    text = "Bilibili hosts videos. Comments on Bilibili scroll: Viewers react (Bilibili, 2024)."
+    assert capitalised_words(text, mid_sentence=False) == {"Bilibili", "Comments", "Viewers"}
+    assert capitalised_words(text, mid_sentence=True) == {"Bilibili"}
+    assert capitalised_words("We use BERT and GPT-4.", mid_sentence=True) == set()  # acronyms
+    assert lowercase_words("The Model and the model of Models") == {"the", "and", "model"}
 
 
 def test_reconstruct_abstract_orders_words_by_position() -> None:

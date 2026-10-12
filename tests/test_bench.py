@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,9 @@ from rk import cli
 from rk.bench import (
     ACCEPTED_FILE,
     CORRUPTIONS,
+    HUMAN_CHECK_COLUMNS,
+    JUDGE_RESPONSE_FORMAT,
+    JUDGE_SCHEMA_SHA256,
     REASONS,
     REJECTIONS_FILE,
     STATS_FILE,
@@ -31,6 +35,7 @@ from rk.bench import (
     LeakFilter,
     _visit_order,
     check_length,
+    export_human_check,
     keep_names_line,
     load_prompts,
     make_bench,
@@ -133,6 +138,7 @@ def test_accepts_clean_proposals_and_writes_full_rows(tmp_path: Path, corpus_dir
     rows = _rows(cfg, ACCEPTED_FILE)
     assert [r["target_id"] for r in rows] == ORDER  # seeded visiting order
     hashes = {name: p.sha256 for name, p in PROMPTS.items()}
+    hashes["judge_schema"] = JUDGE_SCHEMA_SHA256
     for row in rows:
         assert row["qid"] == make_qid(ORDER.index(row["target_id"]), row["target_id"])
         assert row["query"] == GOOD[row["target_id"]]
@@ -556,23 +562,79 @@ def test_paraphrase_prompt_tells_the_model_which_title_names_to_keep(
     tmp_path: Path,
 ) -> None:
     assert keep_names_line("Calibrated reward models") == ""
-    assert keep_names_line("Turkish retrieval in the Middle East") == (
-        "\nThe title names Turkish, Middle East: the proposal must keep them.\n"
+    assert keep_names_line("Turkish retrieval for maritime reports in the Middle East") == (
+        "\nThe proposal must keep these words from the title: Turkish, maritime, Middle East.\n"
     )
     records = corpus_records()
     for record in records:
         if record["id"] == T2:
-            record["title"] = TITLES[T2] + " in Kazakh"
+            record["title"] = TITLES[T2] + " in Kazakh clinical notes"
     freeze(tmp_path / "corpus", records, target_rows(), {})
     para = paraphraser()
 
     make_bench(_config(tmp_path), para, judge())
 
     prompts = {_target_in(c[-1]["content"], "Title"): c[-1]["content"] for c in para.calls}
-    assert "The title names Kazakh: the proposal must keep it." in prompts[T2]
-    assert "The title names" not in prompts[T1]
-    rule = "if the title names a language, nationality, country or region, the proposal must keep"
+    assert "The proposal must keep these words from the title: Kazakh, clinical." in prompts[T2]
+    assert "must keep these words" not in prompts[T1]
+    rule = (
+        "if the title names a language, nationality, country or region, or a research field or "
+        "application domain (such as physics, maritime or clinical), the proposal must keep"
+    )
     assert rule in prompts[T1]
+
+
+def test_leak_filter_lets_a_proposal_keep_the_titles_field() -> None:
+    leak = LeakFilter(corpus_records(), max_overlap=1.0, max_jaccard=1.0)
+    title = "Global trends in physics information-seeking"
+    rejection, stats = leak.check(
+        "We will track how students look up physics facts on the web over several years.",
+        title,
+        "We study how students search for physics material.",
+    )
+    assert rejection is None and stats["title_words_found"] == []
+
+
+def _bilibili_filter() -> LeakFilter:
+    """The fixture corpus plus abstracts that write Bilibili capitalised, and one that
+    capitalises a common word inside a title-cased phrase."""
+    extra = [
+        {"id": "W901", "title": "Danmaku", "abstract":
+         "We study danmaku comments posted on Bilibili, a video site. Bilibili users comment."},
+        {"id": "W902", "title": "Video", "abstract": "Comments on Bilibili scroll across videos."},
+        {"id": "W903", "title": "Search", "abstract":
+         "We extend Retrieval-Augmented Generation with better retrieval and generation."},
+    ]
+    return LeakFilter([*corpus_records(), *extra], max_overlap=1.0, max_jaccard=1.0)
+
+
+def test_source_name_rejects_the_pilots_bilibili_proposal() -> None:
+    title = "Trust the messenger, then the message: the cross-route logic of danmaku engagement"
+    abstract = "We analyse danmaku comments from Bilibili and how viewers weigh source cues."
+    proposal = (  # A0024 as accepted in the Step 6 pilot
+        "We intend to explore how viewers interact with floating annotations on videos from "
+        "Bilibili. By analyzing user behavior and text patterns, we will investigate if people "
+        "first judge the author's reputation before evaluating the actual information and other "
+        "users' reactions."
+    )
+    rejection, stats = _bilibili_filter().check(proposal, title, abstract)
+    assert rejection is not None and rejection.reason == "source_name"
+    assert rejection.message == "it used names from the paper (Bilibili)"
+    assert stats["source_names_found"] == ["Bilibili"]
+
+
+@pytest.mark.parametrize(
+    "proposal",
+    [
+        "Bilibili users will be studied. We look at comments.",  # a sentence start isn't a name use
+        "We study how Generation of comments works.",  # mostly lower case in the corpus: common
+        "We study Arabic comments from the Middle East.",  # exempt languages and regions
+    ],
+)
+def test_source_name_ignores_sentence_starts_common_words_and_exempt_terms(proposal: str) -> None:
+    abstract = "Bilibili comments. We extend Retrieval-Augmented Generation to Arabic posts."
+    _, stats = _bilibili_filter().check(proposal, "A title", abstract)
+    assert stats["source_names_found"] == []
 
 
 def test_prompts_render_every_placeholder() -> None:
@@ -591,6 +653,44 @@ def test_judge_prompts_compare_four_facets(name: str) -> None:
         assert f"- {facet}: " in text and f'"{facet}": {{"match": "yes"' in text
     assert "including any language, region" in text
     assert 'The verdict is "yes" only if all four facets are "yes".' in text
+    # The stricter generalisation test, with its one example.
+    assert "no longer tells this work apart from close sibling work" in text
+    assert "drops the specific domain, population, data type or language" in text
+    assert "Example of a too-general proposal" in text
+
+
+def _strict_everywhere(schema: dict[str, Any]) -> bool:
+    if schema.get("type") != "object":
+        return True
+    props = schema["properties"]
+    return (
+        schema["additionalProperties"] is False
+        and schema["required"] == list(props)
+        and all(_strict_everywhere(p) for p in props.values())
+    )
+
+
+def test_judge_answers_with_a_strict_json_schema(tmp_path: Path, corpus_dir: Path) -> None:
+    fmt = JUDGE_RESPONSE_FORMAT
+    assert fmt["type"] == "json_schema" and fmt["json_schema"]["strict"] is True
+    schema = fmt["json_schema"]["schema"]
+    assert _strict_everywhere(schema)
+    assert list(schema["properties"]) == ["facets", "match", "verdict", "reason"]  # think first
+    facets = ["problem", "method", "domain", "claim"]
+    assert list(schema["properties"]["match"]["properties"]) == facets
+    para, jdg = paraphraser(), judge()
+
+    make_bench(_config(tmp_path), para, jdg)
+
+    assert jdg.response_formats == [JUDGE_RESPONSE_FORMAT] * len(jdg.calls)
+    assert para.response_formats == [None] * len(para.calls)
+    assert _stats(_config(tmp_path))["prompt_hashes"]["judge_schema"] == JUDGE_SCHEMA_SHA256
+
+
+def test_claim_corruption_changes_the_expected_outcome_not_the_question() -> None:
+    claim = CORRUPTIONS["claim"]
+    assert "what the work will show or deliver" in claim
+    assert "Do not merely negate a question" in claim
 
 
 # --- judge validation -----------------------------------------------------------
@@ -687,6 +787,62 @@ def test_cli_validate_judge(
     assert "original     accepted 3/3 (100%)" in printed
     assert "generalised  rejected 0/3 (0%)" in printed
     assert (out / "summary.json").exists()
+
+    # --set swaps the judge for one run, e.g. to compare a stronger model.
+    fakes["bigger-judge"] = _validation_judge()
+    other = tmp_path / "jv-bigger"
+    overrides = ["--set", "judge.name=bigger-judge", "--set", "judge.price_in_per_m=2.0"]
+    assert cli.main([*argv[:-1], str(other), *overrides]) == 0
+    summary = json.loads((other / "summary.json").read_text(encoding="utf-8"))
+    assert summary["models"]["judge"] == "bigger-judge"
+    assert fakes["bigger-judge"].calls and summary["n_pairs"] == 3
+
+
+# --- human check export ----------------------------------------------------------
+
+
+def test_export_human_check_writes_a_seeded_sample_and_never_overwrites(
+    tmp_path: Path, corpus_dir: Path
+) -> None:
+    cfg = _config(tmp_path)
+    make_bench(cfg, paraphraser(), judge())
+    out = tmp_path / "check" / "human_check.csv"
+
+    assert export_human_check(cfg, n=2, out_path=out) == 2
+
+    raw = out.read_bytes()
+    assert raw.startswith(b"\xef\xbb\xbf")  # BOM, so spreadsheets read UTF-8
+    with out.open(encoding="utf-8-sig", newline="") as fh:
+        rows = list(csv.reader(fh))
+    assert tuple(rows[0]) == HUMAN_CHECK_COLUMNS
+    body = rows[1:]
+    assert len(body) == 2 and [r[0] for r in body] == sorted(r[0] for r in body)
+    accepted = {r["qid"]: r for r in _rows(cfg, ACCEPTED_FILE)}
+    for qid, title, abstract, proposal, same_paper, note in body:
+        target = accepted[qid]["target_id"]
+        assert (title, abstract) == (TITLES[target], ABSTRACTS[target])
+        assert proposal == accepted[qid]["query"] and same_paper == note == ""
+
+    with pytest.raises(BenchError, match="refusing to overwrite"):
+        export_human_check(cfg, n=2, out_path=out)
+    again = tmp_path / "again.csv"
+    export_human_check(cfg, n=2, out_path=again)
+    assert again.read_bytes() == raw  # the same seeded sample
+
+
+def test_cli_export_human_check(
+    tmp_path: Path, corpus_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(_config_dict(tmp_path)), encoding="utf-8")
+    make_bench(_config(tmp_path), paraphraser(), judge())
+    out = tmp_path / "hc.csv"
+
+    argv = ["export-human-check", "--config", str(config_path), "--n", "20", "--out", str(out)]
+    assert cli.main(argv) == 0
+    assert "wrote 3 pairs" in capsys.readouterr().out  # all there are
+    assert cli.main(argv) == 1  # never overwritten
+    assert "refusing to overwrite" in capsys.readouterr().err
 
 
 # --- CLI ---------------------------------------------------------------------

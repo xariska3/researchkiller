@@ -11,7 +11,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -72,6 +72,7 @@ class FakeLLM:
         self._replies = replies if callable(replies) else list(replies)
         self.calls: list[list[dict[str, str]]] = []
         self.seeds: list[int | None] = []  # the seed= of each direct complete() call
+        self.response_formats: list[Mapping[str, Any] | None] = []  # and its response_format=
         self.requests: list[dict[str, Any]] = []
         self.headers: list[httpx.Headers] = []
 
@@ -91,8 +92,15 @@ class FakeLLM:
         prompt_tokens = sum(self.count_tokens(m["content"]) for m in msgs)
         return text, prompt_tokens, self.count_tokens(text)
 
-    def complete(self, messages: Sequence[Message], *, seed: int | None = None) -> Completion:
+    def complete(
+        self,
+        messages: Sequence[Message],
+        *,
+        seed: int | None = None,
+        response_format: Mapping[str, Any] | None = None,
+    ) -> Completion:
         self.seeds.append(seed)
+        self.response_formats.append(response_format)
         text, prompt_tokens, completion_tokens = self._reply(messages)
         cost = token_cost(self.model, prompt_tokens, completion_tokens)
         usage = Usage(

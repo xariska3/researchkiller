@@ -1,0 +1,107 @@
+# Research fields and application domains.
+#
+# A proposal must keep the field its paper's title names (a physics paper stays
+# about physics), so the lexical-leak filter ignores these words like the
+# languages and regions in domain_entities.txt (rk.text.mask_domain_terms).
+# Same format and matching: one per line, '#' comments, whole words,
+# case-insensitive, optional plural "s".
+#
+# Left out on purpose: words that are also ML or method vocabulary ("energy"
+# as in energy-based models, "engineering", "genetic", "literature",
+# "linguistic", "history", "security") and every method, model, dataset or
+# organisation name.
+
+agricultural
+agriculture
+archaeology
+astronomical
+astronomy
+astrophysics
+aviation
+banking
+biodiversity
+biological
+biology
+biomedical
+biomedicine
+chemical
+chemistry
+climate
+clinic
+clinical
+culinary
+cooking
+cybersecurity
+dental
+dentistry
+e-commerce
+ecological
+ecology
+economic
+economics
+education
+educational
+environmental
+epidemiology
+fashion
+finance
+financial
+fintech
+food
+forestry
+genomics
+geological
+geology
+geoscience
+geospatial
+health
+healthcare
+hospitality
+humanities
+insurance
+journalism
+judicial
+law
+legal
+manufacturing
+marine
+maritime
+materials science
+mathematics
+medical
+medicine
+mental health
+meteorology
+military
+music
+neuroscience
+nursing
+nutrition
+oncology
+patent
+pharmaceutical
+pharmacology
+pharmacy
+philosophy
+physics
+political
+politics
+psychiatry
+psychological
+psychology
+public health
+radiology
+real estate
+religion
+religious
+retail
+robotics
+social media
+sociology
+sports
+telecommunication
+tourism
+transportation
+urban
+veterinary
+zoology

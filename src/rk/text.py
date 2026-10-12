@@ -215,22 +215,30 @@ def extract_acronyms(text: str) -> list[str]:
     return sorted(found)
 
 
-@functools.lru_cache(maxsize=1)
-def domain_entities() -> tuple[str, ...]:
-    """Languages, nationalities, countries and regions from rk/data/domain_entities.txt.
-
-    A leading "=" in the file (kept here) marks a name matched only as written.
-    """
-    path = resources.files("rk").joinpath("data").joinpath("domain_entities.txt")
-    text = path.read_text(encoding="utf-8")
+def _data_list(name: str) -> tuple[str, ...]:
+    """Non-comment lines of rk/data/<name>; a leading "=" (kept) marks exact-case matching."""
+    text = resources.files("rk").joinpath("data").joinpath(name).read_text(encoding="utf-8")
     lines = (line.split("#", 1)[0].strip() for line in text.splitlines())
     return tuple(line for line in lines if line)
 
 
 @functools.lru_cache(maxsize=1)
-def _domain_entity_re() -> re.Pattern[str]:
+def domain_entities() -> tuple[str, ...]:
+    """Languages, nationalities, countries and regions (rk/data/domain_entities.txt)."""
+    return _data_list("domain_entities.txt")
+
+
+@functools.lru_cache(maxsize=1)
+def domain_fields() -> tuple[str, ...]:
+    """Research fields and application domains (rk/data/domain_fields.txt)."""
+    return _data_list("domain_fields.txt")
+
+
+@functools.lru_cache(maxsize=1)
+def _domain_term_re() -> re.Pattern[str]:
     alternatives = []
-    for entry in sorted(domain_entities(), key=len, reverse=True):  # "South Africa" before "Africa"
+    entries = sorted({*domain_entities(), *domain_fields()}, key=len, reverse=True)
+    for entry in entries:  # longest first: "South Africa" before "Africa"
         name = entry.removeprefix("=")
         body = r"\s+".join(re.escape(word) for word in name.split())
         exact = entry.startswith("=") or name.isupper()
@@ -238,26 +246,53 @@ def _domain_entity_re() -> re.Pattern[str]:
     return re.compile(r"(?<!\w)(?:" + "|".join(alternatives) + r")s?(?!\w)")
 
 
-def find_domain_entities(text: str) -> list[str]:
-    """Named languages, nationalities, countries and regions in `text`, first mention first.
+def find_domain_terms(text: str) -> list[str]:
+    """Languages, nationalities, countries, regions and fields named in `text`, in order.
 
     Whole words only ("TurkColBERT" names a model, not Turkish); repeats that
     differ only in case or a plural "s" are listed once.
     """
     found: dict[str, str] = {}
-    for match in _domain_entity_re().finditer(text):
+    for match in _domain_term_re().finditer(text):
         name = " ".join(match.group().split())
         found.setdefault(name.lower().removesuffix("s"), name)
     return list(found.values())
 
 
-def mask_domain_entities(text: str) -> str:
-    """`text` with every named language, nationality, country and region blanked out.
+def mask_domain_terms(text: str) -> str:
+    """`text` with every named language, nationality, country, region and field blanked out.
 
     The lexical-leak filter runs on masked text, so a proposal may keep the
-    language or region its paper names.
+    language, region or field its paper names.
     """
-    return _domain_entity_re().sub(" ", text)
+    return _domain_term_re().sub(" ", text)
+
+
+_CAPITALISED_RE = re.compile(r"\b[A-Z][a-z]{2,}\b")  # "Bilibili"; acronyms are handled elsewhere
+_LOWER_WORD_RE = re.compile(r"\b[a-z]{3,}\b")
+_SENTENCE_END = ".!?:"
+
+
+def capitalised_words(text: str, *, mid_sentence: bool) -> set[str]:
+    """Words written with one leading capital ("Bilibili"), optionally only mid-sentence.
+
+    A word is mid-sentence if some text precedes it and the last non-space
+    character before it doesn't end a sentence (.!?:).
+    """
+    found = set()
+    for match in _CAPITALISED_RE.finditer(text):
+        i = match.start() - 1
+        while i >= 0 and text[i].isspace():
+            i -= 1
+        if mid_sentence and (i < 0 or text[i] in _SENTENCE_END):
+            continue
+        found.add(match.group())
+    return found
+
+
+def lowercase_words(text: str) -> set[str]:
+    """Words of three or more letters written all in lower case."""
+    return set(_LOWER_WORD_RE.findall(text))
 
 
 def normalize_title(title: str | None) -> str:

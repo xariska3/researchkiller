@@ -108,6 +108,38 @@ def test_load_coerces_types_and_applies_defaults(tmp_path: Path) -> None:
     assert cfg.agent.provider is None  # OpenRouter routes freely unless pinned
 
 
+def test_overrides_set_values_before_validation(tmp_path: Path) -> None:
+    path = _write(tmp_path, _valid())
+    cfg = load_config(
+        path,
+        [
+            "judge.name=openai/gpt-4.1",
+            "judge.price_in_per_m=2.0",
+            "judge.training_cutoff=2024-06-01",
+            "retrieval.encoder_max_seq_length=null",
+        ],
+    )
+    assert (cfg.judge.name, cfg.judge.price_in_per_m) == ("openai/gpt-4.1", 2.0)
+    assert cfg.judge.training_cutoff == date(2024, 6, 1)  # YAML values keep their types
+    assert cfg.retrieval.encoder_max_seq_length is None
+    assert cfg.paraphraser.name == "para-model"  # nothing else changes
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ("judge.name", "expected section.key=value"),
+        ("jduge.name=x", "no section 'jduge'"),
+        ("judge.nmae=x", r"unknown key\(s\) \['nmae'\]"),  # caught by the strict loader
+        ("judge.max_tokens=lots", r"judge\.max_tokens: expected an integer"),
+        ("judge.family=family-c", "model-independence check failed"),  # checks still run
+    ],
+)
+def test_bad_overrides_raise(tmp_path: Path, override: str, message: str) -> None:
+    with pytest.raises(ConfigError, match=message):
+        load_config(_write(tmp_path, _valid()), [override])
+
+
 def test_date_may_be_a_quoted_string() -> None:
     data = _valid()
     data["bench"]["target_from_date"] = "2025-06-01"

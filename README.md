@@ -30,6 +30,7 @@ python -m rk build-corpus --config configs/phase1.yaml [--max-works N]
 python -m rk build-index  --config configs/phase1.yaml
 python -m rk make-bench   --config configs/phase1.yaml [--limit N] [--show]
 python -m rk validate-judge --config configs/phase1.yaml [--n 30]
+python -m rk export-human-check --config configs/phase1.yaml [--n 20]
 python -m rk run          --config configs/phase1.yaml [--configs B1,B4,B5] [--limit N]
 python -m rk report       runs/<timestamp>
 ```

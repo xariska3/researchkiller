@@ -13,7 +13,9 @@ validate_judge measures the judge on accepted pairs and deliberate corruptions.
 
 from __future__ import annotations
 
+import csv
 import dataclasses
+import hashlib
 import json
 import math
 import random
@@ -30,11 +32,14 @@ from rk.llm import ChatModel, Completion, Prompt, Usage, load_prompt, parse_json
 from rk.targets import Record, id_number
 from rk.text import (
     STOPWORDS,
+    capitalised_words,
     content_stems,
     content_tokens,
     extract_acronyms,
-    find_domain_entities,
-    mask_domain_entities,
+    find_domain_terms,
+    is_generic,
+    lowercase_words,
+    mask_domain_terms,
     stem,
 )
 
@@ -51,6 +56,44 @@ FACET_LABELS = {
     "claim": "main claim",
 }
 
+
+def _strict_object(properties: dict[str, Any]) -> dict[str, Any]:
+    """A JSON-schema object in OpenAI strict mode: every property required, no others."""
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": list(properties),
+        "additionalProperties": False,
+    }
+
+
+_STRING = {"type": "string"}
+_YES_NO = {"type": "string", "enum": ["yes", "no"]}
+# The judge's answer, enforced by the API (response_format json_schema, strict), so its
+# format can't slip; the order makes the judge describe the facets before deciding.
+JUDGE_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "facet_judgment",
+        "strict": True,
+        "schema": _strict_object(
+            {
+                "facets": _strict_object(
+                    {f: _strict_object({"paper": _STRING, "proposal": _STRING}) for f in FACETS}
+                ),
+                "match": _strict_object(
+                    {f: _strict_object({"match": _YES_NO, "reason": _STRING}) for f in FACETS}
+                ),
+                "verdict": _YES_NO,
+                "reason": _STRING,
+            }
+        ),
+    },
+}
+JUDGE_SCHEMA_SHA256 = hashlib.sha256(
+    json.dumps(JUDGE_RESPONSE_FORMAT, sort_keys=True).encode("utf-8")
+).hexdigest()
+
 ACCEPTED_FILE = "test_a.jsonl"
 REJECTIONS_FILE = "rejections.jsonl"
 STATS_FILE = "stats.json"
@@ -63,6 +106,7 @@ REASONS = (
     "length",
     "acronym_in_paraphrase",
     "source_acronym",
+    "source_name",
     "title_stem",
     "idf_overlap",
     "content_jaccard",
@@ -79,6 +123,11 @@ class BenchError(RuntimeError):
 def load_prompts() -> dict[str, Prompt]:
     """The benchmark's prompt templates, each with the sha256 of its text."""
     return {name: load_prompt(name) for name in PROMPT_NAMES}
+
+
+def prompt_hashes(prompts: dict[str, Prompt]) -> dict[str, str]:
+    """sha256 of every prompt, plus the judge's answer schema (it shapes the answers too)."""
+    return {**{name: p.sha256 for name, p in prompts.items()}, "judge_schema": JUDGE_SCHEMA_SHA256}
 
 
 @dataclass(frozen=True)
@@ -162,21 +211,30 @@ class LeakFilter:
     1. any acronym or named artefact in the proposal at all;
     2. any acronym or named artefact from the title or abstract (case-insensitive;
        ones that spell a stopword, like "IT" or "US", are skipped);
-    3. any distinctive title stem (title content stems minus generic words);
-    4. more than a fraction max_overlap of the abstract's top-20 IDF stems;
-    5. content-stem Jaccard with title + abstract above max_jaccard, generic
+    3. any capitalised name from the abstract ("Bilibili") used mid-sentence in
+       the proposal; a word counts as a name if the corpus abstracts capitalise it
+       mid-sentence more often than they write it in lower case, so common words
+       capitalised by a title-cased phrase ("Retrieval-Augmented Generation") don't;
+    4. any distinctive title stem (title content stems minus generic words);
+    5. more than a fraction max_overlap of the abstract's top-20 IDF stems;
+    6. content-stem Jaccard with title + abstract above max_jaccard, generic
        science words excluded on both sides (text.is_generic).
-    Named languages, nationalities, countries and regions (rk/data/
-    domain_entities.txt) are blanked out of proposal, title and abstract first:
-    a proposal may keep them, and they never count as leaked terms.
+    Named languages, nationalities, countries, regions and fields (rk/data/)
+    are blanked out of proposal, title and abstract first: a proposal may keep
+    them, and they never count as leaked terms.
     """
 
     def __init__(self, corpus: Iterable[Record], *, max_overlap: float, max_jaccard: float):
         df: Counter[str] = Counter()
+        self._capitalised: Counter[str] = Counter()  # docs capitalising a word mid-sentence
+        self._lowercase: Counter[str] = Counter()  # docs writing it in lower case
         n_docs = 0
         for record in corpus:
             n_docs += 1
             df.update(set(content_stems(f"{record['title']} {record['abstract']}")))
+            capitalised = capitalised_words(record["abstract"], mid_sentence=True)
+            self._capitalised.update({w.lower() for w in capitalised})
+            self._lowercase.update(lowercase_words(record["abstract"]))
         self._idf = {s: math.log(n_docs / n) for s, n in df.items()}
         self._unseen_idf = math.log(max(n_docs, 1))  # as rare as a term can be
         self.max_overlap = max_overlap
@@ -195,10 +253,17 @@ class LeakFilter:
 
         return sorted(counts, key=rank)[:IDF_TOP_TERMS]
 
+    def is_name(self, word: str) -> bool:
+        """True if the corpus abstracts capitalise `word` mid-sentence more than they don't."""
+        key = word.lower()
+        if key in STOPWORDS or is_generic(key):
+            return False
+        return self._capitalised[key] > self._lowercase[key]
+
     def check(
         self, proposal: str, title: str, abstract: str
     ) -> tuple[Rejection | None, dict[str, Any]]:
-        proposal, title, abstract = map(mask_domain_entities, (proposal, title, abstract))
+        proposal, title, abstract = map(mask_domain_terms, (proposal, title, abstract))
         own_acronyms = extract_acronyms(proposal)
 
         source = set(extract_acronyms(title)) | set(extract_acronyms(abstract))
@@ -206,6 +271,12 @@ class LeakFilter:
         proposal_keys = _word_keys(proposal)
         source_found = sorted(
             a for key, a in source_by_key.items() if key in proposal_keys and key not in STOPWORDS
+        )
+        source_names = sorted(
+            w
+            for w in capitalised_words(proposal, mid_sentence=True)
+            & capitalised_words(abstract, mid_sentence=False)
+            if self.is_name(w)
         )
 
         proposal_tokens = content_tokens(proposal)
@@ -226,6 +297,7 @@ class LeakFilter:
         stats = {
             "acronyms_in_paraphrase": own_acronyms,
             "source_acronyms_found": source_found,
+            "source_names_found": source_names,
             "title_words_found": title_words,
             "idf_top_terms": top,
             "idf_overlap": overlap,
@@ -242,6 +314,11 @@ class LeakFilter:
                 "source_acronym",
                 bool(source_found),
                 f"it used names or acronyms from the paper ({', '.join(source_found)})",
+            ),
+            (
+                "source_name",
+                bool(source_names),
+                f"it used names from the paper ({', '.join(source_names)})",
             ),
             (
                 "title_stem",
@@ -322,7 +399,9 @@ def judge_proposal(
 ) -> tuple[dict[str, Any] | None, Completion]:
     """One directional judge call: the parsed judgment (None if unreadable) and the reply."""
     text = prompt.render(title=title, abstract=abstract, proposal=proposal)
-    reply = judge.complete([{"role": "user", "content": text}])
+    reply = judge.complete(
+        [{"role": "user", "content": text}], response_format=JUDGE_RESPONSE_FORMAT
+    )
     return parse_judgment(reply.text), reply
 
 
@@ -409,12 +488,11 @@ def run_attempt(
 
 
 def keep_names_line(title: str) -> str:
-    """The paraphrase prompt's line naming the title's languages and places, or ""."""
-    names = find_domain_entities(title)
+    """The paraphrase prompt's line naming the title's languages, places and fields, or ""."""
+    names = find_domain_terms(title)
     if not names:
         return ""
-    pronoun = "it" if len(names) == 1 else "them"
-    return f"\nThe title names {', '.join(names)}: the proposal must keep {pronoun}.\n"
+    return f"\nThe proposal must keep these words from the title: {', '.join(names)}.\n"
 
 
 def make_bench(
@@ -432,7 +510,7 @@ def make_bench(
     corpus, targets, manifest = load_frozen_corpus(cfg.corpus.out_dir)
     prompts = load_prompts()
     meta = {
-        "prompt_hashes": {name: p.sha256 for name, p in prompts.items()},
+        "prompt_hashes": prompt_hashes(prompts),
         "models": {"paraphraser": cfg.paraphraser.name, "judge": cfg.judge.name},
         "corpus_sha256": manifest["files"][CORPUS_FILE]["sha256"],
     }
@@ -684,8 +762,11 @@ CORRUPTIONS = {
         "the problem, the domain or population and the main claim."
     ),
     "claim": (
-        "Reverse the main claim, or replace it with a clearly different claim. Keep the "
-        "problem, the method and the domain or population."
+        "Change the expected outcome or contribution, that is, what the work will show or "
+        "deliver: a clearly different finding it expects, or a different result, resource "
+        "or artefact it will produce. Do not merely negate a question (turning \"whether X\" "
+        "into \"whether not X\" asks the same question). Keep the problem, the method and the "
+        "domain or population."
     ),
     "generalised": (
         "Make the whole proposal so general that it no longer identifies this work: describe "
@@ -772,7 +853,7 @@ def validate_judge(
         "variants": {v: _variant_stats(rows) for v, rows in by_variant.items()},
         "unchanged_corruptions": dict(Counter(c["kind"] for c in corruptions if c["unchanged"])),
         "corruption_instructions": CORRUPTIONS,
-        "prompt_hashes": {**{k: p.sha256 for k, p in prompts.items()}, "corrupt": corrupt.sha256},
+        "prompt_hashes": {**prompt_hashes(prompts), "corrupt": corrupt.sha256},
         "models": {"paraphraser": cfg.paraphraser.name, "judge": cfg.judge.name},
         "llm_usage": {role: dataclasses.asdict(u) for role, u in usage.items()},
         "method_cost": total.method_cost,
@@ -790,6 +871,38 @@ def validate_judge(
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     return summary
+
+
+HUMAN_CHECK_FILE = Path("data/human_check.csv")
+HUMAN_CHECK_COLUMNS = ("qid", "title", "abstract", "proposal", "same_paper", "note")
+
+
+def export_human_check(cfg: Config, *, n: int, out_path: Path = HUMAN_CHECK_FILE) -> int:
+    """Write a seeded random sample of accepted pairs to a CSV for checking by hand.
+
+    The sample is drawn with bench.seed and listed in qid order; same_paper and
+    note are left empty for the reader. The file is UTF-8 with a byte-order mark
+    so spreadsheet programs read it correctly. Refuses to overwrite a file, which
+    may already hold someone's answers. Returns the number of rows written.
+    """
+    if out_path.exists():
+        raise BenchError(f"{out_path} already exists: refusing to overwrite it (it may hold answers)")
+    accepted = sorted(_read_jsonl(cfg.bench.out_dir / ACCEPTED_FILE), key=lambda r: r["qid"])
+    if not accepted:
+        raise BenchError(
+            f"no accepted queries in {cfg.bench.out_dir}: run `python -m rk make-bench` first"
+        )
+    sample = random.Random(cfg.bench.seed).sample(accepted, min(n, len(accepted)))
+    corpus, _, _ = load_frozen_corpus(cfg.corpus.out_dir)
+    by_id = {r["id"]: r for r in corpus}
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8-sig", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(HUMAN_CHECK_COLUMNS)
+        for row in sorted(sample, key=lambda r: r["qid"]):
+            record = by_id[row["target_id"]]
+            writer.writerow([row["qid"], record["title"], record["abstract"], row["query"], "", ""])
+    return len(sample)
 
 
 def _variant_stats(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:

@@ -24,7 +24,7 @@ researchkiller/
 ¦   +-- config.py         # YAML -> dataclasses
 ¦   +-- llm.py            # OpenAI-compatible client, cache, cost ledger, prompt loading
 ¦   +-- prompts/          # versioned prompt templates (*.txt)
-¦   +-- data/             # curated lists (domain_entities.txt)
+¦   +-- data/             # curated lists (domain_entities.txt, domain_fields.txt)
 ¦   +-- text.py           # tokenising, stemming, stopwords, acronyms
 ¦   +-- corpus.py         # OpenAlex client, corpus build, dedupe, freeze
 ¦   +-- targets.py        # target selection
@@ -162,28 +162,35 @@ reason:
    *proposal* (as if written before the work) with the same research question,
    method and claimed contribution, using different terminology. No model,
    dataset, method or organisation names, no acronyms, no title words, with one
-   exception: a language, nationality, country or region the title names must
-   be kept (the prompt lists the ones found in the title). These named domain
-   entities come from a curated list, `src/rk/data/domain_entities.txt`
-   (matched whole-word and case-insensitively, except all-caps names and
-   names marked `=` because they are also common words). Attempt `a` (from 0)
+   exception: a language, nationality, country or region, or a research field
+   or application domain (physics, maritime, clinical, ...), that the title
+   names must be kept (the prompt lists the ones found in the title). These
+   domain terms come from two curated lists, `src/rk/data/domain_entities.txt`
+   and `src/rk/data/domain_fields.txt` (matched whole-word and
+   case-insensitively, except all-caps names and names marked `=` because they
+   are also common words; ML and method words are left out). Attempt `a` (from 0)
    uses seed `paraphraser.seed + a`, so every attempt has its own cache key,
    and every retry prompt includes the previous attempt's rejection reason.
 2. **Length**: 2–4 sentences and 40–120 words, else `length`.
-3. **Lexical-leak filter** (deterministic). Named domain entities are first
-   blanked out of proposal, title and abstract, so keeping one is never a
-   leak. Then, in this order:
+3. **Lexical-leak filter** (deterministic). Domain terms are first blanked out
+   of proposal, title and abstract, so keeping one is never a leak. Then, in
+   this order:
    1. any acronym/named artefact in the proposal at all (`acronym_in_paraphrase`)
    2. any acronym/named artefact from the title or abstract, case-insensitive
       (`source_acronym`; ones spelling a stopword, like "IT" or "US", are skipped)
-   3. any distinctive title stem: title content stems minus generic science
+   3. any capitalised name from the abstract ("Bilibili") that the proposal
+      uses mid-sentence (`source_name`). A word counts as a name if the corpus
+      abstracts capitalise it mid-sentence more often than they write it in
+      lower case, so title-cased common words ("Retrieval-Augmented
+      Generation") don't count; stopwords and generic science words never do.
+   4. any distinctive title stem: title content stems minus generic science
       words (`title_stem`)
-   4. more than a fraction `max_distinctive_overlap` (in [0, 1]; 0.15 = at most
+   5. more than a fraction `max_distinctive_overlap` (in [0, 1]; 0.15 = at most
       3) of the abstract's top-20 IDF stems, IDF over the frozen corpus, ties
       to stems more frequent in the abstract (`idf_overlap`)
-   5. content-stem Jaccard with title+abstract above `max_content_jaccard`,
+   6. content-stem Jaccard with title+abstract above `max_content_jaccard`,
       generic science words excluded on both sides with the same rule as in
-      3 (`content_jaccard`)
+      4 (`content_jaccard`)
 4. **Equivalence filter**: the **judge** model (different family) answers
    each direction in a **separate call**, so one answer can't anchor the
    other. In each call it first describes four facets of the paper and of the
@@ -192,11 +199,16 @@ reason:
    `{"facets": ..., "match": {facet: {"match": "yes"|"no", "reason"}}, "verdict",
    "reason"}`:
    - Does the proposal keep each facet? "no" if one is left out, changed, or
-     stated so generally that it no longer identifies the paper
-     (`judge_captures`).
+     stated so generally that it no longer tells this work apart from close
+     sibling work (e.g. it drops the specific domain, population, data type or
+     language); the prompt gives one short example (`judge_captures`).
    - Does the proposal change or add to any facet? (`judge_adds_nothing`; not
      asked after a first "no").
-   The verdict is "yes" only if the judge says yes **and** every facet
+   The answer format is enforced by the API: the judge is called with
+   `response_format` = a strict JSON schema (OpenAI structured outputs, which
+   the pinned `openai` endpoint supports; with `require_parameters` OpenRouter
+   refuses rather than ignores it), and the schema's sha256 is recorded with
+   the prompt hashes. The verdict is "yes" only if the judge says yes **and** every facet
    matches; a facet marked "no" rejects whatever the judge concluded, and the
    rejection message (quoted in the retry prompt) names each failed facet with
    its reason. A reply without a yes/no for every facet and the verdict is a
@@ -208,8 +220,10 @@ reason:
 **Judge validation** (`python -m rk validate-judge --config ... --n 30`): for
 the first N accepted pairs (qid order), the paraphraser writes four
 corruptions of the proposal (`prompts/corrupt.txt`), each with exactly one
-change: a different domain or population, a different method, a reversed or
-different main claim, or so general it no longer identifies the work. The
+change: a different domain or population, a different method, a different
+expected outcome or contribution (what the work will show or deliver; merely
+negating a "whether X" question doesn't count), or so general it no longer
+identifies the work. The
 judge answers both directions for the originals and the corruptions (a
 variant passes only if both say yes). Outputs in `data/judge_validation/`:
 `pairs.jsonl`, `corruptions.jsonl`, `verdicts.jsonl` and `summary.json`
@@ -308,9 +322,17 @@ python -m rk build-corpus  --config configs/phase1.yaml [--max-works N]
 python -m rk build-index   --config ...
 python -m rk make-bench    --config ... [--limit N] [--show]
 python -m rk validate-judge --config ... [--n 30] [--out-dir data/judge_validation]
+python -m rk export-human-check --config ... [--n 20] [--out data/human_check.csv]
 python -m rk run           --config ... [--configs B1,B4,B5] [--limit N] [--run-dir runs/<timestamp>] [--retry-errors]
 python -m rk report        runs/<timestamp>
 ```
+Every command that takes `--config` also takes `--set SECTION.KEY=VALUE`
+(repeatable; YAML values) to override one config value for that run, e.g.
+`--set judge.name=openai/gpt-4.1`; the result is validated like the file.
+`export-human-check` writes a seeded random sample (`bench.seed`) of accepted
+pairs to a CSV (`qid, title, abstract, proposal, same_paper, note`, the last
+two empty) for checking by hand, and never overwrites one.
+
 The `rk` console script is equivalent, but launcher executables can be blocked
 on Windows, so docs always use `python -m rk`.
 

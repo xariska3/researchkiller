@@ -111,7 +111,13 @@ class Completion:
 class ChatModel(Protocol):
     """Anything that answers chat messages: LLMClient, or FakeLLM in tests."""
 
-    def complete(self, messages: Sequence[Message], *, seed: int | None = None) -> Completion: ...
+    def complete(
+        self,
+        messages: Sequence[Message],
+        *,
+        seed: int | None = None,
+        response_format: Mapping[str, Any] | None = None,
+    ) -> Completion: ...
 
 
 @dataclass(frozen=True)
@@ -165,11 +171,13 @@ def cache_key(
     seed: int,
     max_tokens: int,
     provider: Mapping[str, Any] | None = None,
+    response_format: Mapping[str, Any] | None = None,
 ) -> str:
     """sha256 of the canonical JSON of (model, messages, temperature, seed, max_tokens).
 
-    A provider pin (OpenRouter routing) is part of the key when set, so replies
-    from one provider are never served for another; without one the key is unchanged.
+    A provider pin (OpenRouter routing) and a response format (e.g. a JSON
+    schema) are part of the key when set, so a reply is never served for a
+    request that differs in either; without them the key is unchanged.
     """
     payload: dict[str, Any] = {
         "model": model,
@@ -180,6 +188,8 @@ def cache_key(
     }
     if provider is not None:
         payload["provider"] = dict(provider)
+    if response_format is not None:
+        payload["response_format"] = dict(response_format)
     blob = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
@@ -390,11 +400,20 @@ class LLMClient(_Closing):
         self._sleep = sleep
         self._http = httpx.Client(base_url=model.base_url, timeout=timeout, transport=transport)
 
-    def complete(self, messages: Sequence[Message], *, seed: int | None = None) -> Completion:
+    def complete(
+        self,
+        messages: Sequence[Message],
+        *,
+        seed: int | None = None,
+        response_format: Mapping[str, Any] | None = None,
+    ) -> Completion:
         """Answer `messages`, from the cache when possible.
 
         `seed` overrides the model's configured seed, e.g. to get a fresh sample
-        on a retry; it is part of the cache key.
+        on a retry. `response_format` is sent as the OpenAI-style field (e.g.
+        {"type": "json_schema", ...}); with a pinned provider, require_parameters
+        makes OpenRouter refuse an endpoint that can't honour it. Both are part
+        of the cache key.
         """
         request: dict[str, Any] = {
             "model": self.model.name,
@@ -405,6 +424,8 @@ class LLMClient(_Closing):
         }
         if self.model.provider is not None:
             request["provider"] = provider_routing(self.model.provider)
+        if response_format is not None:
+            request["response_format"] = dict(response_format)
         key = cache_key(**request)
         reply = self.cache.get(key)
         cached = reply is not None
@@ -438,6 +459,8 @@ class LLMClient(_Closing):
                 f"(needed for {self.model.name})"
             )
         prompt_bound = prompt_token_bound(request["messages"])
+        if "response_format" in request:  # a schema is sent to the model too
+            prompt_bound += len(json.dumps(request["response_format"]).encode("utf-8"))
         estimate = token_cost(self.model, prompt_bound, self.model.max_tokens)
         self.ledger.charge(estimate, label=self.model.name)
         billing = _Billing()

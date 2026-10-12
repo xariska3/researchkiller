@@ -5,7 +5,7 @@ Below are the title and abstract of a research paper. Write a short research pro
 Rules:
 - Write 2 to 4 sentences and 40 to 120 words of plain prose.
 - Describe every idea in your own words, using different terminology from the paper.
-- Do not use any word from the title, in any form, with one exception: if the title names a language, nationality, country or region, the proposal must keep that name.
+- Do not use any word from the title, in any form, with one exception: if the title names a language, nationality, country or region, or a research field or application domain (such as physics, maritime or clinical), the proposal must keep that word.
 - Do not name any model, dataset, benchmark, method, tool, venue or organisation.
 - Do not use acronyms or abbreviations of any kind.
 - Do not add problems, methods, claims or results that the paper does not support.
