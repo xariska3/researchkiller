@@ -12,8 +12,8 @@ corpus:
   min_abstract_words: 50          # placeholder
   max_citers_per_target: 20       # placeholder
   max_works_per_sweep: 25000      # per filter string, newest first (publication_date desc)
-  mailto_env: OPENALEX_MAILTO     # optional; env var holding the polite-pool email
-  api_key_env: OPENALEX_API_KEY   # optional; env var holding an OpenAlex API key
+  mailto_env: OPENALEX_MAILTO     # optional; OpenAlex has ignored mailto since Feb 2026
+  api_key_env: OPENALEX_API_KEY   # optional, but a free key gives 10x the daily budget
   out_dir: data/corpus
 
 bench:

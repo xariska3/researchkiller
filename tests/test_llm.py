@@ -297,17 +297,69 @@ def test_gives_up_after_max_retries(
 def test_failed_call_is_booked_for_timeouts_transport_errors_and_5xx(
     failure: Outcome, db_path: Path, llm_cache: LLMCache, make_ledger: MakeLedger, api_key: str
 ) -> None:
-    model = make_model_config()
     ledger = make_ledger()
-    with pytest.raises(LLMError) as exc_info:
+    with pytest.raises(LLMError):
         _failing_client(llm_cache, ledger, failure).complete(MSGS)
+    _assert_booked_at_estimate(db_path, ledger)
 
+
+def _assert_booked_at_estimate(db_path: Path, ledger: Ledger) -> None:
+    model = make_model_config()
     estimate = pessimistic_cost(model, MSGS)
-    assert exc_info.value.maybe_billed
     assert ledger.spent == pytest.approx(estimate)
     assert _spend_rows(db_path) == [
         ("test", "fake-model", prompt_token_bound(MSGS), model.max_tokens, estimate)
     ]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [b'{"choices": []}', b'{"choices": [{"message": {"content": "hi"}}]}', b"<html>oops</html>"],
+)
+def test_failed_call_is_booked_for_malformed_200_bodies(
+    body: bytes, db_path: Path, llm_cache: LLMCache, make_ledger: MakeLedger, api_key: str
+) -> None:
+    ledger = make_ledger()
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, content=body))
+    client = LLMClient(make_model_config(), llm_cache, ledger, transport=transport)
+    with pytest.raises(LLMError, match="malformed|not JSON"):
+        client.complete(MSGS)
+    _assert_booked_at_estimate(db_path, ledger)
+
+
+def test_keyboard_interrupt_mid_request_is_booked_then_reraised(
+    db_path: Path, llm_cache: LLMCache, make_ledger: MakeLedger, api_key: str
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise KeyboardInterrupt
+
+    ledger = make_ledger()
+    client = LLMClient(
+        make_model_config(), llm_cache, ledger, transport=httpx.MockTransport(handler)
+    )
+    with pytest.raises(KeyboardInterrupt):
+        client.complete(MSGS)
+    _assert_booked_at_estimate(db_path, ledger)
+
+
+def test_keyboard_interrupt_while_backing_off_from_429_is_not_booked(
+    db_path: Path, llm_cache: LLMCache, make_ledger: MakeLedger, api_key: str
+) -> None:
+    def interrupted_sleep(seconds: float) -> None:
+        raise KeyboardInterrupt
+
+    ledger = make_ledger()
+    client = LLMClient(
+        make_model_config(),
+        llm_cache,
+        ledger,
+        transport=_failing_transport(429),
+        sleep=interrupted_sleep,
+    )
+    with pytest.raises(KeyboardInterrupt):
+        client.complete(MSGS)
+    assert ledger.spent == 0.0
+    assert _spend_rows(db_path) == []
 
 
 @pytest.mark.parametrize("failure", [400, 401, 404, 429])
@@ -315,10 +367,9 @@ def test_failed_call_is_not_booked_for_4xx_including_429(
     failure: int, db_path: Path, llm_cache: LLMCache, make_ledger: MakeLedger, api_key: str
 ) -> None:
     ledger = make_ledger()
-    with pytest.raises(LLMError) as exc_info:
+    with pytest.raises(LLMError):
         _failing_client(llm_cache, ledger, failure).complete(MSGS)
 
-    assert not exc_info.value.maybe_billed
     assert ledger.spent == 0.0  # reservation released
     assert _spend_rows(db_path) == []
 

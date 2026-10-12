@@ -53,15 +53,7 @@ class _Closing:
 
 
 class LLMError(RuntimeError):
-    """A completion failed: bad request, malformed response, or retries exhausted.
-
-    `maybe_billed` is set when an attempt timed out, hit a transport error or got
-    a 5xx, since the provider may have processed (and billed) that request.
-    """
-
-    def __init__(self, message: str, *, maybe_billed: bool = False) -> None:
-        super().__init__(message)
-        self.maybe_billed = maybe_billed
+    """A completion failed: bad request, malformed response, or retries exhausted."""
 
 
 class BudgetExceeded(RuntimeError):
@@ -235,10 +227,11 @@ class Ledger(_Closing):
     and process using that file: the running total is read at startup. Before a
     real call the client reserves a pessimistic estimate (`charge`); afterwards it
     `record`s what the call cost, which releases the reservation and appends a
-    spend row. A failed call is recorded at its estimate if it may have been
-    billed (timeout, transport error or 5xx); otherwise (4xx, including 429) its
-    reservation is just `release`d. Spend by a command running concurrently is
-    only seen after a restart, so run commands one at a time.
+    spend row. A failed call is recorded at its estimate if any request was sent
+    without a 4xx coming back (timeouts, transport errors, 5xx, malformed 200s,
+    Ctrl-C mid-request), since it may have been billed; otherwise its reservation
+    is just `release`d. Spend by a command running concurrently is only seen
+    after a restart, so run commands one at a time.
     """
 
     def __init__(self, path: str | Path, cap: float = 20.0, *, command: str) -> None:
@@ -368,10 +361,11 @@ class LLMClient(_Closing):
         prompt_bound = prompt_token_bound(request["messages"])
         estimate = token_cost(self.model, prompt_bound, self.model.max_tokens)
         self.ledger.charge(estimate, label=self.model.name)
+        billing = _Billing()
         try:
-            reply = _parse_reply(self._post(request, api_key), self.model.name)
-        except BaseException as exc:
-            if isinstance(exc, LLMError) and exc.maybe_billed:
+            reply = _parse_reply(self._post(request, api_key, billing), self.model.name)
+        except BaseException:  # includes KeyboardInterrupt: book, then re-raise
+            if billing.possible:
                 self.ledger.record(
                     reserved=estimate,
                     model=self.model.name,
@@ -391,32 +385,31 @@ class LLMClient(_Closing):
         )
         return reply
 
-    def _post(self, request: dict[str, Any], api_key: str) -> Any:
+    def _post(self, request: dict[str, Any], api_key: str, billing: _Billing) -> Any:
         """POST /chat/completions, retrying 429, 5xx and transport errors with backoff.
 
-        A raised LLMError has `maybe_billed` set if any attempt timed out, hit a
-        transport error (timeouts are transport errors in httpx) or got a 5xx.
+        Every request counts as possibly billed from the moment it is sent; only a
+        4xx response clears that again. `billing` carries the verdict out, even
+        when the call ends in an exception.
         """
         headers = {"Authorization": f"Bearer {api_key}"}
-        maybe_billed = False
         for attempt in range(self.max_retries + 1):
             retry_after: float | None = None
+            billed_before = billing.possible
+            billing.possible = True
             try:
                 response = self._http.post("/chat/completions", json=request, headers=headers)
-            except httpx.TransportError as exc:
+            except httpx.TransportError as exc:  # timeouts are transport errors in httpx
                 problem = f"{type(exc).__name__}: {exc}"
-                maybe_billed = True
             else:
                 status = response.status_code
+                if 400 <= status < 500:
+                    billing.possible = billed_before  # rejected, so not billed
                 if status == 429 or status >= 500:
                     problem = f"HTTP {status}: {response.text[:300]}"
-                    retry_after = _retry_after_seconds(response)
-                    maybe_billed = maybe_billed or status >= 500
+                    retry_after = retry_after_seconds(response)
                 elif response.is_error:
-                    raise LLMError(
-                        f"{self.model.name}: HTTP {status}: {response.text[:500]}",
-                        maybe_billed=maybe_billed,
-                    )
+                    raise LLMError(f"{self.model.name}: HTTP {status}: {response.text[:500]}")
                 else:
                     try:
                         return response.json()
@@ -425,8 +418,7 @@ class LLMClient(_Closing):
             if attempt == self.max_retries:
                 raise LLMError(
                     f"{self.model.name}: giving up after {attempt + 1} attempts; "
-                    f"last error: {problem}",
-                    maybe_billed=maybe_billed,
+                    f"last error: {problem}"
                 )
             delay = self.backoff_base * 2**attempt
             if retry_after is not None:
@@ -436,6 +428,13 @@ class LLMClient(_Closing):
 
     def close(self) -> None:
         self._http.close()
+
+
+class _Billing:
+    """Whether a real call may have been billed: a request went out and no 4xx came back."""
+
+    def __init__(self) -> None:
+        self.possible = False
 
 
 def _normalize_messages(messages: Sequence[Message]) -> list[dict[str, str]]:
@@ -469,7 +468,8 @@ def _parse_reply(data: Any, model_name: str) -> CachedReply:
     )
 
 
-def _retry_after_seconds(response: httpx.Response) -> float | None:
+def retry_after_seconds(response: httpx.Response) -> float | None:
+    """A numeric Retry-After header in seconds, if the server sent one."""
     try:
         return max(0.0, float(response.headers["retry-after"]))
     except (KeyError, ValueError):

@@ -39,8 +39,8 @@ class CorpusConfig:
     max_citers_per_target: int
     out_dir: Path
     max_works_per_sweep: int = 25000  # per filter string, newest first; deterministic cut
-    mailto_env: str | None = None  # env var holding the OpenAlex polite-pool email
-    api_key_env: str | None = None  # env var holding an OpenAlex API key
+    mailto_env: str | None = None  # env var with an email; OpenAlex ignores mailto since 2026-02
+    api_key_env: str | None = None  # env var holding an OpenAlex API key (optional, 10x budget)
 
     def __post_init__(self) -> None:
         _require(len(self.filters) > 0, "filters must list at least one OpenAlex filter")

@@ -19,4 +19,4 @@ jobs:
       - name: Ruff
         run: ruff check .
       - name: Pytest
-        run: pytest
+        run: pytest -m "not network"

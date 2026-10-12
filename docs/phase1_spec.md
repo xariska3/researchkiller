@@ -70,25 +70,32 @@ than every model's `training_cutoff`.
 - `parse_json()` helper that tolerates code fences.
 
 ## Corpus (`corpus.py`, `targets.py`)
-Source: OpenAlex `/works`. Optional `mailto` and `api_key` (from env). Respect
-10 req/s. Cursor paging, `per_page=200`, `select` only the fields needed
-(id, doi, title, publication_date, abstract_inverted_index, referenced_works,
-primary_topic, cited_by_count, language).
+Source: OpenAlex `/works`. Optional `api_key` (sent as a Bearer header; a
+free key gives 10× the keyless daily budget) and `mailto` (ignored by OpenAlex
+since February 2026), both from env. Throttle to the documented limit (100
+req/s). Cursor paging, `per_page=100` (the documented maximum; 200 is
+deprecated), `select` only the fields needed (id, doi, title,
+publication_date, abstract_inverted_index, referenced_works, primary_topic,
+cited_by_count, language). The API facts and their doc URLs are in the
+comment at the top of `corpus.py`.
 
 Build order:
 1. **Subfield sweeps**: each config filter string (e.g.
    `primary_topic.subfield.id:1702,from_publication_date:2023-01-01`),
-   always add `has_abstract:true`. Request results sorted by publication_date
-   **descending** (newest first, so targets always survive truncation), ties
-   by id, and stop after `corpus.max_works_per_sweep` (default 25000), so
-   truncation is deterministic. Check the OpenAlex docs for which sort fields
-   exist; if `id` isn't sortable, sort ties by (date, id) locally after
-   fetching. Rebuild abstracts from the inverted index.
-   Drop docs under `min_abstract_words` or wrong language.
+   always add `has_abstract:true` and `to_publication_date:<build date>`
+   (newest-first results otherwise start with bogus future dates). Request
+   results sorted by publication_date **descending** (newest first, so targets
+   always survive truncation) and keep `corpus.max_works_per_sweep` (default
+   25000). OpenAlex can't sort by `id` (HTTP 400), so past the cap keep reading
+   while the publication date at the cut lasts, then order by (date desc, id
+   asc) locally and cut: truncation is deterministic. Rebuild abstracts from
+   the inverted index. Drop docs under `min_abstract_words` or wrong language.
 2. **Dedupe**: merge two works only if they share a DOI, or if their
    normalised titles match AND the title has at least 5 content words AND
    their publication years are at most 2 apart. Earliest version keeps its id;
-   other ids become `aliases` (a hit on any alias counts as a hit).
+   other ids become `aliases` (a hit on any alias counts as a hit). A merged
+   record keeps the earliest version's fields, with references unioned over
+   all versions.
 3. **Select targets** (`targets.py`): origin = sweep, published on or after
    `bench.target_from_date` (later than every model's `training_cutoff`, checked at load),
    abstract 100–450 words, at least 10 references. Seeded sample of
@@ -96,11 +103,15 @@ Build order:
    no target candidates remain after selection.
 4. **Citation expansion**: fetch every target's references (batch
    `ids.openalex:W1|W2|...`, 50 per call) and up to `max_citers_per_target`
-   citers (`cites:Wxxx`). References are the hard near-miss distractors.
-   Dedupe again and re-map target ids through aliases.
+   citers (`cites:Wxxx`, newest first, cut like a sweep). References are the
+   hard near-miss distractors. Expansion docs pass the same `has_abstract`,
+   language and `min_abstract_words` filters as sweeps. Dedupe again, re-map
+   target ids through aliases, and re-check remapped targets against the
+   target rules (an earlier version may predate `target_from_date`).
 5. **Freeze**: write `corpus.jsonl`, `targets.jsonl`, `manifest.json`
    (filters, counts by origin, API calls, sha256 of corpus file, timestamp,
-   and per sweep: `truncated` (bool), `oldest_date`, `newest_date`, `n_fetched`).
+   and per sweep: `truncated` (bool), `oldest_date`, `newest_date`, `n_fetched`,
+   `n_kept`).
    Refuse to overwrite an existing manifest.
 
 ## Benchmark generation (`bench.py`), Test A only
