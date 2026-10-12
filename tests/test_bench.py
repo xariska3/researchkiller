@@ -24,7 +24,7 @@ from rk.bench import (
     parse_verdict,
 )
 from rk.config import Config, config_from_dict
-from rk.corpus import CORPUS_FILE, freeze
+from rk.corpus import CORPUS_FILE, CorpusError, freeze
 
 YES = '{"verdict": "yes", "reason": "same problem, method and claim"}'
 NO = '{"verdict": "no", "reason": "the method differs"}'
@@ -274,13 +274,13 @@ def test_refuses_to_resume_with_other_prompts(tmp_path: Path, corpus_dir: Path) 
 
 def test_needs_an_intact_frozen_corpus(tmp_path: Path) -> None:
     cfg = _config(tmp_path)
-    with pytest.raises(BenchError, match="run `python -m rk build-corpus` first"):
+    with pytest.raises(CorpusError, match="run `python -m rk build-corpus` first"):
         make_bench(cfg, paraphraser(), judge())
 
     freeze(cfg.corpus.out_dir, corpus_records(), target_rows(), {})
     with (cfg.corpus.out_dir / CORPUS_FILE).open("a", encoding="utf-8") as fh:
         fh.write("{}\n")
-    with pytest.raises(BenchError, match="doesn't match the sha256"):
+    with pytest.raises(CorpusError, match="doesn't match the sha256"):
         make_bench(cfg, paraphraser(), judge())
 
 

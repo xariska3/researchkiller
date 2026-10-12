@@ -13,5 +13,7 @@ commands (`python -m rk build-corpus --config configs/phase1.yaml` and so on)
 are stubs and there are no results yet. To set up, create a Python 3.10+
 virtualenv, run `pip install -e ".[dev]"` (add the `dense` extra for
 sentence-transformers and `tracking` for MLflow), then run `ruff check .` and
-`pytest`. Results, limitations and reproduction instructions will be added in
+`pytest`. For GPU encoding on Windows, first install a CUDA build of torch
+(`pip install torch --index-url https://download.pytorch.org/whl/cu128`), since
+the PyPI wheel is CPU-only. Results, limitations and reproduction instructions will be added in
 Step 7.

@@ -12,7 +12,6 @@ happens, which is also what makes a rerun resume where the last one stopped.
 from __future__ import annotations
 
 import dataclasses
-import hashlib
 import json
 import math
 import random
@@ -20,14 +19,12 @@ import re
 from collections import Counter
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from importlib import resources
 from pathlib import Path
-from string import Template
 from typing import Any
 
 from rk.config import Config
-from rk.corpus import CORPUS_FILE, MANIFEST_FILE, TARGETS_FILE
-from rk.llm import ChatModel, Completion, Usage, parse_json
+from rk.corpus import CORPUS_FILE, load_frozen_corpus
+from rk.llm import ChatModel, Completion, Prompt, Usage, load_prompt, parse_json
 from rk.targets import Record, id_number
 from rk.text import STOPWORDS, content_stems, content_tokens, extract_acronyms, stem
 
@@ -59,29 +56,9 @@ class BenchError(RuntimeError):
     """The benchmark can't be generated as asked (missing corpus, incompatible outputs)."""
 
 
-@dataclass(frozen=True)
-class Prompt:
-    name: str
-    template: Template
-    sha256: str
-
-    def render(self, **values: str) -> str:
-        return self.template.substitute(values)
-
-
 def load_prompts() -> dict[str, Prompt]:
-    """The prompt templates in rk/prompts, each with the sha256 of its text.
-
-    Files are read with universal newlines, so the text sent to the model and
-    its hash don't depend on the line endings of the checkout.
-    """
-    prompts = {}
-    folder = resources.files("rk").joinpath("prompts")
-    for name in PROMPT_NAMES:
-        text = folder.joinpath(f"{name}.txt").read_text(encoding="utf-8")
-        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
-        prompts[name] = Prompt(name, Template(text), digest)
-    return prompts
+    """The benchmark's prompt templates, each with the sha256 of its text."""
+    return {name: load_prompt(name) for name in PROMPT_NAMES}
 
 
 @dataclass(frozen=True)
@@ -467,24 +444,6 @@ def bench_stats(
         "money_spent": total.money_spent,
         **meta,
     }
-
-
-def load_frozen_corpus(
-    corpus_dir: Path,
-) -> tuple[list[Record], list[dict[str, Any]], dict[str, Any]]:
-    """The frozen corpus, its targets and manifest; the corpus must match its sha256."""
-    manifest_path = corpus_dir / MANIFEST_FILE
-    if not manifest_path.exists():
-        raise BenchError(
-            f"no frozen corpus in {corpus_dir}: run `python -m rk build-corpus` first"
-        )
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    corpus_bytes = (corpus_dir / CORPUS_FILE).read_bytes()
-    if hashlib.sha256(corpus_bytes).hexdigest() != manifest["files"][CORPUS_FILE]["sha256"]:
-        raise BenchError(f"{corpus_dir / CORPUS_FILE} doesn't match the sha256 in its manifest")
-    corpus = _read_jsonl(corpus_dir / CORPUS_FILE)
-    targets = _read_jsonl(corpus_dir / TARGETS_FILE)
-    return corpus, targets, manifest
 
 
 def _check_resumable(out_dir: Path, meta: dict[str, Any], rows: Sequence[dict[str, Any]]) -> None:

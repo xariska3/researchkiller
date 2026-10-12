@@ -554,6 +554,25 @@ def freeze(
     return manifest
 
 
+def load_frozen_corpus(
+    corpus_dir: Path,
+) -> tuple[list[Record], list[dict[str, Any]], dict[str, Any]]:
+    """The frozen corpus, its targets and manifest; the corpus must match its sha256."""
+    manifest_path = corpus_dir / MANIFEST_FILE
+    if not manifest_path.exists():
+        raise CorpusError(
+            f"no frozen corpus in {corpus_dir}: run `python -m rk build-corpus` first"
+        )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    corpus_bytes = (corpus_dir / CORPUS_FILE).read_bytes()
+    if hashlib.sha256(corpus_bytes).hexdigest() != manifest["files"][CORPUS_FILE]["sha256"]:
+        raise CorpusError(f"{corpus_dir / CORPUS_FILE} doesn't match the sha256 in its manifest")
+    corpus = [json.loads(line) for line in corpus_bytes.decode("utf-8").splitlines()]
+    targets_text = (corpus_dir / TARGETS_FILE).read_text(encoding="utf-8")
+    targets = [json.loads(line) for line in targets_text.splitlines()]
+    return corpus, targets, manifest
+
+
 def _refuse_overwrite(manifest_path: Path) -> None:
     if manifest_path.exists():
         raise _overwrite_error(manifest_path)

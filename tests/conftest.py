@@ -131,17 +131,24 @@ class FakeLLM:
 
 
 class FakeEncoder:
-    """Deterministic bag-of-stems encoder: feature-hashed, L2-normalised float32.
+    """Deterministic bag-of-stems encoder (rk.retrieval.Encoder): feature-hashed, unit float32.
 
     Texts that share content stems get higher cosine similarity, so retrieval
     tests behave sensibly. Uses blake2b, not hash(), so vectors are identical
-    across processes. Empty texts encode to the zero vector.
+    across processes. Empty texts encode to the zero vector. Queries and
+    documents are encoded the same way.
     """
+
+    name = "fake-encoder"
+    device = "cpu"
 
     def __init__(self, dim: int = 256) -> None:
         self.dim = dim
 
-    def encode(self, texts: Sequence[str]) -> np.ndarray:
+    def encode_queries(self, texts: Sequence[str]) -> np.ndarray:
+        return self.encode_docs(texts)
+
+    def encode_docs(self, texts: Sequence[str]) -> np.ndarray:
         vectors = np.zeros((len(texts), self.dim), dtype=np.float32)
         for row, text in enumerate(texts):
             for s in content_stems(text):

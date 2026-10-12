@@ -1,0 +1,8 @@
+You are helping a researcher find out whether the idea in their research proposal has already been published.
+
+Below is the proposal. Write up to $n_queries search queries for a scientific literature search engine that could find earlier papers on the same idea. Published work often uses different terminology from the proposal, so vary the wording: use the terms, synonyms and phrasings that papers on this idea would likely use, and cover different aspects (the problem, the method, the claimed contribution). Each query should be a short phrase or one sentence.
+
+Proposal: $proposal
+
+Answer with JSON only, in exactly this form:
+{"queries": ["first query", "second query"]}
