@@ -1,0 +1,12 @@
+You are checking whether a research proposal captures a paper.
+
+Question: does the proposal capture the paper's core research problem, its method and its main claimed contribution? The proposal deliberately uses different wording and was written as if before the work was done, so judge the meaning only. Answer "yes" only if all three (problem, method, claim) are there.
+
+Paper title: $title
+
+Paper abstract: $abstract
+
+Proposal: $proposal
+
+Answer with JSON only, in exactly this form, where verdict is "yes" or "no":
+{"verdict": "yes", "reason": "one short sentence"}

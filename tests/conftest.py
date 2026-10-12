@@ -64,6 +64,7 @@ class FakeLLM:
         self.model = model or make_model_config()
         self._replies = replies if callable(replies) else list(replies)
         self.calls: list[list[dict[str, str]]] = []
+        self.seeds: list[int | None] = []  # the seed= of each direct complete() call
 
     @staticmethod
     def count_tokens(text: str) -> int:
@@ -82,6 +83,7 @@ class FakeLLM:
         return text, prompt_tokens, self.count_tokens(text)
 
     def complete(self, messages: Sequence[Message], *, seed: int | None = None) -> Completion:
+        self.seeds.append(seed)
         text, prompt_tokens, completion_tokens = self._reply(messages)
         cost = token_cost(self.model, prompt_tokens, completion_tokens)
         usage = Usage(
@@ -123,6 +125,9 @@ class FakeLLM:
     @property
     def transport(self) -> httpx.MockTransport:
         return httpx.MockTransport(self.handle)
+
+    def close(self) -> None:
+        """Nothing to release; lets FakeLLM stand in where an LLMClient gets closed."""
 
 
 class FakeEncoder:
@@ -262,7 +267,7 @@ _T2_TITLE = "Contrastive pretraining of molecular graph encoders at scale"
 FIXTURE_WORKS: list[dict[str, Any]] = [
     # Targets: post-cutoff sweep works, 120-word abstracts, 10+ references.
     oa_work(1001, "Sparse attention routing for long document summarisation", "2025-09-10",
-            words=120, refs=[*range(2001, 2014), 3001, 2999]),  # W2999 doesn't exist
+            words=120, refs=[*range(2001, 2015), 3001, 2999]),  # W2999 doesn't exist
     oa_work(1002, _T2_TITLE, "2025-08-20", words=120, refs=range(2001, 2011), doi="10.1000/t2"),
     oa_work(1003, "Uncertainty calibration for reinforcement learning reward models",
             "2025-11-05", words=120, refs=range(2003, 2013)),
@@ -310,6 +315,9 @@ FIXTURE_WORKS: list[dict[str, Any]] = [
     ],
     # Same title as W1010 but 4 years earlier: not merged.
     oa_work(2013, _SAME_TITLE, "2020-04-01", subfield=OTHER_SUBFIELD),
+    # A reference without an abstract: dropped and counted.
+    oa_work(2014, "A reference known only by its title", "2019-05-01", subfield=OTHER_SUBFIELD,
+            has_abstract=False),
     # An earlier version of target W1002 (same DOI), reachable only as a reference.
     oa_work(3001, _T2_TITLE, "2025-07-01", words=120, refs=range(2001, 2011), doi="10.1000/t2",
             subfield=OTHER_SUBFIELD),

@@ -42,7 +42,6 @@ def test_fake_encoder_is_deterministic_normalised_and_lexically_sensible() -> No
     "argv",
     [
         ["build-index", "--config", "configs/phase1.yaml"],
-        ["make-bench", "--config", "configs/phase1.yaml"],
         ["run", "--config", "configs/phase1.yaml", "--configs", "B1,B4,B5", "--limit", "5"],
         ["report", "runs/20260101-000000"],
     ],

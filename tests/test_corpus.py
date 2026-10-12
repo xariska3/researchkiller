@@ -209,8 +209,13 @@ def test_build_freezes_corpus_targets_and_manifest(tmp_path: Path) -> None:
     }
     assert manifest["n_docs"] == len(corpus) == 36
     assert manifest["counts_by_origin"] == {"sweep": 20, "reference": 13, "citer": 3}
-    assert manifest["dropped"] == {"language": 1}
-    assert {"W1012", "W1013", "W1014", "W2999"}.isdisjoint(ids)  # German, no abstract, future, missing
+    assert manifest["dropped"] == {
+        "sweep": {"language": 1},
+        "reference": {"no_abstract": 1, "not_found": 1},  # W2014, W2999
+        "citer": {},
+    }
+    # German, no abstract (sweep and reference), future-dated, nonexistent:
+    assert {"W1012", "W1013", "W2014", "W1014", "W2999"}.isdisjoint(ids)
     assert manifest["citers"] == {"queries": 3, "truncated": 1, "n_kept": 3}
     assert {"W4001", "W4002", "W4004"} <= ids and "W4003" not in ids  # cap of 2 for W1001
     assert manifest["api_calls"] == len(fake.requests)
