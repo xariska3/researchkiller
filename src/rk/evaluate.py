@@ -349,7 +349,7 @@ def _ci(ci: Sequence[float] | None) -> str:
 
 def render_markdown(summary: dict[str, Any]) -> str:
     """summary.md: main, effort, difficulty, paired, cost-quality and error tables."""
-    dirty = " (uncommitted changes)" if summary["git_dirty"] else ""
+    dirty = " (uncommitted changes to tracked files)" if summary["git_dirty"] else ""
     provenance = (
         f"Git {summary['git_commit'] or 'unknown'}{dirty}; corpus sha256 "
         f"{summary['corpus_sha256'][:12]}; bench sha256 {summary['bench_sha256'][:12]}."
@@ -476,18 +476,29 @@ def load_bench(
     return rows, stats, hashlib.sha256(data).hexdigest()
 
 
-def git_state() -> tuple[str | None, bool | None]:
-    """HEAD commit and whether the working tree has uncommitted changes (None if unknown)."""
+MAX_UNTRACKED_LISTED = 200
+
+
+def git_state(cwd: Path | None = None) -> tuple[str | None, bool | None, list[str] | None]:
+    """HEAD commit, whether tracked files have uncommitted changes, and the untracked files.
+
+    Untracked files (not git-ignored) don't make the tree dirty; they are only
+    listed, as information. Everything is None if git isn't available.
+    """
+
+    def git(*args: str) -> str:
+        done = subprocess.run(
+            ["git", *args], capture_output=True, text=True, check=True, cwd=cwd
+        )
+        return done.stdout
+
     try:
-        head = subprocess.run(
-            ["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True
-        )
-        status = subprocess.run(
-            ["git", "status", "--porcelain"], capture_output=True, text=True, check=True
-        )
+        head = git("rev-parse", "HEAD").strip()
+        tracked = git("status", "--porcelain", "--untracked-files=no")
+        untracked = git("ls-files", "--others", "--exclude-standard").splitlines()
     except (OSError, subprocess.CalledProcessError):
-        return None, None
-    return head.stdout.strip(), bool(status.stdout.strip())
+        return None, None, None
+    return head, bool(tracked.strip()), sorted(untracked)[:MAX_UNTRACKED_LISTED]
 
 
 def _jsonable(value: Any) -> Any:
@@ -538,10 +549,11 @@ def run_eval(
         raise EvalError(f"unknown configs {unknown}; choose from {list(CONFIG_ORDER)}")
     retrievers = make_retrievers(cfg, index, encoder, agent)
 
-    commit, dirty = git_state()
+    commit, dirty, untracked = git_state()
     meta: dict[str, Any] = {
         "git_commit": commit,
-        "git_dirty": dirty,
+        "git_dirty": dirty,  # tracked files only
+        "git_untracked": untracked,  # information, not part of "dirty"
         "corpus_sha256": corpus_sha,
         "bench_sha256": bench_sha,
         "index": index.manifest,
@@ -615,6 +627,7 @@ def _open_run(
             "at": _now(),
             "git_commit": meta["git_commit"],
             "git_dirty": meta["git_dirty"],
+            "git_untracked": meta["git_untracked"],
             "retry_errors": retry_errors,
         }
         run_meta.setdefault("resumed", []).append(resumed)

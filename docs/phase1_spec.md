@@ -154,6 +154,10 @@ reason:
    **Never use embedding similarity as the filter**: it would keep only
    paraphrases dense retrieval handles well and bias the benchmark.
 
+A qid is the target's position in the seeded visiting order plus its id
+(`A0007-W123`), so sorting by qid gives the seeded order and the first N
+queries (`run --limit N`) are a seeded random sample, not the lowest ids.
+
 Outputs in `bench.out_dir`: `test_a.jsonl` (`qid, target_id, target_aliases,
 query, attempt, leak_stats, judge_verdicts, prompt_hashes`, plus the attempt's
 LLM `usage`), `rejections.jsonl` (one row per rejected attempt with `reason`
@@ -194,8 +198,10 @@ retrieval refuses an encoder or revision other than the index's.
 ## Evaluation (`evaluate.py`)
 - **Runner** (`python -m rk run`): loads the frozen corpus, index and bench (all
   integrity-checked), creates `runs/<timestamp>/` and records run metadata: git
-  commit and whether the tree is dirty, config snapshot, corpus and bench
-  sha256, index manifest, prompt hashes, model names.
+  commit and whether tracked files have uncommitted changes (untracked files
+  are listed separately, as information), config snapshot, corpus and bench
+  sha256, index manifest, prompt hashes, model names. Queries run in qid
+  order (the seeded order), so `--limit N` is a seeded random sample.
 - Per query and config: target rank (first position of the target or any
   alias in the top-100, else none), Hit@1/5/10, reciprocal rank, and the trace
   fields (queries issued, LLM calls, prompt/completion tokens, method cost,

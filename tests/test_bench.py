@@ -21,6 +21,7 @@ from rk.bench import (
     check_length,
     load_prompts,
     make_bench,
+    make_qid,
     parse_verdict,
 )
 from rk.config import Config, config_from_dict
@@ -116,7 +117,7 @@ def test_accepts_clean_proposals_and_writes_full_rows(tmp_path: Path, corpus_dir
     assert [r["target_id"] for r in rows] == ORDER  # seeded visiting order
     hashes = {name: p.sha256 for name, p in PROMPTS.items()}
     for row in rows:
-        assert row["qid"] == f"A-{row['target_id']}"
+        assert row["qid"] == make_qid(ORDER.index(row["target_id"]), row["target_id"])
         assert row["query"] == GOOD[row["target_id"]]
         assert row["target_aliases"] == []
         assert row["attempt"] == 0
@@ -131,6 +132,9 @@ def test_accepts_clean_proposals_and_writes_full_rows(tmp_path: Path, corpus_dir
     assert stats["prompt_hashes"] == hashes
     assert len(para.calls) == 3 and len(jdg.calls) == 6  # two separate judge calls each
     assert stats == _stats(cfg)
+    # Sorting qids reproduces the seeded visiting order, so a qid prefix is a random sample.
+    assert [r["target_id"] for r in sorted(rows, key=lambda r: r["qid"])] == ORDER
+    assert ORDER != sorted(ORDER)  # (the seeded order isn't just id order here)
 
 
 # --- rejections --------------------------------------------------------------
@@ -405,7 +409,7 @@ def test_cli_make_bench_with_limit_and_show(
     out = capsys.readouterr().out
     first = ORDER[0]
     assert "1 of 3 queries accepted" in out
-    assert f"A-{first}  {TITLES[first]}" in out
+    assert f"{make_qid(0, first)}  {TITLES[first]}" in out
     opening = ". ".join(ABSTRACTS[first].split(". ")[:2]) + "."
     assert f"abstract: {opening}" in out
     assert f"proposal: {GOOD[first]}" in out

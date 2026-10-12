@@ -339,10 +339,12 @@ def make_bench(
     )
     by_id = {r["id"]: r for r in corpus}
     max_attempts = cfg.bench.max_attempts_per_target
+    width = max(4, len(str(len(targets))))
     worked_on = 0
     try:
-        for target in _visit_order(targets, cfg.bench.seed):
+        for position, target in enumerate(_visit_order(targets, cfg.bench.seed)):
             target_id = target["id"]
+            qid = make_qid(position, target_id, width)
             if len(accepted) >= cfg.bench.n_targets:
                 break
             if target_id in accepted or attempts[target_id] >= max_attempts:
@@ -361,7 +363,7 @@ def make_bench(
                     leak=leak,
                     base_seed=cfg.paraphraser.seed,
                 )
-                row = _row(target, attempt, result, meta["prompt_hashes"])
+                row = _row(qid, target, attempt, result, meta["prompt_hashes"])
                 if result.rejection is None:
                     _append(out_dir / ACCEPTED_FILE, row)
                     accepted_rows.append(row)
@@ -385,16 +387,29 @@ def _visit_order(targets: Sequence[dict[str, Any]], seed: int) -> list[dict[str,
     return order
 
 
+def make_qid(position: int, target_id: str, width: int = 4) -> str:
+    """'A0007-W123': the target's position in the seeded visiting order, then its id.
+
+    Sorting qids therefore gives the seeded order, so the first N queries (as in
+    `run --limit N`) are a seeded random sample, not the lowest ids.
+    """
+    return f"A{position:0{width}d}-{target_id}"
+
+
 def _by_attempt(row: dict[str, Any]) -> int:
     return int(row["attempt"])
 
 
 def _row(
-    target: dict[str, Any], attempt: int, result: Attempt, prompt_hashes: dict[str, str]
+    qid: str,
+    target: dict[str, Any],
+    attempt: int,
+    result: Attempt,
+    prompt_hashes: dict[str, str],
 ) -> dict[str, Any]:
     row: dict[str, Any] = {"target_id": target["id"], "attempt": attempt}
     if result.rejection is None:
-        row = {"qid": f"A-{target['id']}", **row, "target_aliases": target["aliases"]}
+        row = {"qid": qid, **row, "target_aliases": target["aliases"]}
     else:
         row.update(reason=result.rejection.reason, detail=result.rejection.message)
     row.update(

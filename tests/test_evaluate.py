@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
 from contextlib import closing
 from pathlib import Path
 from typing import Any
@@ -12,7 +13,7 @@ from bench_data import GOOD, T2, TITLES, corpus_records, target_rows
 from conftest import FakeEncoder, FakeLLM, corpus_config_dict
 
 from rk import cli
-from rk.bench import make_bench
+from rk.bench import _visit_order, make_bench, make_qid
 from rk.config import Config, config_from_dict
 from rk.corpus import freeze
 from rk.evaluate import (
@@ -23,6 +24,7 @@ from rk.evaluate import (
     SUMMARY_MD,
     EvalError,
     bucket,
+    git_state,
     mcnemar_exact,
     ok_row,
     paired_bootstrap,
@@ -30,9 +32,11 @@ from rk.evaluate import (
     run_eval,
     target_rank,
 )
-from rk.llm import LLMError
+from rk.llm import BudgetExceeded, LLMError
 from rk.retrieval import Result, Trace, build_index
 
+ORDER = [t["id"] for t in _visit_order(target_rows(), 7)]  # the bench seed in these configs
+Q2 = make_qid(ORDER.index(T2), T2)
 YES = '{"verdict": "yes", "reason": "same idea"}'
 REWRITES = '{"queries": ["learned groups for efficient comparison", "memory saving condensation"]}'
 SEARCH = '{"action": "search", "query": "condensing long texts with learned groups"}'
@@ -159,7 +163,7 @@ def test_llm_errors_mark_rows_and_are_left_out_of_paired_stats(cfg: Config) -> N
 
     rows = _rows(cfg, run_dir)
     errors = [(r["config"], r["qid"]) for r in rows if r["status"] == "error"]
-    assert errors == [("B4", f"A-{T2}"), ("B5", f"A-{T2}"), ("B5-U", f"A-{T2}")]
+    assert errors == [("B4", Q2), ("B5", Q2), ("B5-U", Q2)]
     assert all(r["error"] == "LLMError: simulated outage" for r in rows if r["status"] == "error")
     summary = json.loads((run_dir / SUMMARY_JSON).read_text(encoding="utf-8"))
     assert summary["errors"] == {"B1": 0, "B2": 0, "B3": 0, "B4": 1, "B5": 1, "B5-U": 1}
@@ -190,7 +194,7 @@ def test_retry_errors_redoes_only_the_errored_rows(cfg: Config) -> None:
         for r in after
         if r["finished_at"] != before[(r["config"], r["qid"])]
     }
-    assert redone <= {("B4", f"A-{T2}"), ("B5", f"A-{T2}"), ("B5-U", f"A-{T2}")}
+    assert redone <= {("B4", Q2), ("B5", Q2), ("B5-U", Q2)}
     meta = json.loads((run_dir / RUN_FILE).read_text(encoding="utf-8"))
     assert [r["retry_errors"] for r in meta["resumed"]] == [False, True]
 
@@ -198,7 +202,9 @@ def test_retry_errors_redoes_only_the_errored_rows(cfg: Config) -> None:
 def test_rerunning_into_a_run_directory_resumes(cfg: Config) -> None:
     first = agent()
     run_dir = run_eval(cfg, first, FakeEncoder(), limit=1, log_mlflow=False)
-    assert len(_rows(cfg, run_dir)) == len(CONFIG_ORDER)  # one query, six configs
+    rows = _rows(cfg, run_dir)
+    assert len(rows) == len(CONFIG_ORDER)  # one query, six configs
+    assert {r["qid"] for r in rows} == {make_qid(0, ORDER[0])}  # --limit follows the seeded order
     done_proposal = _proposals(first)
 
     later = agent()
@@ -206,6 +212,38 @@ def test_rerunning_into_a_run_directory_resumes(cfg: Config) -> None:
 
     assert len(_rows(cfg, run_dir)) == 3 * len(CONFIG_ORDER)
     assert _proposals(later).isdisjoint(done_proposal)  # the finished query wasn't redone
+
+
+def test_budget_exceeded_stops_the_whole_run_after_writing_the_summary(cfg: Config) -> None:
+    def broke(messages: list[dict[str, str]]) -> str:
+        raise BudgetExceeded("cap reached")
+
+    with pytest.raises(BudgetExceeded):
+        run_eval(cfg, FakeLLM(broke), FakeEncoder(), log_mlflow=False)
+
+    (run_dir,) = cfg.run.out_dir.iterdir()
+    rows = _rows(cfg, run_dir)
+    assert {r["config"] for r in rows} == {"B1", "B2", "B3"}  # B4 stopped the run
+    assert all(r["status"] == "ok" for r in rows)  # not recorded as error rows
+    assert (run_dir / SUMMARY_MD).exists()
+
+
+def test_git_state_counts_only_tracked_changes_as_dirty(tmp_path: Path) -> None:
+    def git(*args: str) -> None:
+        subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True)
+
+    git("init")
+    (tmp_path / "tracked.txt").write_text("one", encoding="utf-8")
+    git("add", "tracked.txt")
+    git("-c", "user.name=t", "-c", "user.email=t@example.org", "commit", "-m", "init")
+    (tmp_path / "scratch.txt").write_text("notes", encoding="utf-8")
+
+    commit, dirty, untracked = git_state(tmp_path)
+    assert commit is not None and len(commit) == 40
+    assert (dirty, untracked) == (False, ["scratch.txt"])  # untracked: listed, not dirty
+
+    (tmp_path / "tracked.txt").write_text("two", encoding="utf-8")
+    assert git_state(tmp_path)[1] is True
 
 
 def test_resume_refuses_a_changed_retrieval_config(cfg: Config, tmp_path: Path) -> None:
