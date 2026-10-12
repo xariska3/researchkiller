@@ -1,0 +1,77 @@
+# Phase 1 configuration (see docs/phase1_spec.md).
+# Loading is strict: unknown, duplicate or missing keys and wrong types raise.
+# Values marked "placeholder" are not fixed by the spec; calibrate them in the
+# Step 6 pilot.
+
+corpus:
+  # OpenAlex /works filter strings, one subfield sweep each.
+  # `has_abstract:true` is always added by the corpus builder.
+  filters:
+    - "primary_topic.subfield.id:1702,from_publication_date:2023-01-01"
+  language: en
+  min_abstract_words: 50          # placeholder
+  max_citers_per_target: 20       # placeholder
+  mailto_env: OPENALEX_MAILTO     # optional; env var holding the polite-pool email
+  api_key_env: OPENALEX_API_KEY   # optional; env var holding an OpenAlex API key
+  out_dir: data/corpus
+
+bench:
+  n_targets: 200                  # placeholder (the Step 6 pilot uses ~30)
+  target_from_date: 2025-06-01    # must be after every model's training cutoff
+  max_attempts_per_target: 3      # placeholder
+  max_distinctive_overlap: 3      # placeholder; count of the abstract's top-20 IDF terms
+  max_content_jaccard: 0.15       # placeholder
+  seed: 42
+  out_dir: data/bench
+
+retrieval:
+  encoder: BAAI/bge-small-en-v1.5
+  query_prefix: "Represent this sentence for searching relevant passages: "
+  max_queries: 5                          # placeholder; B4 and B5
+  max_llm_calls_agent: 6                  # placeholder; B5
+  max_queries_unconstrained: 15           # placeholder; B5-U
+  max_llm_calls_agent_unconstrained: 20   # placeholder; B5-U
+  index_dir: data/index
+
+run:
+  out_dir: runs
+  cache_path: data/cache/llm.sqlite
+  seed: 42
+  budget_cap: 20.0                # USD; hard cap on real LLM spend per process
+  mlflow: false
+
+# Model roles. paraphraser.family must differ from judge.family and
+# agent.family (checked at load time). Names, endpoints, prices and training
+# cutoffs are placeholders: verify them before Step 6.
+paraphraser:
+  name: qwen/qwen-2.5-72b-instruct
+  family: qwen
+  base_url: https://openrouter.ai/api/v1
+  api_key_env: OPENROUTER_API_KEY
+  price_in_per_m: 0.40
+  price_out_per_m: 0.40
+  temperature: 0.7
+  max_tokens: 400
+  seed: 42
+
+judge:
+  name: google/gemma-3-27b-it
+  family: gemma
+  base_url: https://openrouter.ai/api/v1
+  api_key_env: OPENROUTER_API_KEY
+  price_in_per_m: 0.20
+  price_out_per_m: 0.40
+  temperature: 0.0
+  max_tokens: 300
+  seed: 42
+
+agent:
+  name: meta-llama/llama-3.3-70b-instruct
+  family: llama
+  base_url: https://openrouter.ai/api/v1
+  api_key_env: OPENROUTER_API_KEY
+  price_in_per_m: 0.20
+  price_out_per_m: 0.40
+  temperature: 0.0
+  max_tokens: 400
+  seed: 42

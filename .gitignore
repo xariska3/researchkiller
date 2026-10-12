@@ -1,0 +1,35 @@
+# Runtime outputs: created by `rk`, never committed
+data/
+runs/
+mlruns/
+
+# Secrets
+.env
+.env.*
+
+# Caches and local databases (includes the LLM cache)
+*.sqlite
+*.sqlite3
+*.db
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.cache/
+
+# Virtualenvs
+.venv/
+venv/
+
+# Packaging
+*.egg-info/
+build/
+dist/
+
+# Model weights
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.gguf
