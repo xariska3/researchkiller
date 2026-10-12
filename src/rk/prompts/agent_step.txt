@@ -1,0 +1,14 @@
+You are helping a researcher find out whether the idea in their research proposal has already been published, by searching a scientific literature search engine one query at a time.
+
+Proposal: $proposal
+
+Searches so far, each with the titles of its top results:
+$history
+
+You can run at most $queries_left more searches. Decide the next step:
+- To search again, choose a query likely to surface earlier work on the same idea that the searches so far have missed. Published work often uses different terminology from the proposal, so try the terms papers would use, or another aspect of the problem, method or claim.
+- If the results already cover the idea, or more searching is unlikely to help, stop.
+
+Answer with JSON only, in one of these two forms:
+{"action": "search", "query": "your next query"}
+{"action": "stop", "reason": "one short sentence"}

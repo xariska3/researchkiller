@@ -1,4 +1,4 @@
-"""The `rk` command (run as `python -m rk`). build-corpus and make-bench are implemented."""
+"""The `rk` command (run as `python -m rk`). run and report come in Step 5."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from rk.bench import BenchError, format_accepted, make_bench
 from rk.config import ConfigError, load_config
 from rk.corpus import CorpusError, OpenAlexClient, OpenAlexError, build_corpus
 from rk.llm import BudgetExceeded, Ledger, LLMCache, LLMClient, LLMError
+from rk.retrieval import RetrievalError, build_index, make_encoder
 from rk.targets import TargetSelectionError
 
 
@@ -79,6 +80,18 @@ def build_corpus_command(config_path: Path, max_works: int | None) -> int:
     return 0
 
 
+def build_index_command(config_path: Path) -> int:
+    cfg = load_config(config_path)
+    encoder = make_encoder(cfg.retrieval)
+    manifest = build_index(cfg, encoder)
+    print(
+        f"rk build-index: indexed {manifest['n_docs']} documents in "
+        f"{manifest['build_seconds']:.1f} s with {manifest['encoder']} on {manifest['device']}; "
+        f"saved to {cfg.retrieval.index_dir}"
+    )
+    return 0
+
+
 def make_bench_command(config_path: Path, limit: int | None, show: bool) -> int:
     cfg = load_config(config_path)
     with ExitStack() as stack:
@@ -105,6 +118,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "build-corpus":
             return build_corpus_command(args.config, args.max_works)
+        if args.command == "build-index":
+            return build_index_command(args.config)
         if args.command == "make-bench":
             return make_bench_command(args.config, args.limit, args.show)
     except (
@@ -115,6 +130,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         BenchError,
         LLMError,
         BudgetExceeded,
+        RetrievalError,
     ) as exc:
         print(f"rk {args.command}: {exc}", file=sys.stderr)
         return 1

@@ -30,9 +30,9 @@ def test_fake_encoder_is_deterministic_normalised_and_lexically_sensible() -> No
         "gradient boosting on tabular records",
         "",
     ]
-    vectors = FakeEncoder(dim=64).encode(texts)
+    vectors = FakeEncoder(dim=64).encode_docs(texts)
     assert vectors.shape == (4, 64) and vectors.dtype == np.float32
-    np.testing.assert_array_equal(vectors, FakeEncoder(dim=64).encode(texts))
+    np.testing.assert_array_equal(vectors, FakeEncoder(dim=64).encode_queries(texts))
     np.testing.assert_allclose(np.linalg.norm(vectors[:3], axis=1), 1.0, rtol=1e-6)
     assert not vectors[3].any()
     assert vectors[0] @ vectors[1] > vectors[0] @ vectors[2]
@@ -41,7 +41,6 @@ def test_fake_encoder_is_deterministic_normalised_and_lexically_sensible() -> No
 @pytest.mark.parametrize(
     "argv",
     [
-        ["build-index", "--config", "configs/phase1.yaml"],
         ["run", "--config", "configs/phase1.yaml", "--configs", "B1,B4,B5", "--limit", "5"],
         ["report", "runs/20260101-000000"],
     ],

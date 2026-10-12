@@ -20,7 +20,9 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from importlib import resources
 from pathlib import Path
+from string import Template
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -97,6 +99,29 @@ class ChatModel(Protocol):
     """Anything that answers chat messages: LLMClient, or FakeLLM in tests."""
 
     def complete(self, messages: Sequence[Message], *, seed: int | None = None) -> Completion: ...
+
+
+@dataclass(frozen=True)
+class Prompt:
+    """A versioned prompt template from rk/prompts, with the sha256 of its text."""
+
+    name: str
+    template: Template  # $placeholders, so JSON braces need no escaping
+    sha256: str
+
+    def render(self, **values: str) -> str:
+        return self.template.substitute(values)
+
+
+def load_prompt(name: str) -> Prompt:
+    """Load rk/prompts/<name>.txt.
+
+    The file is read with universal newlines, so the text sent to the model and
+    its hash don't depend on the line endings of the checkout.
+    """
+    path = resources.files("rk").joinpath("prompts").joinpath(f"{name}.txt")
+    text = path.read_text(encoding="utf-8")
+    return Prompt(name, Template(text), hashlib.sha256(text.encode("utf-8")).hexdigest())
 
 
 def token_cost(model: ModelConfig, prompt_tokens: int, completion_tokens: int) -> float:
