@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable, Iterator, Sequence
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +19,7 @@ import numpy as np
 import pytest
 
 from rk.config import ModelConfig
-from rk.llm import Completion, LLMCache, Message, Usage, token_cost
+from rk.llm import Completion, Ledger, LLMCache, Message, Usage, token_cost
 from rk.text import content_stems
 
 TEST_API_KEY_ENV = "RK_TEST_API_KEY"
@@ -35,6 +36,7 @@ def make_model_config(**overrides: Any) -> ModelConfig:
         "temperature": 0.0,
         "max_tokens": 64,
         "seed": 7,
+        "training_cutoff": date(2024, 1, 1),
     }
     values.update(overrides)
     return ModelConfig(**values)
@@ -157,6 +159,27 @@ def api_key(monkeypatch: pytest.MonkeyPatch) -> str:
 
 
 @pytest.fixture
-def llm_cache(tmp_path: Path) -> Iterator[LLMCache]:
-    with LLMCache(tmp_path / "llm.sqlite") as cache:
+def db_path(tmp_path: Path) -> Path:
+    """One SQLite file for the cache and the spend table, as in a real run."""
+    return tmp_path / "llm.sqlite"
+
+
+@pytest.fixture
+def llm_cache(db_path: Path) -> Iterator[LLMCache]:
+    with LLMCache(db_path) as cache:
         yield cache
+
+
+@pytest.fixture
+def make_ledger(db_path: Path) -> Iterator[Callable[..., Ledger]]:
+    """Factory for Ledgers on `db_path`: make_ledger(cap=1.0, command="test")."""
+    opened: list[Ledger] = []
+
+    def make(cap: float = 20.0, command: str = "test") -> Ledger:
+        ledger = Ledger(db_path, cap, command=command)
+        opened.append(ledger)
+        return ledger
+
+    yield make
+    for ledger in opened:
+        ledger.close()

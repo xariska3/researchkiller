@@ -11,15 +11,16 @@ corpus:
   language: en
   min_abstract_words: 50          # placeholder
   max_citers_per_target: 20       # placeholder
+  max_works_per_sweep: 25000      # per filter string, sorted by publication_date then id
   mailto_env: OPENALEX_MAILTO     # optional; env var holding the polite-pool email
   api_key_env: OPENALEX_API_KEY   # optional; env var holding an OpenAlex API key
   out_dir: data/corpus
 
 bench:
   n_targets: 200                  # placeholder (the Step 6 pilot uses ~30)
-  target_from_date: 2025-06-01    # must be after every model's training cutoff
+  target_from_date: 2025-06-01    # must be later than every model's training_cutoff
   max_attempts_per_target: 3      # placeholder
-  max_distinctive_overlap: 3      # placeholder; count of the abstract's top-20 IDF terms
+  max_distinctive_overlap: 0.15   # fraction of the abstract's top-20 IDF terms (0.15 = 3)
   max_content_jaccard: 0.15       # placeholder
   seed: 42
   out_dir: data/bench
@@ -35,14 +36,16 @@ retrieval:
 
 run:
   out_dir: runs
-  cache_path: data/cache/llm.sqlite
+  cache_path: data/cache/llm.sqlite   # LLM cache + cumulative spend table
   seed: 42
-  budget_cap: 20.0                # USD; hard cap on real LLM spend per process
+  budget_cap: 20.0                # USD; hard cap on real LLM spend across all commands
   mlflow: false
 
-# Model roles. paraphraser.family must differ from judge.family and
-# agent.family (checked at load time). Names, endpoints, prices and training
-# cutoffs are placeholders: verify them before Step 6.
+# Model roles. All three must come from different model families, and
+# bench.target_from_date must be later than every training_cutoff (both checked
+# at load time). Names, endpoints, prices and cutoffs are placeholders: verify
+# them before Step 6. Where no cutoff is published, the release date is used,
+# since it bounds the cutoff from above.
 paraphraser:
   name: qwen/qwen-2.5-72b-instruct
   family: qwen
@@ -53,6 +56,7 @@ paraphraser:
   temperature: 0.7
   max_tokens: 400
   seed: 42
+  training_cutoff: 2024-09-19     # release date; no published cutoff
 
 judge:
   name: google/gemma-3-27b-it
@@ -64,6 +68,7 @@ judge:
   temperature: 0.0
   max_tokens: 300
   seed: 42
+  training_cutoff: 2024-08-31     # model card: August 2024
 
 agent:
   name: meta-llama/llama-3.3-70b-instruct
@@ -75,3 +80,4 @@ agent:
   temperature: 0.0
   max_tokens: 400
   seed: 42
+  training_cutoff: 2023-12-31     # model card: December 2023

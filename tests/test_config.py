@@ -23,6 +23,7 @@ def _model(name: str, family: str) -> dict[str, Any]:
         "temperature": 0,
         "max_tokens": 64,
         "seed": 7,
+        "training_cutoff": date(2024, 1, 1),
     }
 
 
@@ -39,7 +40,7 @@ def _valid() -> dict[str, Any]:
             "n_targets": 10,
             "target_from_date": date(2025, 6, 1),
             "max_attempts_per_target": 3,
-            "max_distinctive_overlap": 3,
+            "max_distinctive_overlap": 0.15,
             "max_content_jaccard": 0.15,
             "seed": 1,
             "out_dir": "data/bench",
@@ -72,6 +73,8 @@ def test_repo_config_loads() -> None:
     assert cfg.retrieval.encoder == "BAAI/bge-small-en-v1.5"
     assert isinstance(cfg.bench.target_from_date, date)
     assert isinstance(cfg.corpus.filters, tuple) and cfg.corpus.filters
+    assert len({m.family for m in cfg.models().values()}) == 3
+    assert all(isinstance(m.training_cutoff, date) for m in cfg.models().values())
 
 
 def test_load_coerces_types_and_applies_defaults(tmp_path: Path) -> None:
@@ -79,10 +82,12 @@ def test_load_coerces_types_and_applies_defaults(tmp_path: Path) -> None:
     assert cfg.paraphraser.price_out_per_m == 2.0
     assert isinstance(cfg.paraphraser.temperature, float)
     assert cfg.bench.target_from_date == date(2025, 6, 1)
+    assert cfg.agent.training_cutoff == date(2024, 1, 1)
     assert cfg.run.out_dir == Path("runs")
     assert cfg.run.budget_cap == 20.0  # spec default when omitted
     assert cfg.run.mlflow is False
     assert cfg.retrieval.encoder == "BAAI/bge-small-en-v1.5"
+    assert cfg.corpus.max_works_per_sweep == 25000
     assert cfg.corpus.mailto_env is None
 
 
@@ -127,6 +132,7 @@ def test_missing_section_raises() -> None:
         ("corpus", "filters", "primary_topic.subfield.id:1702"),
         ("corpus", "filters", [1702]),
         ("paraphraser", "temperature", None),
+        ("judge", "training_cutoff", "late 2024"),
     ],
 )
 def test_wrong_types_raise(section: str, key: str, value: Any) -> None:
@@ -140,7 +146,9 @@ def test_wrong_types_raise(section: str, key: str, value: Any) -> None:
     ("section", "key", "value"),
     [
         ("bench", "max_content_jaccard", 1.5),
-        ("bench", "max_distinctive_overlap", 21),
+        ("bench", "max_distinctive_overlap", 3),  # a count, not a fraction
+        ("bench", "max_distinctive_overlap", -0.1),
+        ("corpus", "max_works_per_sweep", 0),
         ("run", "budget_cap", 0),
         ("retrieval", "max_queries_unconstrained", 4),
         ("judge", "max_tokens", 0),
@@ -163,30 +171,47 @@ def test_duplicate_keys_raise(tmp_path: Path) -> None:
         load_config(path)
 
 
-@pytest.mark.parametrize("role", ["judge", "agent"])
-def test_independence_check_rejects_shared_family(role: str) -> None:
+@pytest.mark.parametrize(
+    ("role_a", "role_b"), [("paraphraser", "judge"), ("paraphraser", "agent"), ("judge", "agent")]
+)
+def test_independence_check_rejects_any_shared_family(role_a: str, role_b: str) -> None:
     data = _valid()
-    data[role]["family"] = " FAMILY-A "  # same family as the paraphraser, modulo case/space
-    with pytest.raises(ConfigError, match=rf"model-independence check failed.*{role}"):
+    data[role_b]["family"] = f" {data[role_a]['family'].upper()} "  # modulo case and spaces
+    with pytest.raises(
+        ConfigError, match=rf"model-independence check failed.*{role_a} \(.*\) and {role_b} \("
+    ):
         config_from_dict(data)
 
 
-def test_independence_check_reports_both_clashes() -> None:
+def test_independence_check_reports_every_clash() -> None:
     data = _valid()
     data["judge"]["family"] = data["agent"]["family"] = "family-a"
-    with pytest.raises(ConfigError, match="judge and agent"):
+    with pytest.raises(ConfigError) as exc_info:
         config_from_dict(data)
+    message = str(exc_info.value)
+    for pair in ("paraphraser (", "judge (", "agent ("):
+        assert pair in message
+    assert message.count(") and ") == 3
 
 
 def test_independence_check_catches_same_model_under_another_family_label() -> None:
     data = _valid()
-    data["agent"]["name"] = data["paraphraser"]["name"]
+    data["agent"]["name"] = data["judge"]["name"]
     with pytest.raises(ConfigError, match="model-independence check failed"):
         config_from_dict(data)
 
 
-def test_judge_and_agent_may_share_a_family() -> None:
+@pytest.mark.parametrize("role", ["paraphraser", "judge", "agent"])
+@pytest.mark.parametrize("cutoff", [date(2025, 6, 1), date(2025, 9, 1)])  # equal, later
+def test_training_cutoff_check_rejects_targets_not_after_a_cutoff(role: str, cutoff: date) -> None:
+    data = _valid()  # target_from_date is 2025-06-01
+    data[role]["training_cutoff"] = cutoff
+    with pytest.raises(ConfigError, match=rf"target_from_date .*not later than: {role} "):
+        config_from_dict(data)
+
+
+def test_training_cutoff_check_accepts_targets_after_every_cutoff() -> None:
     data = _valid()
-    data["judge"]["family"] = data["agent"]["family"]
-    cfg = config_from_dict(data)
-    assert cfg.judge.family == cfg.agent.family
+    for role in ("paraphraser", "judge", "agent"):
+        data[role]["training_cutoff"] = date(2025, 5, 31)
+    assert config_from_dict(data).bench.target_from_date == date(2025, 6, 1)
