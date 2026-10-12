@@ -40,7 +40,9 @@ run:
   cache_path: data/cache/llm.sqlite   # LLM cache + cumulative spend table
   seed: 42
   budget_cap: 20.0                # USD; hard cap on real LLM spend across all commands
-  mlflow: false
+  results_db: data/results.sqlite # runs + query_results tables, read by `rk report`
+  mlflow_tracking_uri: sqlite:///mlflow.db   # repo root; artifacts go to mlartifacts/ beside it
+  mlflow_experiment: researchkiller-phase1
 
 # Model roles. All three must come from different model families, and
 # bench.target_from_date must be later than every training_cutoff (both checked

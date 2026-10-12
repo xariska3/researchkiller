@@ -86,7 +86,8 @@ def test_load_coerces_types_and_applies_defaults(tmp_path: Path) -> None:
     assert cfg.agent.training_cutoff == date(2024, 1, 1)
     assert cfg.run.out_dir == Path("runs")
     assert cfg.run.budget_cap == 20.0  # spec default when omitted
-    assert cfg.run.mlflow is False
+    assert cfg.run.results_db == Path("data/results.sqlite")
+    assert cfg.run.mlflow_tracking_uri == "sqlite:///mlflow.db"
     assert cfg.retrieval.encoder == "BAAI/bge-small-en-v1.5"
     assert cfg.corpus.max_works_per_sweep == 25000
     assert cfg.corpus.mailto_env is None
@@ -129,7 +130,7 @@ def test_missing_section_raises() -> None:
         ("bench", "n_targets", True),  # bools are not ints
         ("bench", "n_targets", 2.5),
         ("bench", "target_from_date", "June 2025"),
-        ("run", "mlflow", "yes"),
+        ("run", "mlflow_experiment", 5),
         ("corpus", "filters", "primary_topic.subfield.id:1702"),
         ("corpus", "filters", [1702]),
         ("paraphraser", "temperature", None),

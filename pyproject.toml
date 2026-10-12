@@ -14,11 +14,11 @@ dependencies = [
     "pyyaml",
     "bm25s",
     "faiss-cpu",
+    "mlflow",
 ]
 
 [project.optional-dependencies]
 dense = ["sentence-transformers"]
-tracking = ["mlflow"]
 dev = ["pytest", "ruff==0.17.0"]  # ruff pinned: its default rule set changes between releases
 
 [project.scripts]

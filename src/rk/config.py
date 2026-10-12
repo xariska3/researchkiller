@@ -102,9 +102,11 @@ class RetrievalConfig:
 class RunConfig:
     out_dir: Path
     cache_path: Path  # SQLite database: LLM cache and the cumulative spend table
-    seed: int
+    seed: int  # bootstrap resampling
     budget_cap: float = 20.0  # USD, hard cap on real LLM spend across all commands
-    mlflow: bool = False
+    results_db: Path = Path("data/results.sqlite")  # SQL results of every evaluation run
+    mlflow_tracking_uri: str = "sqlite:///mlflow.db"  # the documented local default backend
+    mlflow_experiment: str = "researchkiller-phase1"
 
     def __post_init__(self) -> None:
         _require(self.budget_cap > 0, "budget_cap must be > 0")

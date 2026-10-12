@@ -1,4 +1,4 @@
-"""The `rk` command (run as `python -m rk`). run and report come in Step 5."""
+"""The `rk` command (run as `python -m rk`)."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from pathlib import Path
 from rk.bench import BenchError, format_accepted, make_bench
 from rk.config import ConfigError, load_config
 from rk.corpus import CorpusError, OpenAlexClient, OpenAlexError, build_corpus
+from rk.evaluate import CONFIG_ORDER, SUMMARY_MD, EvalError, report, run_eval
 from rk.llm import BudgetExceeded, Ledger, LLMCache, LLMClient, LLMError
 from rk.retrieval import RetrievalError, build_index, make_encoder
 from rk.targets import TargetSelectionError
@@ -22,6 +23,16 @@ def _positive_int(text: str) -> int:
     if value < 1:
         raise argparse.ArgumentTypeError(f"must be >= 1, got {value}")
     return value
+
+
+def _config_list(text: str) -> list[str]:
+    names = [name.strip() for name in text.split(",") if name.strip()]
+    unknown = [name for name in names if name not in CONFIG_ORDER]
+    if unknown or not names:
+        raise argparse.ArgumentTypeError(
+            f"unknown configs {unknown}; choose from {','.join(CONFIG_ORDER)}"
+        )
+    return names
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -54,11 +65,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = sub.add_parser("run", help="evaluate retrieval configurations on the benchmark")
     run.add_argument("--config", type=Path, required=True)
-    run.add_argument("--configs", help="comma-separated configs to run, e.g. B1,B4,B5")
-    run.add_argument("--limit", type=int, help="evaluate only the first N queries")
+    run.add_argument(
+        "--configs",
+        type=_config_list,
+        help=f"comma-separated configs to run (default: all of {','.join(CONFIG_ORDER)})",
+    )
+    run.add_argument("--limit", type=_positive_int, help="evaluate only the first N queries")
+    run.add_argument(
+        "--run-dir", type=Path, help="resume this run directory instead of starting a new run"
+    )
+    run.add_argument(
+        "--retry-errors",
+        action="store_true",
+        help="with --run-dir: redo the rows that ended in an LLM error",
+    )
 
-    report = sub.add_parser("report", help="summarise a finished run")
-    report.add_argument("run_dir", type=Path, help="runs/<timestamp>")
+    report_cmd = sub.add_parser("report", help="regenerate a run's summary from the database")
+    report_cmd.add_argument("run_dir", type=Path, help="runs/<timestamp>")
     return parser
 
 
@@ -113,8 +136,46 @@ def make_bench_command(config_path: Path, limit: int | None, show: bool) -> int:
     return 0
 
 
+def run_command(
+    config_path: Path,
+    configs: list[str] | None,
+    limit: int | None,
+    run_dir: Path | None,
+    retry_errors: bool,
+) -> int:
+    cfg = load_config(config_path)
+    with ExitStack() as stack:
+        cache = stack.enter_context(LLMCache(cfg.run.cache_path))
+        ledger = stack.enter_context(Ledger(cfg.run.cache_path, cfg.run.budget_cap, command="run"))
+        agent = stack.enter_context(closing(LLMClient(cfg.agent, cache, ledger)))
+        out = run_eval(
+            cfg,
+            agent,
+            make_encoder(cfg.retrieval),
+            configs=configs,
+            limit=limit,
+            retry_errors=retry_errors,
+            run_dir=run_dir,
+        )
+    print(f"rk run: results in {cfg.run.results_db}; summary in {out / SUMMARY_MD}")
+    return 0
+
+
+def report_command(run_dir: Path) -> int:
+    summary = report(run_dir)
+    errors = sum(summary["errors"].values())
+    print(
+        f"rk report: rewrote {run_dir / SUMMARY_MD} and summary.json "
+        f"({len(summary['configs'])} configs, {errors} error rows)"
+    )
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.command == "run" and args.retry_errors and args.run_dir is None:
+        parser.error("--retry-errors needs --run-dir (the run whose errors to retry)")
     try:
         if args.command == "build-corpus":
             return build_corpus_command(args.config, args.max_works)
@@ -122,6 +183,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             return build_index_command(args.config)
         if args.command == "make-bench":
             return make_bench_command(args.config, args.limit, args.show)
+        if args.command == "run":
+            return run_command(
+                args.config, args.configs, args.limit, args.run_dir, args.retry_errors
+            )
+        return report_command(args.run_dir)
     except (
         ConfigError,
         CorpusError,
@@ -131,11 +197,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         LLMError,
         BudgetExceeded,
         RetrievalError,
+        EvalError,
     ) as exc:
         print(f"rk {args.command}: {exc}", file=sys.stderr)
         return 1
-    print(f"rk {args.command}: not implemented")
-    return 1
 
 
 if __name__ == "__main__":

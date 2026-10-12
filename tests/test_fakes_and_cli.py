@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import runpy
 import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -39,22 +40,27 @@ def test_fake_encoder_is_deterministic_normalised_and_lexically_sensible() -> No
 
 
 @pytest.mark.parametrize(
-    "argv",
+    ("argv", "message"),
     [
-        ["run", "--config", "configs/phase1.yaml", "--configs", "B1,B4,B5", "--limit", "5"],
-        ["report", "runs/20260101-000000"],
+        (["run", "--config", "c.yaml", "--configs", "B1,B9"], "unknown configs ['B9']"),
+        (["run", "--config", "c.yaml", "--retry-errors"], "--retry-errors needs --run-dir"),
+        (["run", "--config", "c.yaml", "--limit", "0"], "must be >= 1"),
     ],
 )
-def test_cli_subcommands_are_stubs(argv: list[str], capsys: pytest.CaptureFixture[str]) -> None:
-    assert main(argv) == 1
-    assert capsys.readouterr().out.strip() == f"rk {argv[0]}: not implemented"
+def test_cli_rejects_bad_run_arguments(
+    argv: list[str], message: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        main(argv)
+    assert exit_info.value.code == 2
+    assert message in capsys.readouterr().err
 
 
 def test_python_dash_m_rk_runs_the_cli(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.setattr(sys, "argv", ["rk", "report", "runs/20260101-000000"])
+    monkeypatch.setattr(sys, "argv", ["rk", "report", str(tmp_path / "no-such-run")])
     with pytest.raises(SystemExit) as exit_info:
         runpy.run_module("rk", run_name="__main__")
     assert exit_info.value.code == 1
-    assert capsys.readouterr().out.strip() == "rk report: not implemented"
+    assert "is not a run directory" in capsys.readouterr().err
