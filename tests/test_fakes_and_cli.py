@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import runpy
+import sys
+
 import numpy as np
 import pytest
 from conftest import FakeEncoder, FakeLLM
@@ -48,3 +51,13 @@ def test_fake_encoder_is_deterministic_normalised_and_lexically_sensible() -> No
 def test_cli_subcommands_are_stubs(argv: list[str], capsys: pytest.CaptureFixture[str]) -> None:
     assert main(argv) == 1
     assert capsys.readouterr().out.strip() == f"rk {argv[0]}: not implemented"
+
+
+def test_python_dash_m_rk_runs_the_cli(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["rk", "report", "runs/20260101-000000"])
+    with pytest.raises(SystemExit) as exit_info:
+        runpy.run_module("rk", run_name="__main__")
+    assert exit_info.value.code == 1
+    assert capsys.readouterr().out.strip() == "rk report: not implemented"

@@ -3,9 +3,10 @@
 Cost accounting keeps two numbers (see Usage). *Method cost* is what the method
 costs from scratch and is counted on cache hits too, so reported cost reflects
 the method. *Money spent* counts real API calls only. Before every real call the
-client charges a pessimistic estimate to the shared Ledger, which refuses calls
-that could take total spend over its cap. Cache hits never touch the network,
-the ledger or the API key, so a cached run replays offline and for free.
+client charges a pessimistic estimate to the Ledger, which refuses calls that
+could take cumulative spend (across all commands, persisted next to the cache)
+over its cap. Cache hits never touch the network, the ledger or the API key, so
+a cached run replays offline and for free.
 """
 
 from __future__ import annotations
@@ -21,17 +22,46 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import httpx
 
 from rk.config import ModelConfig
 
+if TYPE_CHECKING:  # annotation only: typing.Self needs Python 3.11
+    from typing_extensions import Self
+
 Message = Mapping[str, str]  # {"role": ..., "content": ...}
 
 
+class _Closing:
+    """`with` support for classes that hold a resource released by close()."""
+
+    def close(self) -> None:
+        raise NotImplementedError
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self.close()
+
+
 class LLMError(RuntimeError):
-    """A completion failed: bad request, malformed response, or retries exhausted."""
+    """A completion failed: bad request, malformed response, or retries exhausted.
+
+    `maybe_billed` is set when an attempt timed out, hit a transport error or got
+    a 5xx, since the provider may have processed (and billed) that request.
+    """
+
+    def __init__(self, message: str, *, maybe_billed: bool = False) -> None:
+        super().__init__(message)
+        self.maybe_billed = maybe_billed
 
 
 class BudgetExceeded(RuntimeError):
@@ -84,16 +114,18 @@ def token_cost(model: ModelConfig, prompt_tokens: int, completion_tokens: int) -
     ) / 1_000_000
 
 
-def pessimistic_cost(model: ModelConfig, messages: Sequence[Message]) -> float:
-    """Upper bound on a real call's cost, charged to the ledger before sending.
+def prompt_token_bound(messages: Sequence[Message]) -> int:
+    """Upper bound on prompt tokens: the UTF-8 size of the JSON-encoded messages.
 
-    Prompt tokens are bounded by the UTF-8 size of the JSON-encoded messages:
-    byte-level tokenizers emit at most one token per byte, and the JSON syntax
-    more than covers the chat-template overhead. Completion tokens are bounded by
-    max_tokens.
+    Byte-level tokenizers emit at most one token per byte, and the JSON syntax
+    more than covers the chat-template overhead.
     """
-    encoded = json.dumps([dict(m) for m in messages], ensure_ascii=False).encode("utf-8")
-    return token_cost(model, len(encoded), model.max_tokens)
+    return len(json.dumps([dict(m) for m in messages], ensure_ascii=False).encode("utf-8"))
+
+
+def pessimistic_cost(model: ModelConfig, messages: Sequence[Message]) -> float:
+    """Upper bound on a real call's cost (prompt bound + max_tokens), charged before sending."""
+    return token_cost(model, prompt_token_bound(messages), model.max_tokens)
 
 
 def cache_key(
@@ -133,15 +165,36 @@ CREATE TABLE IF NOT EXISTS completions (
 """
 
 
-class LLMCache:
+_SPEND_SCHEMA = """
+CREATE TABLE IF NOT EXISTS spend (
+    timestamp TEXT NOT NULL,
+    command TEXT NOT NULL,
+    model TEXT NOT NULL,
+    prompt_tokens INTEGER NOT NULL,
+    completion_tokens INTEGER NOT NULL,
+    cost REAL NOT NULL
+)
+"""
+
+
+def _connect(path: str | Path, schema: str) -> sqlite3.Connection:
+    if str(path) != ":memory:":
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
+    conn.execute(schema)
+    conn.commit()
+    return conn
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+class LLMCache(_Closing):
     """SQLite store of completions keyed by cache_key(); one file can serve every model."""
 
     def __init__(self, path: str | Path) -> None:
-        if str(path) != ":memory:":
-            Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(path))
-        self._conn.execute(_SCHEMA)
-        self._conn.commit()
+        self._conn = _connect(path, _SCHEMA)
 
     def get(self, key: str) -> CachedReply | None:
         row = self._conn.execute(
@@ -163,7 +216,7 @@ class LLMCache:
                 reply.finish_reason,
                 reply.prompt_tokens,
                 reply.completion_tokens,
-                datetime.now(timezone.utc).isoformat(),
+                _utc_now(),
             ),
         )
         self._conn.commit()
@@ -174,49 +227,75 @@ class LLMCache:
     def close(self) -> None:
         self._conn.close()
 
-    def __enter__(self) -> LLMCache:
-        return self
 
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
-        self.close()
+class Ledger(_Closing):
+    """Cumulative LLM spend with a hard cap, persisted in the `spend` table.
 
-
-class Ledger:
-    """Spend tracker with a hard cap, shared by every LLMClient in a process.
-
-    Before a real call the client charges a pessimistic estimate; when the call
-    returns, the estimate is settled to the actual cost. A call that fails keeps
-    its estimate, since it may still have been billed.
+    Use the same SQLite file as the LLMCache. Spend adds up across every command
+    and process using that file: the running total is read at startup. Before a
+    real call the client reserves a pessimistic estimate (`charge`); afterwards it
+    `record`s what the call cost, which releases the reservation and appends a
+    spend row. A failed call is recorded at its estimate if it may have been
+    billed (timeout, transport error or 5xx); otherwise (4xx, including 429) its
+    reservation is just `release`d. Spend by a command running concurrently is
+    only seen after a restart, so run commands one at a time.
     """
 
-    def __init__(self, cap: float = 20.0) -> None:
+    def __init__(self, path: str | Path, cap: float = 20.0, *, command: str) -> None:
         if cap < 0:
             raise ValueError("cap must be >= 0")
         self.cap = cap
-        self.spent = 0.0
+        self.command = command
+        self._conn = _connect(path, _SPEND_SCHEMA)
+        row = self._conn.execute("SELECT COALESCE(SUM(cost), 0.0) FROM spend").fetchone()
+        self._recorded = float(row[0])
+        self._reserved = 0.0
+
+    @property
+    def spent(self) -> float:
+        """Recorded spend across all commands, plus reservations for calls in flight."""
+        return self._recorded + self._reserved
 
     @property
     def remaining(self) -> float:
         return self.cap - self.spent
 
     def charge(self, amount: float, *, label: str = "call") -> None:
+        """Reserve `amount` for a real call, or raise BudgetExceeded if it might not fit."""
         if self.spent + amount > self.cap:
             raise BudgetExceeded(
                 f"{label} could cost up to ${amount:.6f}, but only ${self.remaining:.6f} "
-                f"of the ${self.cap:.2f} budget cap is left"
+                f"of the ${self.cap:.2f} cumulative budget cap is left"
             )
-        self.spent += amount
+        self._reserved += amount
 
-    def settle(self, estimate: float, actual: float) -> None:
-        self.spent += actual - estimate
+    def record(
+        self,
+        *,
+        reserved: float,
+        model: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        cost: float,
+    ) -> None:
+        """Release a reservation and persist what the call cost."""
+        self._conn.execute(
+            "INSERT INTO spend VALUES (?, ?, ?, ?, ?, ?)",
+            (_utc_now(), self.command, model, prompt_tokens, completion_tokens, cost),
+        )
+        self._conn.commit()
+        self._reserved -= reserved
+        self._recorded += cost
+
+    def release(self, reserved: float) -> None:
+        """Drop a reservation for a call that cost nothing."""
+        self._reserved -= reserved
+
+    def close(self) -> None:
+        self._conn.close()
 
 
-class LLMClient:
+class LLMClient(_Closing):
     """Chat completions for one model role, cached and charged to a shared ledger."""
 
     def __init__(
@@ -286,29 +365,58 @@ class LLMClient:
                 f"environment variable {self.model.api_key_env} is not set "
                 f"(needed for {self.model.name})"
             )
-        estimate = pessimistic_cost(self.model, request["messages"])
+        prompt_bound = prompt_token_bound(request["messages"])
+        estimate = token_cost(self.model, prompt_bound, self.model.max_tokens)
         self.ledger.charge(estimate, label=self.model.name)
-        reply = _parse_reply(self._post(request, api_key), self.model.name)
-        actual = token_cost(self.model, reply.prompt_tokens, reply.completion_tokens)
-        self.ledger.settle(estimate, actual)
+        try:
+            reply = _parse_reply(self._post(request, api_key), self.model.name)
+        except BaseException as exc:
+            if isinstance(exc, LLMError) and exc.maybe_billed:
+                self.ledger.record(
+                    reserved=estimate,
+                    model=self.model.name,
+                    prompt_tokens=prompt_bound,
+                    completion_tokens=self.model.max_tokens,
+                    cost=estimate,
+                )
+            else:
+                self.ledger.release(estimate)
+            raise
+        self.ledger.record(
+            reserved=estimate,
+            model=self.model.name,
+            prompt_tokens=reply.prompt_tokens,
+            completion_tokens=reply.completion_tokens,
+            cost=token_cost(self.model, reply.prompt_tokens, reply.completion_tokens),
+        )
         return reply
 
     def _post(self, request: dict[str, Any], api_key: str) -> Any:
-        """POST /chat/completions, retrying 429, 5xx and transport errors with backoff."""
+        """POST /chat/completions, retrying 429, 5xx and transport errors with backoff.
+
+        A raised LLMError has `maybe_billed` set if any attempt timed out, hit a
+        transport error (timeouts are transport errors in httpx) or got a 5xx.
+        """
         headers = {"Authorization": f"Bearer {api_key}"}
+        maybe_billed = False
         for attempt in range(self.max_retries + 1):
             retry_after: float | None = None
             try:
                 response = self._http.post("/chat/completions", json=request, headers=headers)
             except httpx.TransportError as exc:
                 problem = f"{type(exc).__name__}: {exc}"
+                maybe_billed = True
             else:
                 status = response.status_code
                 if status == 429 or status >= 500:
                     problem = f"HTTP {status}: {response.text[:300]}"
                     retry_after = _retry_after_seconds(response)
+                    maybe_billed = maybe_billed or status >= 500
                 elif response.is_error:
-                    raise LLMError(f"{self.model.name}: HTTP {status}: {response.text[:500]}")
+                    raise LLMError(
+                        f"{self.model.name}: HTTP {status}: {response.text[:500]}",
+                        maybe_billed=maybe_billed,
+                    )
                 else:
                     try:
                         return response.json()
@@ -317,7 +425,8 @@ class LLMClient:
             if attempt == self.max_retries:
                 raise LLMError(
                     f"{self.model.name}: giving up after {attempt + 1} attempts; "
-                    f"last error: {problem}"
+                    f"last error: {problem}",
+                    maybe_billed=maybe_billed,
                 )
             delay = self.backoff_base * 2**attempt
             if retry_after is not None:
@@ -328,24 +437,13 @@ class LLMClient:
     def close(self) -> None:
         self._http.close()
 
-    def __enter__(self) -> LLMClient:
-        return self
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
-        self.close()
-
 
 def _normalize_messages(messages: Sequence[Message]) -> list[dict[str, str]]:
     out: list[dict[str, str]] = []
     for message in messages:
         role, content = message.get("role"), message.get("content")
         if not isinstance(role, str) or not isinstance(content, str):
-            raise ValueError(f"each message needs string 'role' and 'content': {message!r}")
+            raise TypeError(f"each message needs string 'role' and 'content': {message!r}")
         out.append({"role": role, "content": content})
     if not out:
         raise ValueError("messages must not be empty")

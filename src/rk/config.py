@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import itertools
 import types
 import typing
 from dataclasses import dataclass
@@ -37,6 +38,7 @@ class CorpusConfig:
     min_abstract_words: int
     max_citers_per_target: int
     out_dir: Path
+    max_works_per_sweep: int = 25000  # per filter string, newest first; deterministic cut
     mailto_env: str | None = None  # env var holding the OpenAlex polite-pool email
     api_key_env: str | None = None  # env var holding an OpenAlex API key
 
@@ -44,6 +46,7 @@ class CorpusConfig:
         _require(len(self.filters) > 0, "filters must list at least one OpenAlex filter")
         _require(self.min_abstract_words >= 0, "min_abstract_words must be >= 0")
         _require(self.max_citers_per_target >= 0, "max_citers_per_target must be >= 0")
+        _require(self.max_works_per_sweep >= 1, "max_works_per_sweep must be >= 1")
 
 
 @dataclass(frozen=True)
@@ -51,7 +54,7 @@ class BenchConfig:
     n_targets: int
     target_from_date: date
     max_attempts_per_target: int
-    max_distinctive_overlap: int  # count of the abstract's top-20 IDF terms
+    max_distinctive_overlap: float  # fraction of the abstract's top-20 IDF terms (0.15 = 3)
     max_content_jaccard: float
     seed: int
     out_dir: Path
@@ -60,8 +63,8 @@ class BenchConfig:
         _require(self.n_targets >= 1, "n_targets must be >= 1")
         _require(self.max_attempts_per_target >= 1, "max_attempts_per_target must be >= 1")
         _require(
-            0 <= self.max_distinctive_overlap <= 20,
-            "max_distinctive_overlap counts top-20 IDF terms, so must be in [0, 20]",
+            0.0 <= self.max_distinctive_overlap <= 1.0,
+            "max_distinctive_overlap is a fraction of the top-20 IDF terms, so must be in [0, 1]",
         )
         _require(0.0 <= self.max_content_jaccard <= 1.0, "max_content_jaccard must be in [0, 1]")
 
@@ -92,9 +95,9 @@ class RetrievalConfig:
 @dataclass(frozen=True)
 class RunConfig:
     out_dir: Path
-    cache_path: Path  # SQLite LLM cache shared by every model role
+    cache_path: Path  # SQLite database: LLM cache and the cumulative spend table
     seed: int
-    budget_cap: float = 20.0  # USD, hard cap on real LLM spend
+    budget_cap: float = 20.0  # USD, hard cap on real LLM spend across all commands
     mlflow: bool = False
 
     def __post_init__(self) -> None:
@@ -114,6 +117,7 @@ class ModelConfig:
     temperature: float
     max_tokens: int
     seed: int
+    training_cutoff: date  # targets must be published after this
 
     def __post_init__(self) -> None:
         _require(bool(self.name.strip()), "name must not be empty")
@@ -133,33 +137,50 @@ class Config:
     judge: ModelConfig
     agent: ModelConfig
 
+    def models(self) -> dict[str, ModelConfig]:
+        return {"paraphraser": self.paraphraser, "judge": self.judge, "agent": self.agent}
+
     def __post_init__(self) -> None:
-        check_model_independence(self.paraphraser, self.judge, self.agent)
+        check_model_independence(self.models())
+        check_training_cutoffs(self.bench.target_from_date, self.models())
 
 
-def check_model_independence(
-    paraphraser: ModelConfig, judge: ModelConfig, agent: ModelConfig
-) -> None:
-    """Fail loudly unless the paraphraser's family differs from the judge's and the agent's.
+def check_model_independence(models: dict[str, ModelConfig]) -> None:
+    """Fail loudly unless every model role comes from a different model family.
 
-    A same-family agent can "undo" its sibling's word choices, and a same-family
-    judge rubber-stamps them. Families compare case-insensitively. An identical
-    model name also counts as a clash, so a mistyped family label can't hide one.
+    A same-family agent can "undo" the paraphraser's word choices, a same-family
+    judge rubber-stamps them, and a judge sharing the agent's family selects
+    paraphrases the agent finds natural. Families compare case-insensitively. An
+    identical model name also counts as a clash, so a mistyped family label
+    can't hide one.
     """
 
     def same(a: str, b: str) -> bool:
         return a.strip().lower() == b.strip().lower()
 
     clashes = [
-        role
-        for role, other in (("judge", judge), ("agent", agent))
-        if same(other.family, paraphraser.family) or same(other.name, paraphraser.name)
+        f"{role_a} ({a.name}, family {a.family!r}) and {role_b} ({b.name}, family {b.family!r})"
+        for (role_a, a), (role_b, b) in itertools.combinations(models.items(), 2)
+        if same(a.family, b.family) or same(a.name, b.name)
     ]
     if clashes:
         raise ConfigError(
-            f"model-independence check failed: the paraphraser ({paraphraser.name}, "
-            f"family {paraphraser.family!r}) shares a model family with the "
-            f"{' and '.join(clashes)}; the paraphraser must come from a different family"
+            "model-independence check failed: paraphraser, judge and agent must come from "
+            f"three different model families, but these share one: {'; '.join(clashes)}"
+        )
+
+
+def check_training_cutoffs(target_from_date: date, models: dict[str, ModelConfig]) -> None:
+    """Fail loudly unless targets start strictly after every model's training cutoff."""
+    stale = [
+        f"{role} ({model.name}, cutoff {model.training_cutoff})"
+        for role, model in models.items()
+        if target_from_date <= model.training_cutoff
+    ]
+    if stale:
+        raise ConfigError(
+            f"bench.target_from_date ({target_from_date}) must be later than every model's "
+            f"training_cutoff, but is not later than: {'; '.join(stale)}"
         )
 
 

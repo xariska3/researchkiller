@@ -8,62 +8,68 @@ and the corpus builder give identical results on every run.
 from __future__ import annotations
 
 import html
+import itertools
 import re
 import unicodedata
 from collections.abc import Mapping, Sequence
 
-STOPWORDS: frozenset[str] = frozenset(
-    """
-    a about above across after again against ain al all also although am among
-    amongst an and any are aren as at be because been before being below between
-    both but by can could couldn d did didn do does doesn doing don down during
-    each eg either et etc few for from further had hadn has hasn have haven having
-    he hence her here hers herself him himself his how however i ie if in into is
-    isn it its itself just ll m ma may me might mightn more moreover most must
-    mustn my myself needn neither no nor not now o of off on once one only onto or
-    other our ours ourselves out over own per re s same shall shan she should
-    shouldn so some such t than that the their theirs them themselves then there
-    therefore these they this those thus through to too toward towards under until
-    up upon us ve very via vs was wasn we were weren what when where whether which
-    while who whom why will with within without won would wouldn y yet you your
-    yours yourself yourselves
-    """.split()
-)
+STOPWORDS: frozenset[str] = frozenset({
+    "a", "about", "above", "across", "after", "again", "against", "ain", "al", "all", "also",
+    "although", "am", "among", "amongst", "an", "and", "any", "are", "aren", "as", "at", "be",
+    "because", "been", "before", "being", "below", "between", "both", "but", "by", "can", "could",
+    "couldn", "d", "did", "didn", "do", "does", "doesn", "doing", "don", "down", "during", "each",
+    "eg", "either", "et", "etc", "few", "for", "from", "further", "had", "hadn", "has", "hasn",
+    "have", "haven", "having", "he", "hence", "her", "here", "hers", "herself", "him", "himself",
+    "his", "how", "however", "i", "ie", "if", "in", "into", "is", "isn", "it", "its", "itself",
+    "just", "ll", "m", "ma", "may", "me", "might", "mightn", "more", "moreover", "most", "must",
+    "mustn", "my", "myself", "needn", "neither", "no", "nor", "not", "now", "o", "of", "off", "on",
+    "once", "one", "only", "onto", "or", "other", "our", "ours", "ourselves", "out", "over", "own",
+    "per", "re", "s", "same", "shall", "shan", "she", "should", "shouldn", "so", "some", "such",
+    "t", "than", "that", "the", "their", "theirs", "them", "themselves", "then", "there",
+    "therefore", "these", "they", "this", "those", "thus", "through", "to", "too", "toward",
+    "towards", "under", "until", "up", "upon", "us", "ve", "very", "via", "vs", "was", "wasn", "we",
+    "were", "weren", "what", "when", "where", "whether", "which", "while", "who", "whom", "why",
+    "will", "with", "within", "without", "won", "would", "wouldn", "y", "yet", "you", "your",
+    "yours", "yourself", "yourselves",
+})
 
 # Words that appear in almost any (AI/ML) abstract and so say nothing about a
 # specific paper. The leak filter ignores them when looking for distinctive
-# title terms. Tuned for the Phase 1 subfield sweeps; extend as the pilot shows.
-GENERIC_SCIENCE_WORDS: frozenset[str] = frozenset(
-    """
-    ability able accuracy accurate achieve achieves achieved address addresses
-    advance advances algorithm algorithms analysis analyse analyze application
-    applications apply applied approach approaches art aspect aspects available
-    base based baseline baselines benchmark benchmarks better build case cases
-    challenge challenges challenging compare compared comparison component
-    components comprehensive conduct consider contribution contributions current
-    data dataset datasets deep demonstrate demonstrates describe design designed
-    develop developed development different effect effective effectiveness
-    efficiency efficient empirical empirically enable enables enhance enhanced
-    evaluate evaluated evaluation evidence example examples existing experiment
-    experimental experiments explore extensive feature features field find
-    finding findings first focus framework frameworks further furthermore future
-    gain gains general given good high higher however identify impact implement
-    implementation important improve improved improvement improvements improves
-    include includes including increase information insight insights introduce
-    introduces investigate issue issues key large learn learning level leverage
-    limitation limitations limited low lower main make many measure method
-    methodology methods metric metrics model models multiple need network
-    networks neural new novel number obtain offer outperform outperforms overall
-    paper particular perform performance potential present presents previous
-    problem problems process propose proposed proposes provide provides quality
-    range real recent recently reduce related report research result results
-    reveal scale scenario scenarios set several show shows significant
-    significantly similar simple small solution solutions specific state strategy
-    strong study superior system systems task tasks technique techniques test
-    tool tools train trained training type understand use used useful uses using
-    validate value variety various way well wide widely work works world
-    """.split()
-)
+# title terms. Matched on the surface form before stemming, so list every
+# inflection that should count. Tuned for the Phase 1 subfield sweeps; extend as
+# the pilot shows.
+GENERIC_SCIENCE_WORDS: frozenset[str] = frozenset({
+    "ability", "able", "accuracy", "accurate", "achieve", "achieves", "achieved", "address",
+    "addresses", "advance", "advances", "algorithm", "algorithms", "analysis", "analyse", "analyze",
+    "application", "applications", "apply", "applied", "approach", "approaches", "art", "aspect",
+    "aspects", "available", "base", "based", "baseline", "baselines", "benchmark", "benchmarks",
+    "better", "build", "case", "cases", "challenge", "challenges", "challenging", "compare",
+    "compared", "comparison", "component", "components", "comprehensive", "conduct", "consider",
+    "contribution", "contributions", "current", "data", "dataset", "datasets", "deep",
+    "demonstrate", "demonstrates", "describe", "design", "designed", "develop", "developed",
+    "development", "different", "effect", "effective", "effectiveness", "efficiency", "efficient",
+    "empirical", "empirically", "enable", "enables", "enhance", "enhanced", "evaluate", "evaluated",
+    "evaluation", "evidence", "example", "examples", "existing", "experiment", "experimental",
+    "experiments", "explore", "extensive", "feature", "features", "field", "find", "finding",
+    "findings", "first", "focus", "framework", "frameworks", "further", "furthermore", "future",
+    "gain", "gains", "general", "given", "good", "high", "higher", "however", "identify", "impact",
+    "implement", "implementation", "important", "improve", "improved", "improvement",
+    "improvements", "improves", "include", "includes", "including", "increase", "information",
+    "insight", "insights", "introduce", "introduces", "investigate", "issue", "issues", "key",
+    "large", "learn", "learning", "level", "leverage", "limitation", "limitations", "limited",
+    "low", "lower", "main", "make", "many", "measure", "method", "methodology", "methods", "metric",
+    "metrics", "model", "models", "multiple", "need", "network", "networks", "neural", "new",
+    "novel", "number", "obtain", "offer", "outperform", "outperforms", "overall", "paper",
+    "particular", "perform", "performance", "potential", "present", "presents", "previous",
+    "problem", "problems", "process", "propose", "proposed", "proposes", "provide", "provides",
+    "quality", "range", "real", "recent", "recently", "reduce", "related", "report", "research",
+    "result", "results", "reveal", "scale", "scenario", "scenarios", "set", "several", "show",
+    "shows", "significant", "significantly", "similar", "simple", "small", "solution", "solutions",
+    "specific", "state", "strategy", "strong", "study", "superior", "system", "systems", "task",
+    "tasks", "technique", "techniques", "test", "tool", "tools", "train", "trained", "training",
+    "type", "understand", "use", "used", "useful", "uses", "using", "validate", "value", "variety",
+    "various", "way", "well", "wide", "widely", "work", "works", "world",
+})
 
 _TOKEN_RE = re.compile(r"[^\W_]+")
 _NON_ALNUM_RE = re.compile(r"[\W_]+")
@@ -87,9 +93,10 @@ _SUFFIXES: tuple[str, ...] = (
     "ation", "ition", "ative", "izing", "ising", "ating",
     "ment", "ness", "ized", "ised", "ated", "izer", "iser",
     "ity", "ive", "ing", "ion", "ize", "ise", "ate",
-    "ed", "er", "ly",
+    "ed", "er", "ly", "al",
 )
 _MIN_STEM = 3
+_MIN_STEM_FOR = {"al": 5}  # "retrieval" -> "retriev", but "neural", "local" stay whole
 _STEM_ROUNDS = 3
 
 
@@ -98,7 +105,9 @@ def stem(word: str) -> str:
 
     Not linguistically correct, only consistent: inflected and derived forms of
     a word usually collapse to one key ("segment", "segmenting", "segmentation"
-    -> "seg"). Short words and tokens containing digits are returned unchanged.
+    -> "seg"). Unrelated words can collide ("gene", "generation" -> "gen"); for
+    the leak filter that errs on the strict side. Short words and tokens
+    containing digits are returned unchanged.
     """
     w = word.lower()
     if len(w) <= _MIN_STEM or not w.isalpha():
@@ -111,7 +120,7 @@ def stem(word: str) -> str:
         w = w[:-1]
     for _ in range(_STEM_ROUNDS):
         for suffix in _SUFFIXES:
-            if w.endswith(suffix) and len(w) - len(suffix) >= _MIN_STEM:
+            if w.endswith(suffix) and len(w) - len(suffix) >= _MIN_STEM_FOR.get(suffix, _MIN_STEM):
                 w = w[: -len(suffix)]
                 if len(w) > _MIN_STEM and w[-1] == w[-2] and w[-1] not in "aeious":
                     w = w[:-1]  # "embedd" -> "embed", "mapp" -> "map"
@@ -123,20 +132,22 @@ def stem(word: str) -> str:
     return w
 
 
-GENERIC_SCIENCE_STEMS: frozenset[str] = frozenset(stem(w) for w in GENERIC_SCIENCE_WORDS)
-
-
 def content_tokens(text: str) -> list[str]:
     """Tokens minus stopwords, bare numbers and single characters, in order."""
     return [t for t in tokenize(text) if len(t) > 1 and not t.isdigit() and t not in STOPWORDS]
 
 
 def content_stems(text: str, *, drop_generic: bool = False) -> list[str]:
-    """Stems of content tokens, in order; optionally minus generic-science stems."""
-    stems = [stem(t) for t in content_tokens(text)]
+    """Stems of content tokens, in order; optionally minus generic-science words.
+
+    Generic words are matched on the surface form, before stemming, so a stem
+    collision ("general", "generation" -> "gen") can't make a distinctive word
+    generic.
+    """
+    tokens = content_tokens(text)
     if drop_generic:
-        stems = [s for s in stems if s not in GENERIC_SCIENCE_STEMS]
-    return stems
+        tokens = [t for t in tokens if t not in GENERIC_SCIENCE_WORDS]
+    return [stem(t) for t in tokens]
 
 
 _WORD_RE = re.compile(r"[^\W_]+(?:-[^\W_]+)*")  # hyphenated compounds stay whole
@@ -152,7 +163,7 @@ def _acronym_form(part: str, allow_caps: bool) -> str | None:
         return None
     if any(c.isdigit() for c in part):  # BM25, T5, word2vec, YOLOv8
         return None if _ORDINAL_RE.fullmatch(part) else part
-    if any(a.islower() and b.isupper() for a, b in zip(part, part[1:])):  # ResNet, LoRA
+    if any(a.islower() and b.isupper() for a, b in itertools.pairwise(part)):  # ResNet, LoRA
         return part
     if allow_caps:
         core = part[:-1] if part.endswith("s") and part[:-1].isupper() else part  # CNNs

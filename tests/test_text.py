@@ -57,22 +57,41 @@ def test_tokenize_lowercases_folds_accents_and_splits_punctuation() -> None:
         ["cluster", "clusters", "clustering", "clustered"],
         ["image", "images", "imaging"],
         ["model", "models", "modeling", "modelling"],
+        ["retrieval", "retrieve", "retrieved", "retrieving"],
+        ["optimal", "optimize", "optimization"],
     ],
 )
 def test_stem_conflates_inflected_forms(family: list[str]) -> None:
     assert len({stem(w) for w in family}) == 1, {w: stem(w) for w in family}
 
 
+def test_stem_strips_al_only_from_stems_of_five_letters_or_more() -> None:
+    assert stem("retrieval") == stem("retrieving") == "retriev"
+    assert stem("neural") == "neural"  # "neur" would be too short
+    assert stem("local") == "local"
+
+
+def test_stem_accepts_the_gene_generation_collision() -> None:
+    # Unrelated words may share a stem; for the leak filter that only errs strict.
+    assert stem("gene") == stem("generation") == "gen"
+
+
 def test_stem_leaves_short_and_alphanumeric_tokens_alone() -> None:
     assert stem("map") == "map"
     assert stem("gpt4") == "gpt4"
-    assert stem("generation") != stem("generalization")
 
 
 def test_content_stems_drop_stopwords_numbers_and_optionally_generic_words() -> None:
     text = "We propose a novel transformer for segmentation in 2024"
     assert content_stems(text) == ["propos", "novel", "transform", "seg"]
     assert content_stems(text, drop_generic=True) == ["transform", "seg"]
+
+
+def test_generic_words_are_matched_before_stemming() -> None:
+    # "general" is generic and stems to "gen" like "generation"; the title word must survive.
+    title = "Controllable Image Generation with Diffusion"
+    assert any(s.startswith("gen") for s in content_stems(title, drop_generic=True))
+    assert content_stems("a general method", drop_generic=True) == []
 
 
 def test_normalize_title_ignores_markup_case_punctuation_and_accents() -> None:

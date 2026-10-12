@@ -8,8 +8,10 @@ rewrites recent target papers as terminology-shifted research proposals, and
 compares BM25, dense, hybrid, one-shot LLM query rewriting and an agent loop at
 the same query budget. The design is in [docs/phase1_spec.md](docs/phase1_spec.md).
 
-This README is a placeholder. The project is at Step 1 (scaffold): the `rk`
-commands are stubs and there are no results yet. To set up, create a Python 3.10+
+This README is a placeholder. The project is at Step 1 (scaffold): the CLI
+commands (`python -m rk build-corpus --config configs/phase1.yaml` and so on)
+are stubs and there are no results yet. To set up, create a Python 3.10+
 virtualenv, run `pip install -e ".[dev]"` (add the `dense` extra for
-sentence-transformers and `tracking` for MLflow), then run `pytest`. Results,
-limitations and reproduction instructions will be added in Step 7.
+sentence-transformers and `tracking` for MLflow), then run `ruff check .` and
+`pytest`. Results, limitations and reproduction instructions will be added in
+Step 7.
