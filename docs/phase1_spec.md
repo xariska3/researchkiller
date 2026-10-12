@@ -14,7 +14,7 @@ researchkiller/
 +-- CLAUDE.md
 +-- README.md
 +-- pyproject.toml
-+-- .gitignore            # data/, runs/, .env, .venv/, __pycache__/, *.sqlite, mlruns/
++-- .gitignore            # data/, runs/, .env, .venv/, __pycache__/, *.sqlite, mlflow.db, mlartifacts/
 +-- .github/workflows/ci.yml  # Python 3.10: ruff check, then pytest
 +-- configs/phase1.yaml
 +-- docs/phase1_spec.md
@@ -39,8 +39,8 @@ researchkiller/
 `data/` and `runs/` are created at runtime and git-ignored.
 
 ## Dependencies
-Core: `httpx`, `numpy`, `pyyaml`, `bm25s`, `faiss-cpu`.
-Optional extras: `dense = [sentence-transformers]`, `tracking = [mlflow]`, `dev = [pytest, ruff]`.
+Core: `httpx`, `numpy`, `pyyaml`, `bm25s`, `faiss-cpu`, `mlflow`.
+Optional extras: `dense = [sentence-transformers]`, `dev = [pytest, ruff]`.
 
 ## Config (`configs/phase1.yaml`)
 Sections: `corpus`, `bench`, `retrieval`, `run`, and three model roles:
@@ -173,7 +173,7 @@ by doc id.
 | ID | Strategy |
 |---|---|
 | B1 | BM25 (`bm25s`), single query; only docs with a positive score |
-| B2 | Dense: sentence-transformers (default `BAAI/bge-small-en-v1.5`, query prefix from config), normalised float32 vectors, FAISS `IndexFlatIP` |
+| B2 | Dense: sentence-transformers (default `BAAI/bge-small-en-v1.5`, pinned to the Hugging Face commit `retrieval.encoder_revision`, query prefix from config), normalised float32 vectors, FAISS `IndexFlatIP` |
 | B3 | Hybrid: reciprocal rank fusion (k=60) of B1 and B2 top-100 |
 | B4 | One agent-model call returns JSON `{"queries": [...]}`: at most `max_queries - 1` rewrites, duplicates removed. Run B3 on the original + rewrites; RRF-fuse all lists. On a parse failure, the original query alone, with the error recorded |
 | B5 | The original query runs first with no LLM call. Each agent step sees the queries so far with the top-10 titles of each (titles only, to bound tokens) and returns `{"action": "search", "query": ...}` or `{"action": "stop", "reason": ...}`. Hard limits: `max_queries` queries in total and `max_llm_calls_agent` calls. A repeated query counts toward the budget but isn't re-run; a parse failure stops the loop and is recorded. Fused with exactly the same function as B4 |
@@ -187,27 +187,53 @@ BM25 gets the project's own tokenisation (`content_tokens` + `stem`). The
 encoder sits behind a small interface (`encode_queries`, `encode_docs`) so
 tests use a deterministic fake; it runs on the GPU if torch sees CUDA. Indexes
 are built once per frozen corpus and saved to `data/index/` with a manifest
-(corpus sha256, encoder, device, doc count, build time); loading refuses an
-index whose corpus sha256 doesn't match the frozen corpus.
+(corpus sha256, encoder and revision, device, doc count, build time); loading
+refuses an index whose corpus sha256 doesn't match the frozen corpus, and dense
+retrieval refuses an encoder or revision other than the index's.
 
 ## Evaluation (`evaluate.py`)
-- Per config: Hit@1, Hit@5, Hit@10, MRR (over top-100). Hit = target id or any alias.
-- Per query, a difficulty column: the target's rank in the B1 (BM25) results.
-  Recorded, **never filtered on** (filtering on it would bias against B1).
-- Per query: queries issued, LLM calls, prompt/completion tokens, method cost, latency.
-  Report mean, p50, p95.
-- **Paired statistics for B5 vs B4** (and B4 vs B3): paired bootstrap
-  (10,000 resamples, seeded) 95% CI on ΔHit@5 and ΔMRR, plus exact McNemar on Hit@5.
-- Outputs per run in `runs/<timestamp>/`: `per_query/<config>.jsonl`, `summary.json`,
-  `summary.md` (one table), and the config used.
-- MLflow logging behind `run.mlflow: true` only (optional dependency).
+- **Runner** (`python -m rk run`): loads the frozen corpus, index and bench (all
+  integrity-checked), creates `runs/<timestamp>/` and records run metadata: git
+  commit and whether the tree is dirty, config snapshot, corpus and bench
+  sha256, index manifest, prompt hashes, model names.
+- Per query and config: target rank (first position of the target or any
+  alias in the top-100, else none), Hit@1/5/10, reciprocal rank, and the trace
+  fields (queries issued, LLM calls, prompt/completion tokens, method cost,
+  latency, stop reason).
+- **Errors**: an LLM error marks that row `status=error` and the run continues
+  (other errors, including `BudgetExceeded`, stop it after the summary is
+  written). `--retry-errors` with `--run-dir` redoes only errored rows; a rerun
+  into the same `--run-dir` skips finished rows, and refuses if the corpus,
+  bench, index, retrieval config, agent model or retrieval prompts changed.
+- **Results database** (`run.results_db`, default `data/results.sqlite`):
+  tables `runs` (run metadata) and `query_results` (one row per run, config and
+  query), written as rows finish. `per_query/<config>.jsonl` is a portable
+  copy. `python -m rk report` rebuilds the summary from the database with SQL.
+- **Metrics**: per config Hit@1/5/10 and MRR, and mean/p50/p95 of queries
+  issued, LLM calls, tokens, method cost and latency (successful rows only).
+- **Difficulty**: each query's B1 target rank is its difficulty (recorded,
+  **never filtered on**). Hit@5 per config within B1-rank buckets 1, 2–10,
+  11–100 and not found (only when B1 is part of the run).
+- **Paired comparisons**: B4 vs B3, B5 vs B4, B5-U vs B5, on queries that
+  succeeded in both configs: seeded paired bootstrap (10,000 resamples,
+  `run.seed`) 95% CI on ΔHit@5 and ΔMRR, and an exact McNemar test on Hit@5.
+- A cost–quality table: Hit@5 and MRR next to mean method cost per query.
+- Outputs per run in `runs/<timestamp>/`: `run.json`, `config.yaml`,
+  `per_query/<config>.jsonl`, `summary.json` and `summary.md` (main,
+  effort, difficulty, paired, cost–quality and error tables).
+- **MLflow** (core dependency) with the documented default SQLite backend
+  (`run.mlflow_tracking_uri`, default `sqlite:///mlflow.db` at the repo root,
+  artifacts in `mlartifacts/` beside it): one parent run per benchmark run and
+  one child run per config, with params (models, budgets, prompt hashes, corpus
+  sha, encoder and revision, git commit), metrics, and artifacts (per-query
+  JSONL, summary). UI: `python -m mlflow ui --backend-store-uri sqlite:///mlflow.db`.
 
 ## CLI
 ```
 python -m rk build-corpus  --config configs/phase1.yaml [--max-works N]
 python -m rk build-index   --config ...
 python -m rk make-bench    --config ... [--limit N] [--show]
-python -m rk run           --config ... [--configs B1,B4,B5] [--limit N]
+python -m rk run           --config ... [--configs B1,B4,B5] [--limit N] [--run-dir runs/<timestamp>] [--retry-errors]
 python -m rk report        runs/<timestamp>
 ```
 The `rk` console script is equivalent, but launcher executables can be blocked

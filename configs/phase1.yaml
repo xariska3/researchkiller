@@ -27,6 +27,7 @@ bench:
 
 retrieval:
   encoder: BAAI/bge-small-en-v1.5
+  encoder_revision: 5c38ec7c405ec4b44b94cc5a9bb96e735b38267a   # HF commit (main as of 2024-02-22)
   query_prefix: "Represent this sentence for searching relevant passages: "
   max_queries: 5                          # placeholder; B4 and B5
   max_llm_calls_agent: 6                  # placeholder; B5
@@ -39,7 +40,9 @@ run:
   cache_path: data/cache/llm.sqlite   # LLM cache + cumulative spend table
   seed: 42
   budget_cap: 20.0                # USD; hard cap on real LLM spend across all commands
-  mlflow: false
+  results_db: data/results.sqlite # runs + query_results tables, read by `rk report`
+  mlflow_tracking_uri: sqlite:///mlflow.db   # repo root; artifacts go to mlartifacts/ beside it
+  mlflow_experiment: researchkiller-phase1
 
 # Model roles. All three must come from different model families, and
 # bench.target_from_date must be later than every training_cutoff (both checked
