@@ -35,9 +35,8 @@ STOPWORDS: frozenset[str] = frozenset({
 
 # Words that appear in almost any (AI/ML) abstract and so say nothing about a
 # specific paper. The leak filter ignores them when looking for distinctive
-# title terms. Matched on the surface form before stemming, so list every
-# inflection that should count. Tuned for the Phase 1 subfield sweeps; extend as
-# the pilot shows.
+# title terms (see is_generic for how inflections match). Tuned for the Phase 1
+# subfield sweeps; extend as the pilot shows.
 GENERIC_SCIENCE_WORDS: frozenset[str] = frozenset({
     "ability", "able", "accuracy", "accurate", "achieve", "achieves", "achieved", "address",
     "addresses", "advance", "advances", "algorithm", "algorithms", "analysis", "analyse", "analyze",
@@ -137,16 +136,28 @@ def content_tokens(text: str) -> list[str]:
     return [t for t in tokenize(text) if len(t) > 1 and not t.isdigit() and t not in STOPWORDS]
 
 
-def content_stems(text: str, *, drop_generic: bool = False) -> list[str]:
-    """Stems of content tokens, in order; optionally minus generic-science words.
+# Stems of listed words, kept only when at least 5 characters long: short stems
+# collide too easily ("general" and "generation" both stem to "gen").
+_GENERIC_STEMS: frozenset[str] = frozenset(
+    s for s in map(stem, GENERIC_SCIENCE_WORDS) if len(s) >= 5
+)
 
-    Generic words are matched on the surface form, before stemming, so a stem
-    collision ("general", "generation" -> "gen") can't make a distinctive word
-    generic.
+
+def is_generic(token: str) -> bool:
+    """True if `token` is a listed generic-science word or an inflection of one.
+
+    Inflections are matched by stem, but only through stems of 5+ characters:
+    "proposing" is generic (stem "propos"), "generation" is not (stem "gen").
     """
+    word = token.lower()
+    return word in GENERIC_SCIENCE_WORDS or stem(word) in _GENERIC_STEMS
+
+
+def content_stems(text: str, *, drop_generic: bool = False) -> list[str]:
+    """Stems of content tokens, in order; optionally minus generic-science words."""
     tokens = content_tokens(text)
     if drop_generic:
-        tokens = [t for t in tokens if t not in GENERIC_SCIENCE_WORDS]
+        tokens = [t for t in tokens if not is_generic(t)]
     return [stem(t) for t in tokens]
 
 

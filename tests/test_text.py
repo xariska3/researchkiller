@@ -5,6 +5,7 @@ import pytest
 from rk.text import (
     content_stems,
     extract_acronyms,
+    is_generic,
     normalize_title,
     reconstruct_abstract,
     stem,
@@ -92,6 +93,14 @@ def test_generic_words_are_matched_before_stemming() -> None:
     title = "Controllable Image Generation with Diffusion"
     assert any(s.startswith("gen") for s in content_stems(title, drop_generic=True))
     assert content_stems("a general method", drop_generic=True) == []
+
+
+def test_unlisted_inflections_of_generic_words_are_generic() -> None:
+    assert is_generic("proposing")  # listed: propose, proposed, proposes
+    assert is_generic("Evaluating")
+    assert content_stems("proposing evaluating gradients", drop_generic=True) == ["gradient"]
+    assert not is_generic("generation")
+    assert not is_generic("severity")  # "several" stems to "sev": too short to match on
 
 
 def test_normalize_title_ignores_markup_case_punctuation_and_accents() -> None:
