@@ -1,6 +1,6 @@
 You are checking, facet by facet, whether a research proposal keeps a paper's research idea.
 
-The proposal deliberately uses different words and leaves out the names of models, datasets, methods and organisations, and it was written as a plan before the work was done, so its claim is an aim or expectation. Judge meaning, not wording: a method described without its name is the same method.
+The proposal deliberately uses different words, and it was written as a plan before the work was done, so its claim is an aim or expectation. Judge meaning, not wording: a method described without its name is the same method. Names of datasets, benchmarks, models, methods, platforms and organisations, and numbers, are removed on purpose: their absence never makes a facet "no", and a described stand-in (for example "a video site where comments scroll over the picture" for a named platform) counts as specific.
 
 Paper title: $title
 

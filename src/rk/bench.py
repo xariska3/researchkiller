@@ -215,7 +215,9 @@ class LeakFilter:
        the proposal; a word counts as a name if the corpus abstracts capitalise it
        mid-sentence more often than they write it in lower case, so common words
        capitalised by a title-cased phrase ("Retrieval-Augmented Generation") don't;
-    4. any distinctive title stem (title content stems minus generic words);
+    4. any rare title stem: a title content stem (generic words excluded) whose
+       document frequency in the corpus is below title_stem_max_df, as a
+       fraction of documents; common task words ("translation") are allowed;
     5. more than a fraction max_overlap of the abstract's top-20 IDF stems;
     6. content-stem Jaccard with title + abstract above max_jaccard, generic
        science words excluded on both sides (text.is_generic).
@@ -224,7 +226,14 @@ class LeakFilter:
     them, and they never count as leaked terms.
     """
 
-    def __init__(self, corpus: Iterable[Record], *, max_overlap: float, max_jaccard: float):
+    def __init__(
+        self,
+        corpus: Iterable[Record],
+        *,
+        max_overlap: float,
+        max_jaccard: float,
+        title_stem_max_df: float = 1.0,  # 1.0: every title stem is banned (the old rule)
+    ):
         df: Counter[str] = Counter()
         self._capitalised: Counter[str] = Counter()  # docs capitalising a word mid-sentence
         self._lowercase: Counter[str] = Counter()  # docs writing it in lower case
@@ -235,10 +244,17 @@ class LeakFilter:
             capitalised = capitalised_words(record["abstract"], mid_sentence=True)
             self._capitalised.update({w.lower() for w in capitalised})
             self._lowercase.update(lowercase_words(record["abstract"]))
+        self._df = df
+        self._n_docs = n_docs
         self._idf = {s: math.log(n_docs / n) for s, n in df.items()}
         self._unseen_idf = math.log(max(n_docs, 1))  # as rare as a term can be
         self.max_overlap = max_overlap
         self.max_jaccard = max_jaccard
+        self.title_stem_max_df = title_stem_max_df
+
+    def df_fraction(self, stem_: str) -> float:
+        """Fraction of corpus documents (title + abstract) containing the content stem."""
+        return self._df[stem_] / self._n_docs if self._n_docs else 0.0
 
     def top_terms(self, abstract: str) -> list[str]:
         """The abstract's IDF_TOP_TERMS highest-IDF content stems.
@@ -281,7 +297,11 @@ class LeakFilter:
 
         proposal_tokens = content_tokens(proposal)
         title_stems = set(content_stems(title, drop_generic=True))
-        title_words = sorted({t for t in proposal_tokens if stem(t) in title_stems})
+        rare = {s for s in title_stems if self.df_fraction(s) < self.title_stem_max_df}
+        title_words = sorted({t for t in proposal_tokens if stem(t) in rare})
+        common_title_words = sorted(
+            {t for t in proposal_tokens if stem(t) in title_stems - rare}
+        )
 
         top = self.top_terms(abstract)
         proposal_stems = {stem(t) for t in proposal_tokens}
@@ -298,7 +318,8 @@ class LeakFilter:
             "acronyms_in_paraphrase": own_acronyms,
             "source_acronyms_found": source_found,
             "source_names_found": source_names,
-            "title_words_found": title_words,
+            "title_words_found": title_words,  # rare ones: banned
+            "common_title_words_used": common_title_words,  # allowed
             "idf_top_terms": top,
             "idf_overlap": overlap,
             "idf_overlap_fraction": len(overlap) / len(top) if top else 0.0,
@@ -323,7 +344,7 @@ class LeakFilter:
             (
                 "title_stem",
                 bool(title_words),
-                f"it used words from the title ({', '.join(title_words)})",
+                f"it used rare or distinctive words from the title ({', '.join(title_words)})",
             ),
             (
                 "idf_overlap",
@@ -528,6 +549,7 @@ def make_bench(
         corpus,
         max_overlap=cfg.bench.max_distinctive_overlap,
         max_jaccard=cfg.bench.max_content_jaccard,
+        title_stem_max_df=cfg.bench.title_stem_max_df,
     )
     by_id = {r["id"]: r for r in corpus}
     max_attempts = cfg.bench.max_attempts_per_target

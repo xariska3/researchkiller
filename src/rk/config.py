@@ -62,9 +62,16 @@ class BenchConfig:
     max_content_jaccard: float
     seed: int
     out_dir: Path
+    # A title content stem is banned from proposals only if it is rarer than this
+    # (document frequency as a fraction of the corpus); 1.0 bans every title stem.
+    title_stem_max_df: float = 1.0
 
     def __post_init__(self) -> None:
         _require(self.n_targets >= 1, "n_targets must be >= 1")
+        _require(
+            0.0 < self.title_stem_max_df <= 1.0,
+            "title_stem_max_df is a fraction of documents, so must be in (0, 1]",
+        )
         _require(self.max_attempts_per_target >= 1, "max_attempts_per_target must be >= 1")
         _require(
             0.0 <= self.max_distinctive_overlap <= 1.0,

@@ -305,7 +305,8 @@ def test_retry_uses_the_next_seed_and_quotes_the_rejection(
     assert [s for _, s in t1_calls] == [SEED, SEED + 1]
     first, retry = (para.calls[i][-1]["content"] for i, _ in t1_calls)
     assert "previous proposal was rejected" not in first
-    assert "previous proposal was rejected because it used words from the title" in retry
+    because = "rejected because it used rare or distinctive words from the title"
+    assert f"previous proposal was {because}" in retry
     assert "(documents, long)" in retry
 
 
@@ -577,11 +578,66 @@ def test_paraphrase_prompt_tells_the_model_which_title_names_to_keep(
     prompts = {_target_in(c[-1]["content"], "Title"): c[-1]["content"] for c in para.calls}
     assert "The proposal must keep these words from the title: Kazakh, clinical." in prompts[T2]
     assert "must keep these words" not in prompts[T1]
-    rule = (
-        "if the title names a language, nationality, country or region, or a research field or "
+    avoid_rare = (
+        "Avoid the rare or distinctive words of the title, in any form; common field and task "
+        "terms (such as translation, question answering or knowledge graph) are fine."
+    )
+    keep_terms = (
+        "If the title names a language, nationality, country or region, or a research field or "
         "application domain (such as physics, maritime or clinical), the proposal must keep"
     )
-    assert rule in prompts[T1]
+    assert avoid_rare in prompts[T1] and keep_terms in prompts[T1]
+
+
+def _translation_corpus() -> list[dict[str, Any]]:
+    """The fixture corpus plus 20 documents about translation: a common task word here."""
+    extra = [
+        {"id": f"W{700 + i}", "title": f"Translation study {i}",
+         "abstract": f"We improve translation quality for setting {i}."}
+        for i in range(20)
+    ]
+    return [*corpus_records(), *extra]
+
+
+COMMON_ONLY = "We will improve translation by inferring the likeliest explanation."
+
+
+@pytest.mark.parametrize(
+    ("max_df", "proposal", "banned"),
+    [
+        (0.2, COMMON_ONLY, []),
+        (0.2, "We will apply abduction to improve how sentences are rendered.", ["abduction"]),
+        (1.0, COMMON_ONLY, ["translation"]),  # 1.0: every title stem is banned, as before
+    ],
+)
+def test_title_stems_are_banned_only_when_rare(
+    max_df: float, proposal: str, banned: list[str]
+) -> None:
+    corpus = _translation_corpus()
+    leak = LeakFilter(corpus, max_overlap=1.0, max_jaccard=1.0, title_stem_max_df=max_df)
+    assert leak.df_fraction(stem("translation")) >= 20 / len(corpus) > 0.2  # common here
+    assert leak.df_fraction(stem("abduction")) == 0.0  # in no document: rare
+    rejection, stats = leak.check(proposal, "Abduction for translation", "An abstract.")
+    assert stats["title_words_found"] == banned
+    assert (rejection is None) == (not banned)
+    if not banned:
+        assert stats["common_title_words_used"] == ["translation"]
+
+
+def test_make_bench_uses_the_configured_title_stem_threshold(tmp_path: Path) -> None:
+    # The fixture's title_stem proposal reuses the title words "documents" and "long".
+    strict = _config(tmp_path / "strict")
+    freeze(strict.corpus.out_dir, corpus_records(), target_rows(), {})
+    make_bench(strict, paraphraser(**{T1: [LEAKY["title_stem"]]}), judge())
+    assert [r["reason"] for r in _rows(strict, REJECTIONS_FILE)] == ["title_stem"]
+
+    lenient = _config(tmp_path / "lenient", title_stem_max_df=0.0001)  # nothing that rare
+    freeze(lenient.corpus.out_dir, corpus_records(), target_rows(), {})
+    make_bench(lenient, paraphraser(**{T1: [LEAKY["title_stem"]]}), judge())
+    assert _rows(lenient, REJECTIONS_FILE) == []
+    accepted = {r["target_id"]: r for r in _rows(lenient, ACCEPTED_FILE)}
+    assert accepted[T1]["query"] == LEAKY["title_stem"]
+    assert accepted[T1]["leak_stats"]["common_title_words_used"] == ["documents", "long"]
 
 
 def test_leak_filter_lets_a_proposal_keep_the_titles_field() -> None:
@@ -653,10 +709,21 @@ def test_judge_prompts_compare_four_facets(name: str) -> None:
         assert f"- {facet}: " in text and f'"{facet}": {{"match": "yes"' in text
     assert "including any language, region" in text
     assert 'The verdict is "yes" only if all four facets are "yes".' in text
-    # The stricter generalisation test, with its one example.
-    assert "no longer tells this work apart from close sibling work" in text
-    assert "drops the specific domain, population, data type or language" in text
-    assert "Example of a too-general proposal" in text
+    # Removed names never count against a proposal, in either direction.
+    assert "are removed on purpose: their absence never makes a facet \"no\"" in text
+    assert "a described stand-in" in text
+    # Omissions and generality are judged only in "captures"; "adds nothing" judges
+    # only changes and additions.
+    captures_only = (
+        "no longer tells this work apart from close sibling work",
+        "drops the specific domain, population, data type or language",
+        "Example of a too-general proposal",
+    )
+    if name == "judge_captures":
+        assert all(phrase in text for phrase in captures_only)
+    else:
+        assert not any(phrase in text for phrase in captures_only)
+        assert "Judge only changes and additions here" in text
 
 
 def _strict_everywhere(schema: dict[str, Any]) -> bool:

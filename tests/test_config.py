@@ -76,6 +76,7 @@ def test_repo_config_loads() -> None:
     assert len({m.family for m in cfg.models().values()}) == 3
     assert all(isinstance(m.training_cutoff, date) for m in cfg.models().values())
     assert all(m.provider for m in cfg.models().values())  # every role is pinned
+    assert (cfg.bench.max_attempts_per_target, cfg.bench.title_stem_max_df) == (4, 0.02)
 
 
 def test_repo_config_uses_qwen3_embedding_as_its_model_card_says() -> None:
@@ -106,6 +107,7 @@ def test_load_coerces_types_and_applies_defaults(tmp_path: Path) -> None:
     assert cfg.corpus.max_works_per_sweep == 25000
     assert cfg.corpus.mailto_env is None
     assert cfg.agent.provider is None  # OpenRouter routes freely unless pinned
+    assert cfg.bench.title_stem_max_df == 1.0  # every title stem banned unless configured
 
 
 def test_overrides_set_values_before_validation(tmp_path: Path) -> None:
@@ -205,6 +207,8 @@ def test_wrong_types_raise(section: str, key: str, value: Any) -> None:
         ("judge", "max_tokens", 0),
         ("retrieval", "encoder_revision", "main"),
         ("retrieval", "encoder_revision", "5C38EC7C405EC4B44B94CC5A9BB96E735B38267A"),
+        ("bench", "title_stem_max_df", 0),  # a fraction in (0, 1]
+        ("bench", "title_stem_max_df", 1.5),
         ("retrieval", "encoder_dtype", "fp16"),  # torch names only
         ("retrieval", "encoder_dtype", "int8"),
         ("retrieval", "encoder_max_seq_length", 0),

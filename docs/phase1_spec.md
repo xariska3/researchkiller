@@ -146,7 +146,9 @@ Prompts are versioned text files in `src/rk/prompts/` (`paraphrase.txt`,
 `judge_captures.txt`, `judge_adds_nothing.txt`); each prompt's sha256 is
 recorded in every output row and in `stats.json`. Targets are visited in a
 seeded random order (`bench.seed`). For each target, up to
-`max_attempts_per_target` tries; the first failing check is the rejection
+`max_attempts_per_target` tries (4 in configs/phase1.yaml: with 3, 14 of 40
+pilot targets ran out, and exhaustion biases the benchmark toward papers that
+are easy to paraphrase); the first failing check is the rejection
 reason:
 0. **Not a research contribution** (checked once, before any LLM call): a
    target whose title contains "survey", or whose title or abstract describes
@@ -161,9 +163,10 @@ reason:
 1. **Paraphraser** gets the title and abstract and writes a research
    *proposal* (as if written before the work) with the same research question,
    method and claimed contribution, using different terminology. No model,
-   dataset, method or organisation names, no acronyms, no title words, with one
-   exception: a language, nationality, country or region, or a research field
-   or application domain (physics, maritime, clinical, ...), that the title
+   dataset, method or organisation names, no acronyms, no rare or distinctive
+   title words (common field and task terms are fine; see the leak filter),
+   and a language, nationality, country or region, or a research field or
+   application domain (physics, maritime, clinical, ...), that the title
    names must be kept (the prompt lists the ones found in the title). These
    domain terms come from two curated lists, `src/rk/data/domain_entities.txt`
    and `src/rk/data/domain_fields.txt` (matched whole-word and
@@ -183,8 +186,15 @@ reason:
       abstracts capitalise it mid-sentence more often than they write it in
       lower case, so title-cased common words ("Retrieval-Augmented
       Generation") don't count; stopwords and generic science words never do.
-   4. any distinctive title stem: title content stems minus generic science
-      words (`title_stem`)
+   4. any rare title stem: a title content stem (generic science words
+      excluded) whose document frequency in the frozen corpus is below
+      `bench.title_stem_max_df`, a fraction of documents (`title_stem`). Common
+      task words ("translation", "question answering", "knowledge graph") are
+      allowed; rare, distinctive ones and names stay banned. 1.0 bans every
+      title stem. configs/phase1.yaml uses 0.02, chosen from the pilot's 215
+      title stems (median df 3.6%): names and paper-defining terms sit below
+      2% (abduction 0.09%, faithfulness 1.3%), task words well above
+      (translation 9.5%, question 15.5%, graph 6.8%).
    5. more than a fraction `max_distinctive_overlap` (in [0, 1]; 0.15 = at most
       3) of the abstract's top-20 IDF stems, IDF over the frozen corpus, ties
       to stems more frequent in the abstract (`idf_overlap`)
@@ -202,8 +212,14 @@ reason:
      stated so generally that it no longer tells this work apart from close
      sibling work (e.g. it drops the specific domain, population, data type or
      language); the prompt gives one short example (`judge_captures`).
-   - Does the proposal change or add to any facet? (`judge_adds_nothing`; not
+     Omissions and generality are judged only here.
+   - Does the proposal change or add to any facet? Only changes and additions
+     count; a left-out detail is not a change (`judge_adds_nothing`; not
      asked after a first "no").
+   Both prompts say that names of datasets, benchmarks, models, methods,
+   platforms and organisations, and numbers, are removed on purpose and never
+   make a facet fail, and that a described stand-in counts as specific (the
+   pilot judge kept demanding names the leak filter bans).
    The answer format is enforced by the API: the judge is called with
    `response_format` = a strict JSON schema (OpenAI structured outputs, which
    the pinned `openai` endpoint supports; with `require_parameters` OpenRouter

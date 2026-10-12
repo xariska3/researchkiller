@@ -22,9 +22,14 @@ corpus:
 bench:
   n_targets: 500                  # the pilot is the first 30 in seeded order (--limit 30)
   target_from_date: 2026-01-01    # must be later than every model's training_cutoff
-  max_attempts_per_target: 3      # placeholder
+  max_attempts_per_target: 4      # 3 exhausted 14 of 40 pilot targets
   max_distinctive_overlap: 0.15   # fraction of the abstract's top-20 IDF terms (0.15 = 3)
   max_content_jaccard: 0.15       # placeholder
+  # A title stem is banned only if fewer than 2% of corpus documents contain it: names
+  # and paper-defining terms (abduction 0.09%, faithfulness 1.3%) stay banned, common
+  # task words (translation 9.5%, question 15.5%, graph 6.8%) are allowed. The pilot's
+  # 215 title stems have median df 3.6%; 0.02 bans the rarest 36% of them.
+  title_stem_max_df: 0.02
   seed: 42
   out_dir: data/bench
 
