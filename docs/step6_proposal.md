@@ -502,3 +502,8 @@ The proposal's estimate assumed the cheapest endpoints. Here it is again with th
 - ≈ 1,170 citer queries.
 
 That is ≈ 2,000 calls ≈ $0.20, within the keyed daily budget.
+
+**After review:**
+- **Strict routing:** the provider routing also sends `require_parameters: true`. All three pinned endpoints list `temperature`, `max_tokens` and `seed` (checked 2026-10-12).
+- **Billed cost:** the spend table now stores OpenRouter's billed `usage.cost` in `billed_cost`, next to the computed `cost`. The ledger counts the billed cost when present, which settles the "billed vs counted cost" risk above.
+- **Pilot size:** the pilot uses `make-bench --limit 35`.

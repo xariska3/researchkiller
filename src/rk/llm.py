@@ -9,15 +9,20 @@ over its cap. Cache hits never touch the network, the ledger or the API key, so
 a cached run replays offline and for free.
 
 On OpenRouter, a model's `provider` pins one endpoint with fallbacks disabled
+and every request parameter required
 (https://openrouter.ai/docs/guides/routing/provider-selection), and every
 request asks for router metadata (https://openrouter.ai/docs/guides/features/router-metadata)
 so the provider that served each call is stored with the reply and its spend row.
+The billed cost OpenRouter returns in `usage.cost` (USD, on every non-streaming
+reply: https://openrouter.ai/docs/guides/guides/usage-accounting) is stored
+next to the cost computed from the config prices, and the ledger counts it.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
@@ -211,6 +216,7 @@ CREATE TABLE IF NOT EXISTS spend (
     prompt_tokens INTEGER NOT NULL,
     completion_tokens INTEGER NOT NULL,
     cost REAL NOT NULL,
+    billed_cost REAL,
     provider TEXT
 )
 """
@@ -277,7 +283,9 @@ class Ledger(_Closing):
     and process using that file: the running total is read at startup. Before a
     real call the client reserves a pessimistic estimate (`charge`); afterwards it
     `record`s what the call cost, which releases the reservation and appends a
-    spend row. A failed call is recorded at its estimate if any request was sent
+    spend row. A row's spend is its `billed_cost` (what the API reports it
+    charged) when present, else its `cost` (computed from the config prices).
+    A failed call is recorded at its estimate if any request was sent
     without a 4xx coming back (timeouts, transport errors, 5xx, malformed 200s,
     Ctrl-C mid-request), since it may have been billed; otherwise its reservation
     is just `release`d. Spend by a command running concurrently is only seen
@@ -290,7 +298,9 @@ class Ledger(_Closing):
         self.cap = cap
         self.command = command
         self._conn = _connect(path, _SPEND_SCHEMA)
-        row = self._conn.execute("SELECT COALESCE(SUM(cost), 0.0) FROM spend").fetchone()
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(COALESCE(billed_cost, cost)), 0.0) FROM spend"
+        ).fetchone()
         self._recorded = float(row[0])
         self._reserved = 0.0
 
@@ -320,17 +330,31 @@ class Ledger(_Closing):
         prompt_tokens: int,
         completion_tokens: int,
         cost: float,
+        billed_cost: float | None = None,
         provider: str | None = None,
     ) -> None:
-        """Release a reservation and persist what the call cost, and who served it if known."""
+        """Release a reservation and persist what the call cost, and who served it if known.
+
+        `cost` is computed from the config prices; `billed_cost`, if the API
+        reported one, is what it charged and is what counts against the cap.
+        """
         self._conn.execute(
             "INSERT INTO spend (timestamp, command, model, prompt_tokens, completion_tokens,"
-            " cost, provider) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (_utc_now(), self.command, model, prompt_tokens, completion_tokens, cost, provider),
+            " cost, billed_cost, provider) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                _utc_now(),
+                self.command,
+                model,
+                prompt_tokens,
+                completion_tokens,
+                cost,
+                billed_cost,
+                provider,
+            ),
         )
         self._conn.commit()
         self._reserved -= reserved
-        self._recorded += cost
+        self._recorded += cost if billed_cost is None else billed_cost
 
     def release(self, reserved: float) -> None:
         """Drop a reservation for a call that cost nothing."""
@@ -418,7 +442,8 @@ class LLMClient(_Closing):
         self.ledger.charge(estimate, label=self.model.name)
         billing = _Billing()
         try:
-            reply = _parse_reply(self._post(request, api_key, billing), self.model.name)
+            data = self._post(request, api_key, billing)
+            reply = _parse_reply(data, self.model.name)
         except BaseException:  # includes KeyboardInterrupt: book, then re-raise
             if billing.possible:
                 self.ledger.record(
@@ -437,6 +462,7 @@ class LLMClient(_Closing):
             prompt_tokens=reply.prompt_tokens,
             completion_tokens=reply.completion_tokens,
             cost=token_cost(self.model, reply.prompt_tokens, reply.completion_tokens),
+            billed_cost=billed_cost(data),
             provider=reply.provider,
         )
         return reply
@@ -526,8 +552,24 @@ def _parse_reply(data: Any, model_name: str) -> CachedReply:
 
 
 def provider_routing(slug: str) -> dict[str, Any]:
-    """OpenRouter's `provider` request field: only this endpoint, no fallbacks."""
-    return {"order": [slug], "allow_fallbacks": False}
+    """OpenRouter's `provider` request field: only this endpoint, no fallbacks.
+
+    With require_parameters, OpenRouter refuses the request (a 4xx, so neither
+    retried nor booked) rather than send it to an endpoint that would ignore a
+    parameter such as `seed`.
+    """
+    return {"order": [slug], "allow_fallbacks": False, "require_parameters": True}
+
+
+def billed_cost(data: Mapping[str, Any]) -> float | None:
+    """What the API says it charged for a completion (OpenRouter's usage.cost, USD), else None."""
+    try:
+        cost = data["usage"]["cost"]
+    except (KeyError, TypeError):
+        return None
+    if isinstance(cost, bool) or not isinstance(cost, (int, float)):
+        return None
+    return float(cost) if math.isfinite(cost) and cost >= 0 else None
 
 
 def served_provider(data: Mapping[str, Any]) -> str | None:

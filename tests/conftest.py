@@ -54,7 +54,8 @@ class FakeLLM:
     LLMClient via `transport`, which answers like a /chat/completions endpoint.
     Every prompt received is recorded in `calls`; over the transport, every
     request body and header set in `requests` and `headers`. With `provider`,
-    replies name it as the serving provider, as OpenRouter's router metadata does.
+    replies name it as the serving provider, as OpenRouter's router metadata does;
+    with `billed_cost`, they report it as OpenRouter's usage.cost.
     """
 
     def __init__(
@@ -63,9 +64,11 @@ class FakeLLM:
         *,
         model: ModelConfig | None = None,
         provider: str | None = None,
+        billed_cost: Any = None,  # any JSON value, to test parsing; None leaves it out
     ) -> None:
         self.model = model or make_model_config()
         self.provider = provider
+        self.billed_cost = billed_cost
         self._replies = replies if callable(replies) else list(replies)
         self.calls: list[list[dict[str, str]]] = []
         self.seeds: list[int | None] = []  # the seed= of each direct complete() call
@@ -131,6 +134,8 @@ class FakeLLM:
                 "total_tokens": prompt_tokens + completion_tokens,
             },
         }
+        if self.billed_cost is not None:
+            reply["usage"]["cost"] = self.billed_cost
         if self.provider is not None:  # the shape of a real OpenRouter reply (2026-10-12)
             reply["openrouter_metadata"] = {
                 "requested": body["model"],

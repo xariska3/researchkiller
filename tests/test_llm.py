@@ -17,6 +17,7 @@ from rk.llm import (
     LLMClient,
     LLMError,
     Usage,
+    billed_cost,
     cache_key,
     parse_json,
     pessimistic_cost,
@@ -130,14 +131,18 @@ def test_pinned_provider_is_sent_without_fallbacks_and_the_served_one_is_recorde
     first = client.complete(MSGS)
     second = client.complete(MSGS)  # from the cache
 
-    assert fake.requests[0]["provider"] == {"order": ["novita/fp8"], "allow_fallbacks": False}
+    assert fake.requests[0]["provider"] == {
+        "order": ["novita/fp8"],
+        "allow_fallbacks": False,
+        "require_parameters": True,  # refuse rather than drop seed, temperature, max_tokens
+    }
     assert fake.headers[0]["X-OpenRouter-Metadata"] == "enabled"
     assert (first.provider, second.cached, second.provider) == ("Novita", True, "Novita")
     with closing(sqlite3.connect(db_path)) as conn:
         spend = conn.execute("SELECT model, provider FROM spend").fetchall()
         stored = conn.execute("SELECT provider, request FROM completions").fetchall()
     assert spend == [("fake-model", "Novita")]
-    assert stored[0][0] == "Novita" and '"allow_fallbacks": false' in stored[0][1]
+    assert stored[0][0] == "Novita" and '"require_parameters": true' in stored[0][1]
 
 
 def test_unpinned_requests_have_no_provider_field(
@@ -148,8 +153,8 @@ def test_unpinned_requests_have_no_provider_field(
     assert client.complete(MSGS).provider is None
     assert "provider" not in fake.requests[0]
     assert fake.headers[0]["X-OpenRouter-Metadata"] == "enabled"  # harmless elsewhere
-    with closing(sqlite3.connect(db_path)) as conn:
-        assert conn.execute("SELECT provider FROM spend").fetchall() == [(None,)]
+    with closing(sqlite3.connect(db_path)) as conn:  # nothing reported, nothing invented
+        assert conn.execute("SELECT billed_cost, provider FROM spend").fetchall() == [(None, None)]
 
 
 def _metadata(*endpoints: tuple[str, bool]) -> dict[str, Any]:
@@ -170,6 +175,62 @@ def _metadata(*endpoints: tuple[str, bool]) -> dict[str, Any]:
 )
 def test_served_provider(data: dict[str, Any], expected: str | None) -> None:
     assert served_provider(data) == expected
+
+
+def test_billed_cost_is_stored_next_to_the_computed_cost_and_counts_against_the_cap(
+    db_path: Path, llm_cache: LLMCache, make_ledger: MakeLedger, api_key: str
+) -> None:
+    model = make_model_config()
+    fake = FakeLLM(["The answer is 42.", "unused"], billed_cost=0.9999)
+    ledger = make_ledger(cap=1.0)
+    client = LLMClient(model, llm_cache, ledger, transport=fake.transport)
+
+    out = client.complete(MSGS)
+
+    computed = token_cost(model, 4, 4)
+    with closing(sqlite3.connect(db_path)) as conn:
+        assert conn.execute("SELECT cost, billed_cost FROM spend").fetchall() == [
+            (computed, 0.9999)
+        ]
+    assert ledger.spent == pytest.approx(0.9999)  # billed, not the ~$0.00001 computed
+    assert out.usage.money_spent == computed  # Usage keeps the config-price cost
+    with pytest.raises(BudgetExceeded):  # computed spend alone would leave ~$1 of the cap
+        client.complete(OTHER_MSGS)
+    assert len(fake.calls) == 1
+
+
+def test_ledger_counts_billed_cost_when_present_else_computed_cost(db_path: Path) -> None:
+    with Ledger(db_path, cap=5.0, command="make-bench") as ledger:
+        for billed in (0.75, None):
+            ledger.charge(1.0)
+            ledger.record(
+                reserved=1.0,
+                model="m",
+                prompt_tokens=1,
+                completion_tokens=1,
+                cost=0.5,
+                billed_cost=billed,
+            )
+        assert ledger.spent == 1.25
+    with Ledger(db_path, cap=5.0, command="run") as later:  # the persisted total agrees
+        assert later.spent == 1.25
+
+
+@pytest.mark.parametrize(
+    ("data", "expected"),
+    [
+        ({"usage": {"cost": 0.0012}}, 0.0012),
+        ({"usage": {"cost": 0}}, 0.0),  # a free call is billed $0, which is not "unknown"
+        ({"usage": {"cost": "0.1"}}, None),
+        ({"usage": {"cost": True}}, None),
+        ({"usage": {"cost": -1.0}}, None),
+        ({"usage": {"cost": float("nan")}}, None),
+        ({"usage": {"prompt_tokens": 4}}, None),  # a server that doesn't report it
+        ({}, None),
+    ],
+)
+def test_billed_cost(data: dict[str, Any], expected: float | None) -> None:
+    assert billed_cost(data) == expected
 
 
 def test_seed_override_is_a_separate_cache_entry(

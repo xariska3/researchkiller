@@ -70,8 +70,10 @@ than every model's `training_cutoff`.
   plus the provider routing when a provider is pinned.
 - **Provider pinning (OpenRouter):** a model's `provider` (an endpoint slug
   from OpenRouter's provider list, e.g. `novita/fp8`) is sent as
-  `"provider": {"order": [slug], "allow_fallbacks": false}`, so only that
-  endpoint serves the model. Every request sends `X-OpenRouter-Metadata:
+  `"provider": {"order": [slug], "allow_fallbacks": false,
+  "require_parameters": true}`, so only that endpoint serves the model, and
+  OpenRouter refuses the call (a 4xx) rather than drop a parameter such as
+  `seed` that the endpoint doesn't support. Every request sends `X-OpenRouter-Metadata:
   enabled`; the provider OpenRouter reports (the `selected` endpoint in
   `openrouter_metadata`, else the top-level `provider` string) is stored with
   the cached reply, returned on cache hits too, and recorded in every trace
@@ -80,10 +82,14 @@ than every model's `training_cutoff`.
   hits, so reported cost reflects the method) and **money spent** (real calls only).
 - `Ledger` with a hard cap (`run.budget_cap`, default 20) on spend **cumulative
   across all commands**: every real call appends a row (timestamp, command,
-  model, prompt_tokens, completion_tokens, cost, provider) to a `spend` table in the same
-  SQLite database as the cache, and the ledger reads the running total at
-  startup. Charge a pessimistic estimate *before* each real call; raise
-  `BudgetExceeded` if over.
+  model, prompt_tokens, completion_tokens, cost, billed_cost, provider) to a
+  `spend` table in the same SQLite database as the cache, and the ledger reads
+  the running total at startup. `cost` is computed from the config prices;
+  `billed_cost` is what the API reports it charged (OpenRouter's `usage.cost`,
+  in USD, returned on every non-streaming reply without being requested), or
+  NULL if it reports nothing. A row counts against the cap at `billed_cost`
+  when present, else at `cost`. Charge a pessimistic estimate *before* each
+  real call; raise `BudgetExceeded` if over.
 - Retries with exponential backoff on 429/5xx/transport errors.
 - `parse_json()` helper that tolerates code fences.
 
