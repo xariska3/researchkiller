@@ -111,8 +111,9 @@ LEAKY = {
     ),
     "content_jaccard": GOOD[T1].replace(
         "We expect output quality close to exhaustive comparison while needing far less memory.",
-        "We show that the model keeps quality within half a point while cutting memory, and "
-        "that the number of groups matters more than their size.",
+        "We show that each token passes through one layer fitted with the same loss, keeping "
+        "quality within half a point while cutting memory, and that the number of groups "
+        "matters more than their size.",
     ),
     "length": "We plan to condense very lengthy books without running out of memory.",
 }

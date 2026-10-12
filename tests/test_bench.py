@@ -366,6 +366,15 @@ def test_source_acronyms_that_spell_stopwords_are_not_matched() -> None:
     assert rejection is None
 
 
+def test_content_jaccard_ignores_generic_science_words() -> None:
+    leak = LeakFilter(corpus_records(), max_overlap=1.0, max_jaccard=1.0)
+    abstract = "We propose a novel method and show results on data."  # all generic
+    _, stats = leak.check(
+        "We present an approach and evaluate the method on a dataset.", "Generic words", abstract
+    )
+    assert stats["content_jaccard"] == 0.0
+
+
 def test_prompts_render_every_placeholder() -> None:
     values = {"title": "T", "abstract": "A", "proposal": "P", "feedback": ""}
     for prompt in PROMPTS.values():

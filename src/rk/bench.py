@@ -143,7 +143,8 @@ class LeakFilter:
        ones that spell a stopword, like "IT" or "US", are skipped);
     3. any distinctive title stem (title content stems minus generic words);
     4. more than a fraction max_overlap of the abstract's top-20 IDF stems;
-    5. content-stem Jaccard with title + abstract above max_jaccard.
+    5. content-stem Jaccard with title + abstract above max_jaccard, generic
+       science words excluded on both sides (text.is_generic).
     """
 
     def __init__(self, corpus: Iterable[Record], *, max_overlap: float, max_jaccard: float):
@@ -192,9 +193,10 @@ class LeakFilter:
         allowed = math.floor(self.max_overlap * len(top) + 1e-9)
         overlap_words = sorted({t for t in proposal_tokens if stem(t) in overlap})
 
-        doc_stems = set(content_stems(f"{title} {abstract}"))
-        union = proposal_stems | doc_stems
-        jaccard = len(proposal_stems & doc_stems) / len(union) if union else 0.0
+        specific = set(content_stems(proposal, drop_generic=True))
+        doc_stems = set(content_stems(f"{title} {abstract}", drop_generic=True))
+        union = specific | doc_stems
+        jaccard = len(specific & doc_stems) / len(union) if union else 0.0
 
         stats = {
             "acronyms_in_paraphrase": own_acronyms,

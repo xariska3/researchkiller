@@ -139,8 +139,9 @@ reason:
    4. more than a fraction `max_distinctive_overlap` (in [0, 1]; 0.15 = at most
       3) of the abstract's top-20 IDF stems, IDF over the frozen corpus, ties
       to stems more frequent in the abstract (`idf_overlap`)
-   5. content-stem Jaccard with title+abstract above `max_content_jaccard`
-      (`content_jaccard`)
+   5. content-stem Jaccard with title+abstract above `max_content_jaccard`,
+      generic science words excluded on both sides with the same rule as in
+      3 (`content_jaccard`)
 4. **Equivalence filter**: the **judge** model (different family) answers
    each direction in a **separate call**, so one answer can't anchor the other,
    as JSON `{"verdict": "yes"|"no", "reason": "..."}`:
