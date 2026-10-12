@@ -143,7 +143,8 @@ def make_bench_command(config_path: Path, limit: int | None, show: bool) -> int:
         stats = make_bench(cfg, paraphraser, judge, limit=limit)
     print(
         f"rk make-bench: {stats['accepted']} of {stats['n_targets_goal']} queries accepted "
-        f"({stats['rejected']} rejected attempts, {stats['exhausted']} targets exhausted); "
+        f"({stats['rejected']} rejected attempts, {stats['exhausted']} targets exhausted, "
+        f"{stats['skipped']} skipped as not research contributions); "
         f"method cost ${stats['method_cost']:.4f}, money spent ${stats['money_spent']:.4f}; "
         f"outputs in {cfg.bench.out_dir}"
     )

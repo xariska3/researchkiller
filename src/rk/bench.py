@@ -38,8 +38,11 @@ ACCEPTED_FILE = "test_a.jsonl"
 REJECTIONS_FILE = "rejections.jsonl"
 STATS_FILE = "stats.json"
 
+NOT_RESEARCH = "not_research_contribution"
+
 # Every rejection reason, in the order the checks run; the first failure wins.
 REASONS = (
+    NOT_RESEARCH,  # checked once per target, before any paraphrase
     "length",
     "acronym_in_paraphrase",
     "source_acronym",
@@ -65,6 +68,30 @@ def load_prompts() -> dict[str, Prompt]:
 class Rejection:
     reason: str  # one of REASONS
     message: str  # human-readable; quoted in the retry prompt
+
+
+# A paper that calls itself a survey, review or tutorial isn't a research contribution:
+# its proposal is generic and matches many papers equally well, so the target isn't
+# the one right answer. Self-description only, so papers *about* reviews (Cochrane
+# reviews, peer review, literature-review tooling) are kept.
+_SURVEY_TITLE = re.compile(r"\bsurveys?\b", re.IGNORECASE)
+_SELF_DESCRIPTION = (
+    re.compile(r"\b(?:this|our|the present) (?:survey|review|tutorial)\b", re.IGNORECASE),
+    re.compile(r"\bwe (?:survey|review)\b", re.IGNORECASE),
+    re.compile(r"\b(?:is|are) reviewed\b", re.IGNORECASE),
+    re.compile(r"\bPRISMA\b"),  # the systematic-review reporting guideline
+)
+
+
+def not_research_contribution(title: str, abstract: str) -> str | None:
+    """The phrase by which a paper describes itself as a survey, review or tutorial, else None."""
+    if match := _SURVEY_TITLE.search(title):
+        return match.group(0)
+    text = f"{title}. {abstract}"
+    for pattern in _SELF_DESCRIPTION:
+        if match := pattern.search(text):
+            return match.group(0)
+    return None
 
 
 _SENTENCE_BREAK = re.compile(r"(?<=[.!?])\s+")
@@ -314,10 +341,12 @@ def make_bench(
 ) -> dict[str, Any]:
     """Generate (or resume) Test A in bench.out_dir; return the stats.
 
-    Targets are visited in a seeded random order. Targets already accepted or
-    exhausted are skipped, a target interrupted mid-way continues with its next
-    attempt, and the run stops at n_targets accepted. `limit` caps how many
-    targets this run works on.
+    Targets are visited in a seeded random order. A target that describes itself
+    as a survey, review or tutorial is skipped before any LLM call and logged
+    once in rejections.jsonl. Targets already accepted, exhausted or skipped are
+    passed over, a target interrupted mid-way continues with its next attempt,
+    and the run stops at n_targets accepted. `limit` caps how many targets this
+    run paraphrases (skipped ones don't count).
     """
     corpus, targets, manifest = load_frozen_corpus(cfg.corpus.out_dir)
     prompts = load_prompts()
@@ -333,6 +362,7 @@ def make_bench(
     _check_resumable(out_dir, meta, [*accepted_rows, *rejected_rows])
 
     accepted = {r["target_id"] for r in accepted_rows}
+    skipped = {r["target_id"] for r in rejected_rows if r["reason"] == NOT_RESEARCH}
     attempts: Counter[str] = Counter(r["target_id"] for r in rejected_rows)
     last_reason = {r["target_id"]: r["detail"] for r in sorted(rejected_rows, key=_by_attempt)}
     leak = LeakFilter(
@@ -350,14 +380,22 @@ def make_bench(
             qid = make_qid(position, target_id, width)
             if len(accepted) >= cfg.bench.n_targets:
                 break
-            if target_id in accepted or attempts[target_id] >= max_attempts:
+            if target_id in accepted or target_id in skipped or attempts[target_id] >= max_attempts:
                 continue
             if limit is not None and worked_on >= limit:
                 break
+            record = by_id[target_id]
+            phrase = not_research_contribution(record["title"], record["abstract"])
+            if phrase is not None:
+                row = _skip_row(target, phrase, meta["prompt_hashes"])
+                _append(out_dir / REJECTIONS_FILE, row)
+                rejected_rows.append(row)
+                skipped.add(target_id)
+                continue
             worked_on += 1
             for attempt in range(attempts[target_id], max_attempts):
                 result = run_attempt(
-                    by_id[target_id],
+                    record,
                     attempt,
                     last_reason.get(target_id),
                     prompts=prompts,
@@ -426,6 +464,22 @@ def _row(
     return row
 
 
+def _skip_row(target: dict[str, Any], phrase: str, prompt_hashes: dict[str, str]) -> dict[str, Any]:
+    """A rejections.jsonl row for a target skipped before any LLM call."""
+    return {
+        "target_id": target["id"],
+        "attempt": 0,
+        "reason": NOT_RESEARCH,
+        "detail": f"it describes itself as a survey, review or tutorial ({phrase!r})",
+        "query": None,
+        "leak_stats": {},
+        "judge_verdicts": {},
+        "prompt_hashes": prompt_hashes,
+        "usage": {role: dataclasses.asdict(Usage()) for role in ("paraphraser", "judge")},
+        "providers": {"paraphraser": [], "judge": []},
+    }
+
+
 def bench_stats(
     accepted_rows: Sequence[dict[str, Any]],
     rejected_rows: Sequence[dict[str, Any]],
@@ -434,7 +488,13 @@ def bench_stats(
     *,
     n_available: int,
 ) -> dict[str, Any]:
-    """Counts, attempts per target and LLM usage over every row written so far."""
+    """Counts, attempts per target and LLM usage over every row written so far.
+
+    Skipped targets (not research contributions) are counted under their reason
+    and in `skipped`, but they had no attempt, so they aren't in the attempt counts.
+    """
+    skip_rows = [r for r in rejected_rows if r["reason"] == NOT_RESEARCH]
+    rejected_rows = [r for r in rejected_rows if r["reason"] != NOT_RESEARCH]
     rows = [*accepted_rows, *rejected_rows]
     per_target = Counter(r["target_id"] for r in rows)
     accepted_ids = {r["target_id"] for r in accepted_rows}
@@ -443,7 +503,7 @@ def bench_stats(
         for t, n in per_target.items()
         if t not in accepted_ids and n >= cfg.bench.max_attempts_per_target
     ]
-    reasons = Counter(r["reason"] for r in rejected_rows)
+    reasons = Counter(r["reason"] for r in [*rejected_rows, *skip_rows])
     usage = {
         role: sum((Usage(**r["usage"][role]) for r in rows), Usage())
         for role in ("paraphraser", "judge")
@@ -457,10 +517,11 @@ def bench_stats(
         "n_targets_goal": cfg.bench.n_targets,
         "targets_available": n_available,
         "accepted": len(accepted_rows),
-        "rejected": len(rejected_rows),
+        "rejected": len(rejected_rows),  # rejected attempts
         "rejected_by_reason": {reason: reasons[reason] for reason in REASONS},
         "attempts": len(rows),
         "exhausted": len(exhausted),
+        "skipped": len(skip_rows),  # targets that aren't research contributions
         "attempts_per_target": dict(sorted(per_target.items(), key=lambda kv: id_number(kv[0]))),
         "llm_usage": {role: dataclasses.asdict(u) for role, u in usage.items()},
         "llm_providers": providers,  # calls per reported provider; "None" if not reported

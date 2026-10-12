@@ -147,6 +147,16 @@ recorded in every output row and in `stats.json`. Targets are visited in a
 seeded random order (`bench.seed`). For each target, up to
 `max_attempts_per_target` tries; the first failing check is the rejection
 reason:
+0. **Not a research contribution** (checked once, before any LLM call): a
+   target whose title contains "survey", or whose title or abstract describes
+   the paper itself as one ("this/our/the present survey|review|tutorial",
+   "we survey|review", "is/are reviewed", "PRISMA"), is skipped with reason
+   `not_research_contribution`. A survey's proposal is generic and matches
+   many papers equally well, so the target isn't the one right answer. Only
+   self-description counts, so papers *about* reviews (Cochrane reviews, peer
+   review, literature-review tooling) are kept. Found in the Step 6 pilot,
+   where 4 of 35 accepted targets were surveys, reviews or tutorials; OpenAlex's
+   `type` field marked none of them as reviews.
 1. **Paraphraser** gets the title and abstract and writes a research
    *proposal* (as if written before the work) with the same research question,
    method and claimed contribution, using different terminology. No model,
@@ -184,9 +194,11 @@ queries (`run --limit N`) are a seeded random sample, not the lowest ids.
 Outputs in `bench.out_dir`: `test_a.jsonl` (`qid, target_id, target_aliases,
 query, attempt, leak_stats, judge_verdicts, prompt_hashes`, plus the attempt's
 LLM `usage` and, per role, the `providers` that served its calls),
-`rejections.jsonl` (one row per rejected attempt with `reason` and `detail`),
-and `stats.json` (accepted, rejected by reason, attempts per target, LLM usage,
-calls per provider and method cost). Rows are appended as attempts finish, so a
+`rejections.jsonl` (one row per rejected attempt with `reason` and `detail`,
+plus one row per skipped target), and `stats.json` (accepted, rejected by
+reason, skipped, attempts per target, LLM usage, calls per provider and method
+cost; skipped targets had no attempt, so they aren't in the attempt counts).
+`--limit N` caps the targets paraphrased in a run; skipped ones don't count. Rows are appended as attempts finish, so a
 rerun resumes: targets already accepted or exhausted are skipped, an
 interrupted target continues with its next attempt, and outputs made with other
 prompts, models or another corpus are refused. Stop at `n_targets` accepted

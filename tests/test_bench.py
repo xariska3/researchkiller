@@ -22,6 +22,7 @@ from rk.bench import (
     load_prompts,
     make_bench,
     make_qid,
+    not_research_contribution,
     parse_verdict,
 )
 from rk.config import Config, config_from_dict
@@ -149,6 +150,71 @@ def test_rows_and_stats_record_who_served_each_call(tmp_path: Path, corpus_dir: 
     for row in _rows(cfg, ACCEPTED_FILE):
         assert row["providers"] == {"paraphraser": ["Novita"], "judge": ["OpenAI", "OpenAI"]}
     assert stats["llm_providers"] == {"paraphraser": {"Novita": 4}, "judge": {"OpenAI": 6}}
+
+
+# --- targets that aren't research contributions --------------------------------
+
+# The pilot's 4 surveys/reviews/tutorials and its 5 papers merely *about* reviews:
+# titles and every abstract sentence mentioning survey/review/tutorial/PRISMA.
+SURVEY_CASES = json.loads(
+    (Path(__file__).parent / "survey_rule_cases.json").read_text(encoding="utf-8")
+)
+
+
+@pytest.mark.parametrize("case", SURVEY_CASES, ids=lambda case: case["qid"])
+def test_self_description_rule_on_the_pilot_targets(case: dict[str, Any]) -> None:
+    phrase = not_research_contribution(case["title"], case["abstract_excerpt"])
+    assert (phrase is not None) == case["skip"], phrase
+
+
+@pytest.mark.parametrize(
+    ("title", "abstract", "phrase"),
+    [
+        ("Hallucinations in LLMs: a lifecycle-based survey", "We study causes.", "survey"),
+        ("Methods for X", "Our review covers 40 papers.", "Our review"),
+        ("Methods for X", "In this paper we survey recent work.", "we survey"),
+        ("Methods for X", "Following PRISMA guidelines, we searched four databases.", "PRISMA"),
+        ("Methods for X", "The reviewer assigned this reviewer score.", None),  # not "review"
+        ("Methods for X", "We collect systematic reviews and peer reviews of papers.", None),
+        ("Methods for X", "Prisma is a prism-shaped toy.", None),  # case matters for PRISMA
+    ],
+)
+def test_self_description_patterns(title: str, abstract: str, phrase: str | None) -> None:
+    assert not_research_contribution(title, abstract) == phrase
+
+
+def _survey_config(tmp_path: Path, survey: str) -> Config:
+    records = corpus_records()
+    for record in records:
+        if record["id"] == survey:
+            record["abstract"] = "This survey compares earlier work. " + record["abstract"]
+    freeze(tmp_path / "corpus", records, target_rows(), {})
+    return _config(tmp_path)
+
+
+def test_surveys_are_skipped_before_paraphrasing_logged_once_and_counted(tmp_path: Path) -> None:
+    survey = ORDER[0]  # visited first
+    cfg = _survey_config(tmp_path, survey)
+    para = paraphraser()
+
+    stats = make_bench(cfg, para, judge(), limit=2)  # a skipped target doesn't use the limit
+
+    assert {r["target_id"] for r in _rows(cfg, ACCEPTED_FILE)} == set(ORDER[1:])
+    assert survey not in {_target_in(c[-1]["content"], "Title") for c in para.calls}
+    (skip,) = _rows(cfg, REJECTIONS_FILE)
+    assert (skip["target_id"], skip["reason"]) == (survey, "not_research_contribution")
+    assert "'This survey'" in skip["detail"]
+    assert stats["rejected_by_reason"]["not_research_contribution"] == stats["skipped"] == 1
+    assert (stats["accepted"], stats["rejected"], stats["attempts"], stats["exhausted"]) == (
+        2,
+        0,
+        2,
+        0,
+    )
+    assert survey not in stats["attempts_per_target"]
+
+    again = make_bench(cfg, paraphraser(), judge())  # resuming neither re-checks nor re-logs it
+    assert len(_rows(cfg, REJECTIONS_FILE)) == 1 and again["skipped"] == 1
 
 
 # --- rejections --------------------------------------------------------------
