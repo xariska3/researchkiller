@@ -30,6 +30,9 @@ version = { attr = "rk.__version__" }
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+rk = ["prompts/*.txt"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = ["network: talks to the live OpenAlex API; deselected unless run with -m network"]

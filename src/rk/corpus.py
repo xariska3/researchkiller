@@ -303,14 +303,16 @@ def _compact_topic(topic: dict[str, Any] | None) -> dict[str, Any] | None:
 def _accept(
     works: Iterable[dict[str, Any]], origin: str, corpus: CorpusConfig, dropped: Counter[str]
 ) -> list[Record]:
-    """Records for the works that pass the language and abstract-length filters."""
+    """Records for the works that have an abstract and pass the language and length filters."""
     accepted = []
     for work in works:
         if not work.get("publication_date"):
             dropped["no_publication_date"] += 1
             continue
         record = to_record(work, origin)
-        if record["language"] != corpus.language:
+        if not record["abstract"]:
+            dropped["no_abstract"] += 1
+        elif record["language"] != corpus.language:
             dropped["language"] += 1
         elif len(record["abstract"].split()) < corpus.min_abstract_words:
             dropped["short_abstract"] += 1
@@ -390,11 +392,16 @@ def expand_citations(
     targets: Sequence[Record],
     cfg: CorpusConfig,
     build_date: date,
-    dropped: Counter[str],
+    dropped: dict[str, Counter[str]],
     *,
     per_page: int = PER_PAGE,
 ) -> tuple[list[Record], list[FetchStats]]:
-    """Fetch the targets' references (batched by id) and up to N newest citers each."""
+    """Fetch the targets' references (batched by id) and up to N newest citers each.
+
+    References are fetched without has_abstract:true so that the ones without
+    an abstract are counted (as dropped) rather than silently missing; ids that
+    OpenAlex doesn't return are counted as not_found.
+    """
     known = {work_id for r in corpus for work_id in (r["id"], *r["aliases"])}
     ref_ids = sorted({w for t in targets for w in t["referenced_works"]} - known, key=id_number)
     found: list[Record] = []
@@ -402,12 +409,14 @@ def expand_citations(
         batch = ref_ids[start : start + IDS_PER_CALL]
         page = client.get_works(
             {
-                "filter": f"ids.openalex:{'|'.join(batch)},has_abstract:true",
+                "filter": f"ids.openalex:{'|'.join(batch)}",
                 "select": SELECT,
                 "per_page": str(IDS_PER_CALL),
             }
         )
-        found += _accept(page.get("results") or [], "reference", cfg, dropped)
+        results = page.get("results") or []
+        dropped["reference"]["not_found"] += len(batch) - len(results)
+        found += _accept(results, "reference", cfg, dropped["reference"])
 
     citer_stats = []
     for target in targets:
@@ -415,7 +424,7 @@ def expand_citations(
         filters = f"cites:{cited},has_abstract:true,to_publication_date:{build_date.isoformat()}"
         works, stats = fetch_newest(client, filters, cfg.max_citers_per_target, per_page=per_page)
         citer_stats.append(stats)
-        found += _accept(works, "citer", cfg, dropped)
+        found += _accept(works, "citer", cfg, dropped["citer"])
     return found, citer_stats
 
 
@@ -463,7 +472,7 @@ def build_corpus(
     _refuse_overwrite(out_dir / MANIFEST_FILE)
     build_date = build_date or date.today()
     calls_before = client.calls
-    dropped: Counter[str] = Counter()
+    dropped: dict[str, Counter[str]] = {origin: Counter() for origin in ORIGINS}
 
     sweeps: list[FetchStats] = []
     records: list[Record] = []
@@ -475,7 +484,7 @@ def build_corpus(
             per_page=per_page,
         )
         sweeps.append(stats)
-        records += _accept(works, "sweep", cfg.corpus, dropped)
+        records += _accept(works, "sweep", cfg.corpus, dropped["sweep"])
     corpus = dedupe(records)
 
     selection = select_targets(corpus, cfg.bench)
@@ -509,7 +518,7 @@ def build_corpus(
         "n_docs": len(corpus),
         "n_aliases": sum(len(r["aliases"]) for r in corpus),
         "counts_by_origin": {origin: origins[origin] for origin in ORIGINS},
-        "dropped": dict(sorted(dropped.items())),
+        "dropped": {origin: dict(sorted(dropped[origin].items())) for origin in ORIGINS},
         "targets": {
             "n_candidates": selection.n_candidates,
             "n_sampled": len(selection.targets),

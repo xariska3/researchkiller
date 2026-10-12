@@ -104,8 +104,10 @@ Build order:
 4. **Citation expansion**: fetch every target's references (batch
    `ids.openalex:W1|W2|...`, 50 per call) and up to `max_citers_per_target`
    citers (`cites:Wxxx`, newest first, cut like a sweep). References are the
-   hard near-miss distractors. Expansion docs pass the same `has_abstract`,
-   language and `min_abstract_words` filters as sweeps. Dedupe again, re-map
+   hard near-miss distractors. Expansion docs pass the same abstract, language
+   and `min_abstract_words` filters as sweeps; references without an abstract
+   (and ids OpenAlex doesn't return) are counted per origin under `dropped` in
+   the manifest. Dedupe again, re-map
    target ids through aliases, and re-check remapped targets against the
    target rules (an earlier version may predate `target_from_date`).
 5. **Freeze**: write `corpus.jsonl`, `targets.jsonl`, `manifest.json`
@@ -115,32 +117,50 @@ Build order:
    Refuse to overwrite an existing manifest.
 
 ## Benchmark generation (`bench.py`), Test A only
-For each target, up to `max_attempts_per_target` tries:
-1. **Paraphraser** writes a 2–4 sentence research *proposal* (as if written
-   before the work) with the same research question, method and claimed
-   contribution, using different terminology. No model, dataset or method
-   names, no acronyms, no title words. Attempt `a` (from 0) uses seed
-   `paraphraser.seed + a`, so every attempt has its own cache key, and every
-   retry prompt includes the previous attempt's rejection reason.
-2. **Lexical-leak filter** (deterministic, reject if any fails):
-   - any distinctive title term (content stems minus stopwords and generic science words) present
-   - any acronym/named artefact from the title or abstract present
-   - more than a fraction `max_distinctive_overlap` (in [0, 1]; 0.15 = at most 3)
-     of the abstract's top-20 IDF terms present
-   - content-stem Jaccard with title+abstract above `max_content_jaccard`
-3. **Equivalence filter**: the **judge** model (different family) checks
-   both directions, as JSON yes/no + reason:
+Prompts are versioned text files in `src/rk/prompts/` (`paraphrase.txt`,
+`judge_captures.txt`, `judge_adds_nothing.txt`); each prompt's sha256 is
+recorded in every output row and in `stats.json`. Targets are visited in a
+seeded random order (`bench.seed`). For each target, up to
+`max_attempts_per_target` tries; the first failing check is the rejection
+reason:
+1. **Paraphraser** gets the title and abstract and writes a research
+   *proposal* (as if written before the work) with the same research question,
+   method and claimed contribution, using different terminology. No model,
+   dataset or method names, no acronyms, no title words. Attempt `a` (from 0)
+   uses seed `paraphraser.seed + a`, so every attempt has its own cache key,
+   and every retry prompt includes the previous attempt's rejection reason.
+2. **Length**: 2–4 sentences and 40–120 words, else `length`.
+3. **Lexical-leak filter** (deterministic), in this order:
+   1. any acronym/named artefact in the proposal at all (`acronym_in_paraphrase`)
+   2. any acronym/named artefact from the title or abstract, case-insensitive
+      (`source_acronym`; ones spelling a stopword, like "IT" or "US", are skipped)
+   3. any distinctive title stem: title content stems minus generic science
+      words (`title_stem`)
+   4. more than a fraction `max_distinctive_overlap` (in [0, 1]; 0.15 = at most
+      3) of the abstract's top-20 IDF stems, IDF over the frozen corpus, ties
+      to stems more frequent in the abstract (`idf_overlap`)
+   5. content-stem Jaccard with title+abstract above `max_content_jaccard`
+      (`content_jaccard`)
+4. **Equivalence filter**: the **judge** model (different family) answers
+   each direction in a **separate call**, so one answer can't anchor the other,
+   as JSON `{"verdict": "yes"|"no", "reason": "..."}`:
    - Does the proposal capture the original's core problem, method and claim?
+     (`judge_captures` on "no")
    - Does the proposal add nothing the original doesn't support?
-   Both must be yes. **Never use embedding similarity as the filter**: it
-   would keep only paraphrases dense retrieval handles well and bias the benchmark.
-4. Record, but **never filter on**, the target's BM25 rank for the paraphrase
-   (a difficulty statistic). Filtering on it would bias against B1.
+     (`judge_adds_nothing` on "no"; not asked after a first "no")
+   An unreadable answer is a rejection (`judge_parse_error`), never a pass.
+   **Never use embedding similarity as the filter**: it would keep only
+   paraphrases dense retrieval handles well and bias the benchmark.
 
-Output `data/bench/test_a.jsonl`: `qid, target_id, target_aliases, query,
-attempt, leak_stats, judge_verdicts, bm25_rank`. Also write a rejection log
-with reasons and a short stats file (accepted / rejected by reason).
-Stop at `n_targets` accepted queries.
+Outputs in `bench.out_dir`: `test_a.jsonl` (`qid, target_id, target_aliases,
+query, attempt, leak_stats, judge_verdicts, prompt_hashes`, plus the attempt's
+LLM `usage`), `rejections.jsonl` (one row per rejected attempt with `reason`
+and `detail`), and `stats.json` (accepted, rejected by reason, attempts per
+target, LLM usage and method cost). Rows are appended as attempts finish, so a
+rerun resumes: targets already accepted or exhausted are skipped, an
+interrupted target continues with its next attempt, and outputs made with other
+prompts, models or another corpus are refused. Stop at `n_targets` accepted
+queries. The BM25 rank of each target is not computed here (see Evaluation).
 
 ## Retrieval configurations (`retrieval.py`, `agent.py`)
 All return a ranked list of up to 100 doc ids plus a trace
@@ -160,6 +180,8 @@ built once per frozen corpus and saved to `data/index/`.
 
 ## Evaluation (`evaluate.py`)
 - Per config: Hit@1, Hit@5, Hit@10, MRR (over top-100). Hit = target id or any alias.
+- Per query, a difficulty column: the target's rank in the B1 (BM25) results.
+  Recorded, **never filtered on** (filtering on it would bias against B1).
 - Per query: queries issued, LLM calls, prompt/completion tokens, method cost, latency.
   Report mean, p50, p95.
 - **Paired statistics for B5 vs B4** (and B4 vs B3): paired bootstrap
@@ -170,9 +192,9 @@ built once per frozen corpus and saved to `data/index/`.
 
 ## CLI
 ```
-python -m rk build-corpus  --config configs/phase1.yaml
+python -m rk build-corpus  --config configs/phase1.yaml [--max-works N]
 python -m rk build-index   --config ...
-python -m rk make-bench    --config ...
+python -m rk make-bench    --config ... [--limit N] [--show]
 python -m rk run           --config ... [--configs B1,B4,B5] [--limit N]
 python -m rk report        runs/<timestamp>
 ```

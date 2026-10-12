@@ -1,4 +1,4 @@
-"""The `rk` command (run as `python -m rk`). Only build-corpus is implemented so far."""
+"""The `rk` command (run as `python -m rk`). build-corpus and make-bench are implemented."""
 
 from __future__ import annotations
 
@@ -6,11 +6,13 @@ import argparse
 import dataclasses
 import sys
 from collections.abc import Sequence
-from contextlib import closing
+from contextlib import ExitStack, closing
 from pathlib import Path
 
+from rk.bench import BenchError, format_accepted, make_bench
 from rk.config import ConfigError, load_config
 from rk.corpus import CorpusError, OpenAlexClient, OpenAlexError, build_corpus
+from rk.llm import BudgetExceeded, Ledger, LLMCache, LLMClient, LLMError
 from rk.targets import TargetSelectionError
 
 
@@ -35,12 +37,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="override corpus.max_works_per_sweep, e.g. for a small pilot",
     )
 
-    for name, help_text in (
-        ("build-index", "build the BM25 and dense indexes for the frozen corpus"),
-        ("make-bench", "generate and filter the Test A paraphrase benchmark"),
-    ):
-        cmd = sub.add_parser(name, help=help_text)
-        cmd.add_argument("--config", type=Path, required=True)
+    index = sub.add_parser("build-index", help="build the BM25 and dense indexes")
+    index.add_argument("--config", type=Path, required=True)
+
+    bench = sub.add_parser("make-bench", help="generate (or resume) the Test A benchmark")
+    bench.add_argument("--config", type=Path, required=True)
+    bench.add_argument(
+        "--limit", type=_positive_int, help="work on at most N targets in this run"
+    )
+    bench.add_argument(
+        "--show",
+        action="store_true",
+        help="print title, abstract opening and proposal for each accepted target",
+    )
 
     run = sub.add_parser("run", help="evaluate retrieval configurations on the benchmark")
     run.add_argument("--config", type=Path, required=True)
@@ -70,14 +79,45 @@ def build_corpus_command(config_path: Path, max_works: int | None) -> int:
     return 0
 
 
+def make_bench_command(config_path: Path, limit: int | None, show: bool) -> int:
+    cfg = load_config(config_path)
+    with ExitStack() as stack:
+        cache = stack.enter_context(LLMCache(cfg.run.cache_path))
+        ledger = stack.enter_context(
+            Ledger(cfg.run.cache_path, cfg.run.budget_cap, command="make-bench")
+        )
+        paraphraser = stack.enter_context(closing(LLMClient(cfg.paraphraser, cache, ledger)))
+        judge = stack.enter_context(closing(LLMClient(cfg.judge, cache, ledger)))
+        stats = make_bench(cfg, paraphraser, judge, limit=limit)
+    print(
+        f"rk make-bench: {stats['accepted']} of {stats['n_targets_goal']} queries accepted "
+        f"({stats['rejected']} rejected attempts, {stats['exhausted']} targets exhausted); "
+        f"method cost ${stats['method_cost']:.4f}, money spent ${stats['money_spent']:.4f}; "
+        f"outputs in {cfg.bench.out_dir}"
+    )
+    if show:
+        print(format_accepted(cfg), end="")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if args.command == "build-corpus":
-        try:
+    try:
+        if args.command == "build-corpus":
             return build_corpus_command(args.config, args.max_works)
-        except (ConfigError, CorpusError, OpenAlexError, TargetSelectionError) as exc:
-            print(f"rk build-corpus: {exc}", file=sys.stderr)
-            return 1
+        if args.command == "make-bench":
+            return make_bench_command(args.config, args.limit, args.show)
+    except (
+        ConfigError,
+        CorpusError,
+        OpenAlexError,
+        TargetSelectionError,
+        BenchError,
+        LLMError,
+        BudgetExceeded,
+    ) as exc:
+        print(f"rk {args.command}: {exc}", file=sys.stderr)
+        return 1
     print(f"rk {args.command}: not implemented")
     return 1
 

@@ -1,0 +1,12 @@
+You are checking whether a research proposal adds anything to a paper.
+
+Question: does the proposal add nothing that the paper does not support? Answer "yes" if every problem, method, claim and detail in the proposal is supported by the paper. Answer "no" if the proposal adds or changes anything: a different or extra method, a stronger or broader claim, results, datasets, or applications the paper does not mention. The proposal deliberately uses different wording, so judge the meaning only.
+
+Paper title: $title
+
+Paper abstract: $abstract
+
+Proposal: $proposal
+
+Answer with JSON only, in exactly this form, where verdict is "yes" or "no":
+{"verdict": "yes", "reason": "one short sentence"}

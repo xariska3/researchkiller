@@ -1,0 +1,17 @@
+You are helping to build a benchmark for finding prior work in science.
+
+Below are the title and abstract of a research paper. Write a short research proposal, as if it had been written before the work was done, that pursues the same research question, uses the same method and aims at the same contribution.
+
+Rules:
+- Write 2 to 4 sentences and 40 to 120 words of plain prose.
+- Describe every idea in your own words, using different terminology from the paper.
+- Do not use any word from the title, in any form.
+- Do not name any model, dataset, benchmark, method, tool, venue or organisation.
+- Do not use acronyms or abbreviations of any kind.
+- Do not add problems, methods, claims or results that the paper does not support.
+- Output only the proposal: no heading, no quotation marks, no commentary.
+
+Title: $title
+
+Abstract: $abstract
+$feedback
