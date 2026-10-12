@@ -173,7 +173,7 @@ by doc id.
 | ID | Strategy |
 |---|---|
 | B1 | BM25 (`bm25s`), single query; only docs with a positive score |
-| B2 | Dense: sentence-transformers (default `BAAI/bge-small-en-v1.5`, query prefix from config), normalised float32 vectors, FAISS `IndexFlatIP` |
+| B2 | Dense: sentence-transformers (default `BAAI/bge-small-en-v1.5`, pinned to the Hugging Face commit `retrieval.encoder_revision`, query prefix from config), normalised float32 vectors, FAISS `IndexFlatIP` |
 | B3 | Hybrid: reciprocal rank fusion (k=60) of B1 and B2 top-100 |
 | B4 | One agent-model call returns JSON `{"queries": [...]}`: at most `max_queries - 1` rewrites, duplicates removed. Run B3 on the original + rewrites; RRF-fuse all lists. On a parse failure, the original query alone, with the error recorded |
 | B5 | The original query runs first with no LLM call. Each agent step sees the queries so far with the top-10 titles of each (titles only, to bound tokens) and returns `{"action": "search", "query": ...}` or `{"action": "stop", "reason": ...}`. Hard limits: `max_queries` queries in total and `max_llm_calls_agent` calls. A repeated query counts toward the budget but isn't re-run; a parse failure stops the loop and is recorded. Fused with exactly the same function as B4 |
@@ -187,8 +187,9 @@ BM25 gets the project's own tokenisation (`content_tokens` + `stem`). The
 encoder sits behind a small interface (`encode_queries`, `encode_docs`) so
 tests use a deterministic fake; it runs on the GPU if torch sees CUDA. Indexes
 are built once per frozen corpus and saved to `data/index/` with a manifest
-(corpus sha256, encoder, device, doc count, build time); loading refuses an
-index whose corpus sha256 doesn't match the frozen corpus.
+(corpus sha256, encoder and revision, device, doc count, build time); loading
+refuses an index whose corpus sha256 doesn't match the frozen corpus, and dense
+retrieval refuses an encoder or revision other than the index's.
 
 ## Evaluation (`evaluate.py`)
 - Per config: Hit@1, Hit@5, Hit@10, MRR (over top-100). Hit = target id or any alias.

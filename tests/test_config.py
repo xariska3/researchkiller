@@ -47,6 +47,7 @@ def _valid() -> dict[str, Any]:
         },
         "retrieval": {
             "query_prefix": "query: ",
+            "encoder_revision": "0123456789abcdef0123456789abcdef01234567",
             "max_queries": 5,
             "max_llm_calls_agent": 6,
             "max_queries_unconstrained": 15,
@@ -152,6 +153,8 @@ def test_wrong_types_raise(section: str, key: str, value: Any) -> None:
         ("run", "budget_cap", 0),
         ("retrieval", "max_queries_unconstrained", 4),
         ("judge", "max_tokens", 0),
+        ("retrieval", "encoder_revision", "main"),
+        ("retrieval", "encoder_revision", "5C38EC7C405EC4B44B94CC5A9BB96E735B38267A"),
     ],
 )
 def test_out_of_range_values_raise(section: str, key: str, value: Any) -> None:

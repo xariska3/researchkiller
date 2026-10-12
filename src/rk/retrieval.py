@@ -56,6 +56,7 @@ class Encoder(Protocol):
     """Maps text to L2-normalised float32 vectors, one row per text."""
 
     name: str
+    revision: str  # model version (a Hugging Face commit hash)
     device: str
 
     def encode_queries(self, texts: Sequence[str]) -> np.ndarray: ...
@@ -64,9 +65,11 @@ class Encoder(Protocol):
 
 
 class SentenceTransformerEncoder:
-    """A sentence-transformers model on the GPU if torch sees CUDA, else the CPU."""
+    """A sentence-transformers model at a pinned revision, on the GPU if torch sees CUDA."""
 
-    def __init__(self, model_name: str, *, query_prefix: str = "", batch_size: int = 64):
+    def __init__(
+        self, model_name: str, *, revision: str, query_prefix: str = "", batch_size: int = 64
+    ):
         try:
             import torch
             from sentence_transformers import SentenceTransformer
@@ -76,10 +79,13 @@ class SentenceTransformerEncoder:
             ) from exc
         cuda = torch.cuda.is_available()
         self.name = model_name
+        self.revision = revision
         self.device = f"cuda ({torch.cuda.get_device_name(0)})" if cuda else "cpu"
         self.query_prefix = query_prefix
         self.batch_size = batch_size
-        self._model = SentenceTransformer(model_name, device="cuda" if cuda else "cpu")
+        self._model = SentenceTransformer(
+            model_name, revision=revision, device="cuda" if cuda else "cpu"
+        )
 
     def encode_queries(self, texts: Sequence[str]) -> np.ndarray:
         return self._encode([self.query_prefix + t for t in texts])
@@ -99,7 +105,9 @@ class SentenceTransformerEncoder:
 
 
 def make_encoder(cfg: RetrievalConfig) -> Encoder:
-    return SentenceTransformerEncoder(cfg.encoder, query_prefix=cfg.query_prefix)
+    return SentenceTransformerEncoder(
+        cfg.encoder, revision=cfg.encoder_revision, query_prefix=cfg.query_prefix
+    )
 
 
 def _unit_rows(vectors: np.ndarray) -> np.ndarray:
@@ -152,6 +160,7 @@ def build_index(cfg: Config, encoder: Encoder) -> dict[str, Any]:
     manifest = {
         "corpus_sha256": corpus_manifest["files"][CORPUS_FILE]["sha256"],
         "encoder": encoder.name,
+        "encoder_revision": encoder.revision,
         "device": encoder.device,
         "dim": int(vectors.shape[1]),
         "n_docs": len(doc_ids),
@@ -311,10 +320,12 @@ class DenseRetriever(_SingleQuery):
     name = "B2"
 
     def __init__(self, index: Index, encoder: Encoder) -> None:
-        if encoder.name != index.manifest["encoder"]:
+        built = (index.manifest["encoder"], index.manifest.get("encoder_revision"))
+        if (encoder.name, encoder.revision) != built:
             raise RetrievalError(
-                f"the index was built with encoder {index.manifest['encoder']!r}, "
-                f"not {encoder.name!r}: rebuild it or change retrieval.encoder"
+                f"the index was built with encoder {built[0]!r} at revision {built[1]!r}, "
+                f"not {encoder.name!r} at {encoder.revision!r}: rebuild it or change "
+                "retrieval.encoder / encoder_revision"
             )
         self.index = index
         self.encoder = encoder

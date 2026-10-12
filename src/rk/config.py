@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import itertools
+import re
 import types
 import typing
 from dataclasses import dataclass
@@ -77,9 +78,14 @@ class RetrievalConfig:
     max_queries_unconstrained: int  # B5-U
     max_llm_calls_agent_unconstrained: int  # B5-U
     index_dir: Path
+    encoder_revision: str  # Hugging Face commit hash of the encoder, for reproducibility
     encoder: str = "BAAI/bge-small-en-v1.5"
 
     def __post_init__(self) -> None:
+        _require(
+            re.fullmatch(r"[0-9a-f]{40}", self.encoder_revision) is not None,
+            "encoder_revision must be a 40-character Hugging Face commit hash",
+        )
         _require(self.max_queries >= 1, "max_queries must be >= 1")
         _require(self.max_llm_calls_agent >= 1, "max_llm_calls_agent must be >= 1")
         _require(

@@ -103,6 +103,7 @@ def test_index_manifest_and_shared_tokenisation(cfg: Config, index: Index) -> No
         "cpu",
         13,
     )
+    assert manifest["encoder_revision"] == FakeEncoder.revision
     assert manifest["doc_text"] == "title. abstract"
     assert index.doc_ids == sorted(index.doc_ids, key=lambda d: int(d[1:]))
     assert analyze(TITLES[T1]) == content_stems(TITLES[T1])  # same tokenisation as the leak filter
@@ -121,10 +122,16 @@ def test_index_is_never_overwritten(cfg: Config, index: Index) -> None:
         build_index(cfg, FakeEncoder())
 
 
-def test_dense_retriever_refuses_a_different_encoder(index: Index) -> None:
+@pytest.mark.parametrize(
+    ("attribute", "value"),
+    [("name", "another-encoder"), ("revision", "1111111111111111111111111111111111111111")],
+)
+def test_dense_retriever_refuses_another_encoder_or_revision(
+    index: Index, attribute: str, value: str
+) -> None:
     other = FakeEncoder()
-    other.name = "another-encoder"
-    with pytest.raises(RetrievalError, match="built with encoder 'fake-encoder'"):
+    setattr(other, attribute, value)
+    with pytest.raises(RetrievalError, match="built with encoder 'fake-encoder' at revision"):
         DenseRetriever(index, other)
 
 

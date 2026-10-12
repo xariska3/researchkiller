@@ -140,6 +140,7 @@ class FakeEncoder:
     """
 
     name = "fake-encoder"
+    revision = "fa4e000000000000000000000000000000000000"  # a valid-looking commit hash
     device = "cpu"
 
     def __init__(self, dim: int = 256) -> None:
@@ -462,6 +463,7 @@ def corpus_config_dict(out_dir: Path, **corpus_overrides: Any) -> dict[str, Any]
         },
         "retrieval": {
             "query_prefix": "query: ",
+            "encoder_revision": FakeEncoder.revision,
             "max_queries": 5,
             "max_llm_calls_agent": 6,
             "max_queries_unconstrained": 15,
