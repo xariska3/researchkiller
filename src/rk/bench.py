@@ -194,6 +194,27 @@ def _match_key(text: str) -> str:
     return re.sub(r"[\W_]+", "", text.lower())
 
 
+def _exact_words(text: str) -> set[str]:
+    """Every word in `text` as written, hyphenated compounds whole and by part."""
+    words = set()
+    for match in _WORD_RE.finditer(text):
+        words.add(match.group())
+        words.update(match.group().split("-"))
+    return words
+
+
+def _is_mixed_case(form: str) -> bool:
+    """True for forms like "STandard" or "LoRA" that mix capitals and small letters."""
+    return any(c.isupper() for c in form) and any(c.islower() for c in form)
+
+
+# A word is common if at least this fraction of corpus abstracts write it in lower
+# case (and at least as many as capitalise it). Common words: standard 6.8%, step
+# 5.4%, map 1.0%; acronyms seen in lower case (gpt-4, llm-based) stay below: gpt
+# 0.24%, llm 0.15%, rag 0.09% (Step 6 pilot corpus).
+COMMON_WORD_MIN_DF = 0.005
+
+
 def _word_keys(text: str) -> set[str]:
     """Match keys of every word in `text`, hyphenated compounds whole and by part."""
     keys = set()
@@ -209,8 +230,10 @@ class LeakFilter:
 
     Checks run in this order and the first failure is the reason:
     1. any acronym or named artefact in the proposal at all;
-    2. any acronym or named artefact from the title or abstract (case-insensitive;
-       ones that spell a stopword, like "IT" or "US", are skipped);
+    2. any acronym or named artefact from the title or abstract: matched
+       case-insensitively, except mixed-case forms ("STandard", "LoRA"), which
+       must match as written; ones that spell a stopword ("IT", "US") or a
+       common corpus word ("STEP" -> step, see is_common_word) are skipped;
     3. any capitalised name from the abstract ("Bilibili") used mid-sentence in
        the proposal; a word counts as a name if the corpus abstracts capitalise it
        mid-sentence more often than they write it in lower case, so common words
@@ -276,6 +299,19 @@ class LeakFilter:
             return False
         return self._capitalised[key] > self._lowercase[key]
 
+    def is_common_word(self, word: str) -> bool:
+        """True if corpus abstracts often write `word` in lower case, not less than capitalised.
+
+        Often means in at least COMMON_WORD_MIN_DF of them; the comparison is
+        is_name's statistic, so an extracted "acronym" spelling a common word
+        ("STEP", the "STandard" of "STandard for Exchange of Product data") isn't
+        held against a proposal that uses the ordinary word.
+        """
+        key = word.lower()
+        lowercase = self._lowercase[key]
+        often = lowercase >= COMMON_WORD_MIN_DF * self._n_docs
+        return often and lowercase >= self._capitalised[key]
+
     def check(
         self, proposal: str, title: str, abstract: str
     ) -> tuple[Rejection | None, dict[str, Any]]:
@@ -285,8 +321,13 @@ class LeakFilter:
         source = set(extract_acronyms(title)) | set(extract_acronyms(abstract))
         source_by_key = {_match_key(a): a for a in sorted(source)}
         proposal_keys = _word_keys(proposal)
+        proposal_words = _exact_words(proposal)
         source_found = sorted(
-            a for key, a in source_by_key.items() if key in proposal_keys and key not in STOPWORDS
+            a
+            for key, a in source_by_key.items()
+            if key not in STOPWORDS
+            and not self.is_common_word(key)
+            and (a in proposal_words if _is_mixed_case(a) else key in proposal_keys)
         )
         source_names = sorted(
             w

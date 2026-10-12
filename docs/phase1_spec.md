@@ -179,8 +179,14 @@ reason:
    of proposal, title and abstract, so keeping one is never a leak. Then, in
    this order:
    1. any acronym/named artefact in the proposal at all (`acronym_in_paraphrase`)
-   2. any acronym/named artefact from the title or abstract, case-insensitive
-      (`source_acronym`; ones spelling a stopword, like "IT" or "US", are skipped)
+   2. any acronym/named artefact from the title or abstract (`source_acronym`):
+      matched case-insensitively, except mixed-case forms ("STandard", "LoRA"),
+      which must match as written; ones spelling a stopword ("IT", "US") or a
+      common corpus word are skipped. Common means at least 0.5% of corpus
+      abstracts write it in lower case, and not less often than they
+      capitalise it (the `source_name` statistic): "STEP" and the "STandard"
+      it abbreviates no longer ban the words step and standard, while gpt
+      (0.24%), llm and rag stay banned in lower case too.
    3. any capitalised name from the abstract ("Bilibili") that the proposal
       uses mid-sentence (`source_name`). A word counts as a name if the corpus
       abstracts capitalise it mid-sentence more often than they write it in
@@ -212,10 +218,10 @@ reason:
      stated so generally that it no longer tells this work apart from close
      sibling work (e.g. it drops the specific domain, population, data type or
      language); the prompt gives one short example (`judge_captures`).
-     Omissions and generality are judged only here.
-   - Does the proposal change or add to any facet? Only changes and additions
-     count; a left-out detail is not a change (`judge_adds_nothing`; not
-     asked after a first "no").
+   - Does the proposal change or add to any facet, or state one too
+     generally (the same test and example)? (`judge_adds_nothing`; not asked
+     after a first "no"). Testing generality only in "captures" was tried in
+     the pilot and caught 7/30 generalised corruptions instead of 24/30.
    Both prompts say that names of datasets, benchmarks, models, methods,
    platforms and organisations, and numbers, are removed on purpose and never
    make a facet fail, and that a described stand-in counts as specific (the

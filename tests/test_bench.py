@@ -640,6 +640,45 @@ def test_make_bench_uses_the_configured_title_stem_threshold(tmp_path: Path) -> 
     assert accepted[T1]["leak_stats"]["common_title_words_used"] == ["documents", "long"]
 
 
+# The pilot target W7212273718: its abstract spells out the STEP acronym, so
+# "STandard" was extracted as an acronym and banned the ordinary word "standard".
+STEP_ABSTRACT = (
+    "We build an evaluation set directly from product and assembly files compliant with the "
+    "STandard for Exchange of Product Model Data (STEP). We fine-tune BERT and LoRA adapters."
+)
+
+
+def _common_words_filter() -> LeakFilter:
+    """The fixture corpus plus abstracts that use "standard" and "step" as ordinary words."""
+    extra = [
+        {"id": f"W{800 + i}", "title": "Procedures",
+         "abstract": "We follow a standard procedure, one step at a time."}
+        for i in range(3)
+    ]
+    return LeakFilter([*corpus_records(), *extra], max_overlap=1.0, max_jaccard=1.0)
+
+
+@pytest.mark.parametrize(
+    ("proposal", "found"),
+    [  # ordinary words that an extracted acronym spells are fine ...
+        ("We will build a test set, step by step, from design files that follow a standard.", []),
+        # ... a mixed-case form must match as written ("lora" isn't "LoRA") ...
+        ("We will tune small lora adapters on design files.", []),
+        # ... and real acronyms still match in any case.
+        ("We will adapt bert to design files.", ["BERT"]),
+    ],
+)
+def test_source_acronyms_skip_common_words_and_match_mixed_case_exactly(
+    proposal: str, found: list[str]
+) -> None:
+    leak = _common_words_filter()
+    assert leak.is_common_word("standard") and leak.is_common_word("step")
+    assert not leak.is_common_word("bert")
+    rejection, stats = leak.check(proposal, "Ontology assessment for product data", STEP_ABSTRACT)
+    assert stats["source_acronyms_found"] == found
+    assert (rejection is None) == (not found)
+
+
 def test_leak_filter_lets_a_proposal_keep_the_titles_field() -> None:
     leak = LeakFilter(corpus_records(), max_overlap=1.0, max_jaccard=1.0)
     title = "Global trends in physics information-seeking"
@@ -712,18 +751,14 @@ def test_judge_prompts_compare_four_facets(name: str) -> None:
     # Removed names never count against a proposal, in either direction.
     assert "are removed on purpose: their absence never makes a facet \"no\"" in text
     assert "a described stand-in" in text
-    # Omissions and generality are judged only in "captures"; "adds nothing" judges
-    # only changes and additions.
-    captures_only = (
+    # The "too general" test, with its one example, is in both directions: with it
+    # only in "captures", generalised corruptions were caught 7/30 instead of 24/30.
+    for phrase in (
         "no longer tells this work apart from close sibling work",
         "drops the specific domain, population, data type or language",
         "Example of a too-general proposal",
-    )
-    if name == "judge_captures":
-        assert all(phrase in text for phrase in captures_only)
-    else:
-        assert not any(phrase in text for phrase in captures_only)
-        assert "Judge only changes and additions here" in text
+    ):
+        assert phrase in text
 
 
 def _strict_everywhere(schema: dict[str, Any]) -> bool:
