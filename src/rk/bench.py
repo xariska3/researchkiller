@@ -937,16 +937,44 @@ def validate_judge(
 
 
 HUMAN_CHECK_FILE = Path("data/human_check.csv")
-HUMAN_CHECK_COLUMNS = ("qid", "title", "abstract", "proposal", "same_paper", "note")
+HUMAN_CHECK_COLUMNS = (
+    "part", "qid", "title", "abstract", "proposal", "judge_reason", "verdict", "note"
+)
 
 
-def export_human_check(cfg: Config, *, n: int, out_path: Path = HUMAN_CHECK_FILE) -> int:
-    """Write a seeded random sample of accepted pairs to a CSV for checking by hand.
+def _judge_reasons(judgments: dict[str, Any]) -> str:
+    """The judge's reasons, one per direction or per failed facet ("direction/facet: ...")."""
+    reasons = []
+    for direction in JUDGE_DIRECTIONS:
+        j = judgments.get(direction)
+        if j is None:
+            continue
+        failed = j.get("failed", [])
+        if failed:
+            reasons += [f"{direction}/{f}: {j['match'][f]['reason']}" for f in failed]
+        else:
+            reasons.append(f"{direction}: {j.get('reason') or 'unreadable answer'}")
+    return " | ".join(reasons)
 
-    The sample is drawn with bench.seed and listed in qid order; same_paper and
-    note are left empty for the reader. The file is UTF-8 with a byte-order mark
-    so spreadsheet programs read it correctly. Refuses to overwrite a file, which
-    may already hold someone's answers. Returns the number of rows written.
+
+def export_human_check(
+    cfg: Config,
+    *,
+    n: int,
+    out_path: Path = HUMAN_CHECK_FILE,
+    validation_dir: Path | None = None,
+) -> tuple[int, int]:
+    """Write pairs to a CSV for checking by hand, in two parts.
+
+    Part A is a seeded random sample (bench.seed) of `n` accepted pairs from
+    bench.out_dir: does the proposal describe the same paper? Part B, if
+    `validation_dir` is given, holds every original pair that the configured
+    judge rejected in that validate-judge run: is the rejection right? Each part
+    is in qid order; judge_reason gives the judge's reasons (per failed facet for
+    a rejection), and verdict and note are left empty for the reader. The file is
+    UTF-8 with a byte-order mark so spreadsheet programs read it correctly.
+    Refuses to overwrite a file, which may already hold someone's answers.
+    Returns the number of rows in parts A and B.
     """
     if out_path.exists():
         raise BenchError(f"{out_path} already exists: refusing to overwrite it (it may hold answers)")
@@ -955,6 +983,18 @@ def export_human_check(cfg: Config, *, n: int, out_path: Path = HUMAN_CHECK_FILE
         raise BenchError(
             f"no accepted queries in {cfg.bench.out_dir}: run `python -m rk make-bench` first"
         )
+    rejected: list[dict[str, Any]] = []
+    if validation_dir is not None:
+        summary_path = validation_dir / "summary.json"
+        if not summary_path.exists():
+            raise BenchError(f"no {summary_path}: run `python -m rk validate-judge` first")
+        judged_by = json.loads(summary_path.read_text(encoding="utf-8"))["models"]["judge"]
+        if judged_by != cfg.judge.name:
+            raise BenchError(
+                f"{validation_dir} was judged by {judged_by}, not the configured {cfg.judge.name}"
+            )
+        verdicts = _read_jsonl(validation_dir / "verdicts.jsonl")
+        rejected = [r for r in verdicts if r["variant"] == "original" and not r["accepted"]]
     sample = random.Random(cfg.bench.seed).sample(accepted, min(n, len(accepted)))
     corpus, _, _ = load_frozen_corpus(cfg.corpus.out_dir)
     by_id = {r["id"]: r for r in corpus}
@@ -962,10 +1002,23 @@ def export_human_check(cfg: Config, *, n: int, out_path: Path = HUMAN_CHECK_FILE
     with out_path.open("w", encoding="utf-8-sig", newline="") as fh:
         writer = csv.writer(fh)
         writer.writerow(HUMAN_CHECK_COLUMNS)
-        for row in sorted(sample, key=lambda r: r["qid"]):
-            record = by_id[row["target_id"]]
-            writer.writerow([row["qid"], record["title"], record["abstract"], row["query"], "", ""])
-    return len(sample)
+        for part, rows, proposal_key in (("A", sample, "query"), ("B", rejected, "proposal")):
+            for row in sorted(rows, key=lambda r: r["qid"]):
+                record = by_id[row["target_id"]]
+                judgments = row["judge_verdicts" if part == "A" else "judgments"]
+                writer.writerow(
+                    [
+                        part,
+                        row["qid"],
+                        record["title"],
+                        record["abstract"],
+                        row[proposal_key],
+                        _judge_reasons(judgments),
+                        "",
+                        "",
+                    ]
+                )
+    return len(sample), len(rejected)
 
 
 def _variant_stats(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:

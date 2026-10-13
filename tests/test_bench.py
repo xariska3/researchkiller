@@ -910,20 +910,20 @@ def test_export_human_check_writes_a_seeded_sample_and_never_overwrites(
     make_bench(cfg, paraphraser(), judge())
     out = tmp_path / "check" / "human_check.csv"
 
-    assert export_human_check(cfg, n=2, out_path=out) == 2
+    assert export_human_check(cfg, n=2, out_path=out) == (2, 0)
 
     raw = out.read_bytes()
     assert raw.startswith(b"\xef\xbb\xbf")  # BOM, so spreadsheets read UTF-8
-    with out.open(encoding="utf-8-sig", newline="") as fh:
-        rows = list(csv.reader(fh))
+    rows = _csv_rows(out)
     assert tuple(rows[0]) == HUMAN_CHECK_COLUMNS
     body = rows[1:]
-    assert len(body) == 2 and [r[0] for r in body] == sorted(r[0] for r in body)
+    assert len(body) == 2 and [r[1] for r in body] == sorted(r[1] for r in body)
     accepted = {r["qid"]: r for r in _rows(cfg, ACCEPTED_FILE)}
-    for qid, title, abstract, proposal, same_paper, note in body:
+    for part, qid, title, abstract, proposal, reason, verdict, note in body:
         target = accepted[qid]["target_id"]
-        assert (title, abstract) == (TITLES[target], ABSTRACTS[target])
-        assert proposal == accepted[qid]["query"] and same_paper == note == ""
+        assert part == "A" and (title, abstract) == (TITLES[target], ABSTRACTS[target])
+        assert proposal == accepted[qid]["query"] and verdict == note == ""
+        assert reason.startswith("captures: ") and " | adds_nothing: " in reason
 
     with pytest.raises(BenchError, match="refusing to overwrite"):
         export_human_check(cfg, n=2, out_path=out)
@@ -932,19 +932,105 @@ def test_export_human_check_writes_a_seeded_sample_and_never_overwrites(
     assert again.read_bytes() == raw  # the same seeded sample
 
 
+def _csv_rows(path: Path) -> list[list[str]]:
+    with path.open(encoding="utf-8-sig", newline="") as fh:
+        return list(csv.reader(fh))
+
+
+def _write_validation(path: Path, judge_name: str) -> None:
+    """A validate-judge output with two rejected originals, one accepted, one corruption."""
+    failed = {
+        "verdict": "no",
+        "failed": ["claim"],
+        "match": {"claim": {"match": "no", "reason": "states an aim, not the findings"}},
+        "reason": "the claim differs",
+    }
+    passed = {"verdict": "yes", "failed": [], "match": {}, "reason": "all facets match"}
+    unreadable = {"verdict": None, "raw": "{"}
+    rows = [
+        ("A0002-x", T2, "original", False, {"captures": failed, "adds_nothing": unreadable}),
+        ("A0001-x", T1, "original", False, {"captures": passed, "adds_nothing": failed}),
+        ("A0003-x", T3, "original", True, {"captures": passed, "adds_nothing": passed}),
+        ("A0001-x", T1, "method", False, {"captures": failed, "adds_nothing": failed}),
+    ]
+    path.mkdir(parents=True)
+    summary = {"models": {"judge": judge_name}}
+    (path / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+    verdicts = [
+        {
+            "qid": qid,
+            "target_id": target,
+            "variant": variant,
+            "proposal": f"{variant} proposal for {qid}",
+            "accepted": accepted,
+            "judgments": judgments,
+        }
+        for qid, target, variant, accepted, judgments in rows
+    ]
+    text = "".join(json.dumps(v) + "\n" for v in verdicts)
+    (path / "verdicts.jsonl").write_text(text, encoding="utf-8")
+
+
+def test_export_human_check_part_b_holds_the_originals_the_judge_rejected(
+    tmp_path: Path, corpus_dir: Path
+) -> None:
+    cfg = _config(tmp_path)
+    make_bench(cfg, paraphraser(), judge())
+    validation = tmp_path / "jv"
+    _write_validation(validation, cfg.judge.name)
+    out = tmp_path / "hc.csv"
+
+    assert export_human_check(cfg, n=1, out_path=out, validation_dir=validation) == (1, 2)
+
+    part_b = [r for r in _csv_rows(out)[1:] if r[0] == "B"]
+    assert [r[:6] for r in part_b] == [
+        [
+            "B",
+            "A0001-x",
+            TITLES[T1],
+            ABSTRACTS[T1],
+            "original proposal for A0001-x",
+            "captures: all facets match | adds_nothing/claim: states an aim, not the findings",
+        ],
+        [
+            "B",
+            "A0002-x",
+            TITLES[T2],
+            ABSTRACTS[T2],
+            "original proposal for A0002-x",
+            "captures/claim: states an aim, not the findings | adds_nothing: unreadable answer",
+        ],
+    ]
+    assert all(r[6] == r[7] == "" for r in part_b)
+
+    # The reasons must come from the judge the config names.
+    other = tmp_path / "jv-other"
+    _write_validation(other, "another-judge")
+    with pytest.raises(BenchError, match="judged by another-judge"):
+        export_human_check(cfg, n=1, out_path=tmp_path / "x.csv", validation_dir=other)
+
+
 def test_cli_export_human_check(
     tmp_path: Path, corpus_dir: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.safe_dump(_config_dict(tmp_path)), encoding="utf-8")
-    make_bench(_config(tmp_path), paraphraser(), judge())
+    cfg = _config(tmp_path)
+    make_bench(cfg, paraphraser(), judge())
     out = tmp_path / "hc.csv"
 
     argv = ["export-human-check", "--config", str(config_path), "--n", "20", "--out", str(out)]
     assert cli.main(argv) == 0
-    assert "wrote 3 pairs" in capsys.readouterr().out  # all there are
+    assert "wrote 3 accepted pairs" in capsys.readouterr().out  # all there are
     assert cli.main(argv) == 1  # never overwritten
     assert "refusing to overwrite" in capsys.readouterr().err
+
+    validation = tmp_path / "jv"
+    _write_validation(validation, cfg.judge.name)
+    both = tmp_path / "both.csv"
+    assert cli.main([*argv[:-1], str(both), "--validation-dir", str(validation)]) == 0
+    assert "and 2 rejected originals from" in capsys.readouterr().out
+    assert [r[0] for r in _csv_rows(both)[1:]] == ["A", "A", "A", "B", "B"]
 
 
 # --- CLI ---------------------------------------------------------------------

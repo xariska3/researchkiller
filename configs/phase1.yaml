@@ -75,18 +75,21 @@ paraphraser:
   seed: 42
   training_cutoff: 2024-08-31     # model card: "a cutoff of August 2024"
 
+# The judge caught 90-100% of every corruption type in validate-judge; gpt-4.1-mini
+# and gpt-4.1 caught 40% and 43% of the generalised ones (data/judge_validation_*).
 judge:
-  name: openai/gpt-4.1-mini
-  family: openai
+  name: mistralai/mistral-medium-3.1
+  family: mistral
   base_url: https://openrouter.ai/api/v1
   api_key_env: OPENROUTER_API_KEY
-  provider: openai                # first party
+  provider: mistral               # first party; lists structured_outputs, so the schema is kept
   price_in_per_m: 0.40
-  price_out_per_m: 1.60
+  price_out_per_m: 2.00
   temperature: 0.0
   max_tokens: 800                 # the facet-by-facet JSON answer runs to ~300-500 tokens
   seed: 42
-  training_cutoff: 2024-06-01     # OpenAI docs: "Jun 01, 2024 knowledge cutoff"
+  # Release date (OpenRouter `created` 2025-08-13); Mistral publishes no cutoff.
+  training_cutoff: 2025-08-13
 
 agent:
   name: qwen/qwen3-235b-a22b-2507

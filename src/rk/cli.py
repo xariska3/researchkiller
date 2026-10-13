@@ -127,6 +127,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=HUMAN_CHECK_FILE,
         help=f"CSV to write; never overwritten (default {HUMAN_CHECK_FILE})",
     )
+    check.add_argument(
+        "--validation-dir",
+        type=Path,
+        default=None,
+        help="also add the originals the judge rejected in this validate-judge run (part B)",
+    )
 
     run = sub.add_parser("run", help="evaluate retrieval configurations on the benchmark")
     _add_config_arguments(run)
@@ -235,11 +241,18 @@ def validate_judge_command(
 
 
 def export_human_check_command(
-    config_path: Path, n: int, out: Path, overrides: Sequence[str] = ()
+    config_path: Path,
+    n: int,
+    out: Path,
+    validation_dir: Path | None = None,
+    overrides: Sequence[str] = (),
 ) -> int:
     cfg = load_config(config_path, overrides)
-    written = export_human_check(cfg, n=n, out_path=out)
-    print(f"rk export-human-check: wrote {written} pairs from {cfg.bench.out_dir} to {out}")
+    part_a, part_b = export_human_check(cfg, n=n, out_path=out, validation_dir=validation_dir)
+    line = f"rk export-human-check: wrote {part_a} accepted pairs from {cfg.bench.out_dir}"
+    if validation_dir is not None:
+        line += f" and {part_b} rejected originals from {validation_dir}"
+    print(f"{line} to {out}")
     return 0
 
 
@@ -294,7 +307,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "validate-judge":
             return validate_judge_command(args.config, args.n, args.out_dir, args.overrides)
         if args.command == "export-human-check":
-            return export_human_check_command(args.config, args.n, args.out, args.overrides)
+            return export_human_check_command(
+                args.config, args.n, args.out, args.validation_dir, args.overrides
+            )
         if args.command == "run":
             return run_command(
                 args.config,

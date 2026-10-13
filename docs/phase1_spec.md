@@ -227,8 +227,8 @@ reason:
    make a facet fail, and that a described stand-in counts as specific (the
    pilot judge kept demanding names the leak filter bans).
    The answer format is enforced by the API: the judge is called with
-   `response_format` = a strict JSON schema (OpenAI structured outputs, which
-   the pinned `openai` endpoint supports; with `require_parameters` OpenRouter
+   `response_format` = a strict JSON schema (OpenAI-style structured outputs,
+   which the pinned endpoint must list; with `require_parameters` OpenRouter
    refuses rather than ignores it), and the schema's sha256 is recorded with
    the prompt hashes. The verdict is "yes" only if the judge says yes **and** every facet
    matches; a facet marked "no" rejects whatever the judge concluded, and the
@@ -344,16 +344,20 @@ python -m rk build-corpus  --config configs/phase1.yaml [--max-works N]
 python -m rk build-index   --config ...
 python -m rk make-bench    --config ... [--limit N] [--show]
 python -m rk validate-judge --config ... [--n 30] [--out-dir data/judge_validation]
-python -m rk export-human-check --config ... [--n 20] [--out data/human_check.csv]
+python -m rk export-human-check --config ... [--n 20] [--out data/human_check.csv] [--validation-dir DIR]
 python -m rk run           --config ... [--configs B1,B4,B5] [--limit N] [--run-dir runs/<timestamp>] [--retry-errors]
 python -m rk report        runs/<timestamp>
 ```
 Every command that takes `--config` also takes `--set SECTION.KEY=VALUE`
 (repeatable; YAML values) to override one config value for that run, e.g.
 `--set judge.name=openai/gpt-4.1`; the result is validated like the file.
-`export-human-check` writes a seeded random sample (`bench.seed`) of accepted
-pairs to a CSV (`qid, title, abstract, proposal, same_paper, note`, the last
-two empty) for checking by hand, and never overwrites one.
+`export-human-check` writes pairs to a CSV for checking by hand (`part, qid,
+title, abstract, proposal, judge_reason, verdict, note`, the last two empty),
+and never overwrites one. Part A is a seeded random sample (`bench.seed`) of
+`--n` accepted pairs: does the proposal describe the same paper? With
+`--validation-dir`, part B adds every original that the configured judge
+rejected in that `validate-judge` run, with the judge's reason per failed
+facet: is the rejection right? A run made with another judge is refused.
 
 The `rk` console script is equivalent, but launcher executables can be blocked
 on Windows, so docs always use `python -m rk`.
