@@ -103,12 +103,14 @@ class FakeLLM:
         self.response_formats.append(response_format)
         text, prompt_tokens, completion_tokens = self._reply(messages)
         cost = token_cost(self.model, prompt_tokens, completion_tokens)
+        billed = self.billed_cost if isinstance(self.billed_cost, float) else cost
         usage = Usage(
             calls=1,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             method_cost=cost,
             money_spent=cost,
+            billed_cost=billed,
         )
         return Completion(
             text=text,

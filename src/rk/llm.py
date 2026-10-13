@@ -1,8 +1,9 @@
 """OpenAI-compatible chat client with a SQLite response cache and a hard-capped cost ledger.
 
-Cost accounting keeps two numbers (see Usage). *Method cost* is what the method
+Cost accounting keeps three numbers (see Usage). *Method cost* is what the method
 costs from scratch and is counted on cache hits too, so reported cost reflects
-the method. *Money spent* counts real API calls only. Before every real call the
+the method. *Money spent* counts real API calls only, at the config prices, and
+*billed cost* is what the API charged for those same calls. Before every real call the
 client charges a pessimistic estimate to the Ledger, which refuses calls that
 could take cumulative spend (across all commands, persisted next to the cache)
 over its cap. Cache hits never touch the network, the ledger or the API key, so
@@ -83,7 +84,8 @@ class Usage:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     method_cost: float = 0.0  # counted on cache hits too
-    money_spent: float = 0.0  # real API calls only
+    money_spent: float = 0.0  # real API calls only, at the config prices
+    billed_cost: float = 0.0  # what the API charged for those calls (money_spent if not reported)
 
     def __add__(self, other: Usage) -> Usage:
         if not isinstance(other, Usage):
@@ -95,6 +97,7 @@ class Usage:
             completion_tokens=self.completion_tokens + other.completion_tokens,
             method_cost=self.method_cost + other.method_cost,
             money_spent=self.money_spent + other.money_spent,
+            billed_cost=self.billed_cost + other.billed_cost,
         )
 
 
@@ -201,6 +204,7 @@ class CachedReply:
     prompt_tokens: int
     completion_tokens: int
     provider: str | None = None
+    billed_cost: float | None = None  # not cached: a cache hit is never billed
 
 
 _SCHEMA = """
@@ -433,13 +437,15 @@ class LLMClient(_Closing):
             reply = self._real_call(request)
             self.cache.put(key, request, reply)
         cost = token_cost(self.model, reply.prompt_tokens, reply.completion_tokens)
+        spent = 0.0 if cached else cost
         usage = Usage(
             calls=1,
             cache_hits=int(cached),
             prompt_tokens=reply.prompt_tokens,
             completion_tokens=reply.completion_tokens,
             method_cost=cost,
-            money_spent=0.0 if cached else cost,
+            money_spent=spent,
+            billed_cost=spent if cached or reply.billed_cost is None else reply.billed_cost,
         )
         self.usage += usage
         return Completion(
@@ -485,7 +491,7 @@ class LLMClient(_Closing):
             prompt_tokens=reply.prompt_tokens,
             completion_tokens=reply.completion_tokens,
             cost=token_cost(self.model, reply.prompt_tokens, reply.completion_tokens),
-            billed_cost=billed_cost(data),
+            billed_cost=reply.billed_cost,
             provider=reply.provider,
         )
         return reply
@@ -571,6 +577,7 @@ def _parse_reply(data: Any, model_name: str) -> CachedReply:
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         provider=served_provider(data),
+        billed_cost=billed_cost(data),
     )
 
 

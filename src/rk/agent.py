@@ -6,7 +6,8 @@ and either searches again or stops. Hard limits: max_queries queries in total
 and max_llm_calls agent calls. A repeated query counts against the budget but
 isn't run again; an unreadable step ends the loop. The final ranking uses the
 same fusion function as B4 (retrieval.fuse_runs). B5-U is the same agent with
-the larger, unconstrained budgets.
+the larger, unconstrained budgets. Searches run through B3; in the secondary
+B5-D they run through B2, so the titles the agent sees come from B2 too.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from rk.retrieval import (
     Encoder,
     HybridRetriever,
     Index,
+    Ranker,
     Result,
     Retriever,
     RewriteRetriever,
@@ -66,11 +68,11 @@ def render_history(
 
 
 class AgentRetriever:
-    """B5 (and B5-U): search, look at titles, decide the next query or stop."""
+    """B5 (and B5-U, B5-D): search, look at titles, decide the next query or stop."""
 
     def __init__(
         self,
-        hybrid: HybridRetriever,
+        base: Ranker,
         agent: ChatModel,
         *,
         titles: Mapping[str, str],
@@ -80,7 +82,7 @@ class AgentRetriever:
         name: str = "B5",
     ) -> None:
         self.name = name
-        self.hybrid = hybrid
+        self.base = base
         self.agent = agent
         self.titles = titles
         self.max_queries = max_queries
@@ -90,7 +92,7 @@ class AgentRetriever:
     def retrieve(self, query: str) -> Result:
         start = time.perf_counter()
         trace = Trace(prompt_hashes={self.prompt.name: self.prompt.sha256})
-        queries, runs = [query], [self.hybrid.rank(query)]  # the proposal itself, no LLM call
+        queries, runs = [query], [self.base.rank(query)]  # the proposal itself, no LLM call
         seen = {normalize_query(query)}
         budget_used, calls = 1, 0
         while True:
@@ -124,7 +126,7 @@ class AgentRetriever:
             if not repeat:
                 seen.add(normalize_query(action["query"]))
                 queries.append(action["query"])
-                runs.append(self.hybrid.rank(action["query"]))
+                runs.append(self.base.rank(action["query"]))
         trace.queries = queries
         trace.budget_used = budget_used
         ranking = retrieval.fuse_runs(runs)  # exactly B4's fusion
@@ -135,35 +137,35 @@ class AgentRetriever:
 def make_retrievers(
     cfg: Config, index: Index, encoder: Encoder, agent: ChatModel
 ) -> dict[str, Retriever]:
-    """All six configurations (B1-B5, B5-U), with budgets from the config."""
+    """All eight configurations (B1-B5, B5-U, and B4-D, B5-D on B2), budgets from the config."""
     bm25 = BM25Retriever(index)
     dense = DenseRetriever(index, encoder)
     hybrid = HybridRetriever(bm25, dense)
-    step = load_prompt("agent_step")
+    rewrite, step = load_prompt("rewrite"), load_prompt("agent_step")
     r = cfg.retrieval
+
+    def agent_on(base: Ranker, name: str, max_queries: int, max_llm_calls: int) -> AgentRetriever:
+        return AgentRetriever(
+            base,
+            agent,
+            titles=index.titles,
+            max_queries=max_queries,
+            max_llm_calls=max_llm_calls,
+            prompt=step,
+            name=name,
+        )
+
     return {
         "B1": bm25,
         "B2": dense,
         "B3": hybrid,
-        "B4": RewriteRetriever(
-            hybrid, agent, max_queries=r.max_queries, prompt=load_prompt("rewrite")
+        "B4": RewriteRetriever(hybrid, agent, max_queries=r.max_queries, prompt=rewrite),
+        "B5": agent_on(hybrid, "B5", r.max_queries, r.max_llm_calls_agent),
+        "B5-U": agent_on(
+            hybrid, "B5-U", r.max_queries_unconstrained, r.max_llm_calls_agent_unconstrained
         ),
-        "B5": AgentRetriever(
-            hybrid,
-            agent,
-            titles=index.titles,
-            max_queries=r.max_queries,
-            max_llm_calls=r.max_llm_calls_agent,
-            prompt=step,
-            name="B5",
+        "B4-D": RewriteRetriever(
+            dense, agent, max_queries=r.max_queries, prompt=rewrite, name="B4-D"
         ),
-        "B5-U": AgentRetriever(
-            hybrid,
-            agent,
-            titles=index.titles,
-            max_queries=r.max_queries_unconstrained,
-            max_llm_calls=r.max_llm_calls_agent_unconstrained,
-            prompt=step,
-            name="B5-U",
-        ),
+        "B5-D": agent_on(dense, "B5-D", r.max_queries, r.max_llm_calls_agent),
     }

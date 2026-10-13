@@ -33,8 +33,11 @@ from rk.corpus import CORPUS_FILE, load_frozen_corpus
 from rk.llm import ChatModel, LLMError, load_prompt
 from rk.retrieval import ENCODER_SETTINGS, TOP_K, Encoder, Result, load_index
 
-CONFIG_ORDER = ("B1", "B2", "B3", "B4", "B5", "B5-U")
-PAIRS = (("B4", "B3"), ("B5", "B4"), ("B5-U", "B5"))
+CONFIG_ORDER = ("B1", "B2", "B3", "B4", "B5", "B5-U", "B4-D", "B5-D")
+SECONDARY_CONFIGS = ("B4-D", "B5-D")  # B4 and B5 with B2 as the base instead of B3
+PRIMARY_PAIR = ("B5", "B4")
+PAIRS = (("B4", "B3"), PRIMARY_PAIR, ("B5-U", "B5"))  # (a, b): a minus b
+SECONDARY_PAIRS = (("B2", "B3"), ("B4-D", "B2"), ("B5-D", "B2"), ("B5-D", "B4-D"))
 HIT_KS = (1, 5, 10)
 BOOTSTRAP_RESAMPLES = 10_000
 BUCKETS = ("1", "2-10", "11-100", "not found")  # B1 rank of the target
@@ -83,6 +86,7 @@ CREATE TABLE IF NOT EXISTS query_results (
     completion_tokens INTEGER,
     method_cost REAL,
     money_spent REAL,
+    billed_cost REAL,
     latency_s REAL,
     stop_reason TEXT,
     trace TEXT,
@@ -95,17 +99,25 @@ CREATE TABLE IF NOT EXISTS query_results (
 _COLUMNS = (
     "run_id", "config", "qid", "target_id", "status", "error", "target_rank", "hit_at_1",
     "hit_at_5", "hit_at_10", "reciprocal_rank", "queries_issued", "llm_calls", "prompt_tokens",
-    "completion_tokens", "method_cost", "money_spent", "latency_s", "stop_reason", "trace",
-    "doc_ids", "finished_at",
+    "completion_tokens", "method_cost", "money_spent", "billed_cost", "latency_s", "stop_reason",
+    "trace", "doc_ids", "finished_at",
 )
 
 
 def connect(path: Path) -> sqlite3.Connection:
-    """The results database, created with its tables if needed."""
+    """The results database, created with its tables if needed.
+
+    A database from before billed costs were recorded gets the billed_cost
+    column added; its earlier rows keep NULL there.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
     conn.executescript(_SCHEMA)
+    columns = {r["name"] for r in conn.execute("PRAGMA table_info(query_results)")}
+    if "billed_cost" not in columns:
+        conn.execute("ALTER TABLE query_results ADD COLUMN billed_cost REAL")
+        conn.commit()
     return conn
 
 
@@ -149,6 +161,7 @@ def ok_row(run_id: str, config: str, query: dict[str, Any], result: Result) -> d
         "completion_tokens": trace.usage.completion_tokens,
         "method_cost": trace.usage.method_cost,
         "money_spent": trace.usage.money_spent,
+        "billed_cost": trace.usage.billed_cost,
         "latency_s": trace.latency_s,
         "stop_reason": trace.stop_reason,
         "trace": json.dumps(trace.to_dict(), ensure_ascii=False),
@@ -246,6 +259,18 @@ def summarize(db_path: Path, run_id: str, *, seed: int) -> dict[str, Any]:
             "WHERE run_id = ? AND status = 'error' ORDER BY config, qid",
             (run_id,),
         ).fetchall()
+        # Calls actually sent in this run, at the config prices and as billed. A row
+        # without LLM calls cost nothing; one from before billing was recorded has NULL.
+        spend = conn.execute(
+            """
+            SELECT config,
+                   SUM(money_spent) AS computed,
+                   SUM(COALESCE(billed_cost, CASE WHEN llm_calls = 0 THEN 0.0 END)) AS billed,
+                   SUM(llm_calls > 0 AND billed_cost IS NULL) AS unrecorded
+            FROM query_results WHERE run_id = ? AND status = 'ok' GROUP BY config
+            """,
+            (run_id,),
+        ).fetchall()
 
     configs = sorted({r["config"] for r in quality}, key=CONFIG_ORDER.index)
     by_config: dict[str, dict[str, sqlite3.Row]] = {c: {} for c in configs}
@@ -256,6 +281,24 @@ def summarize(db_path: Path, run_id: str, *, seed: int) -> dict[str, Any]:
         c: {m: _spread([r[m] for r in by_config[c].values()]) for m in EFFORT} for c in configs
     }
     quality_by = {r["config"]: r for r in quality}
+    spend_by = {r["config"]: r for r in spend}
+
+    def billed(config: str) -> dict[str, Any]:
+        row = spend_by.get(config)
+        if row is None:  # no successful rows
+            return {"computed": None, "billed": None, "unrecorded_rows": 0}
+        return {
+            "computed": row["computed"],
+            "billed": None if row["unrecorded"] else row["billed"],
+            "unrecorded_rows": row["unrecorded"],
+        }
+
+    def paired(pairs: Sequence[tuple[str, str]]) -> list[dict[str, Any]]:
+        return [
+            _paired(a, b, by_config[a], by_config[b], seed=seed)
+            for a, b in pairs
+            if a in by_config and b in by_config
+        ]
 
     def mean_of(config: str, metric: str) -> float | None:
         spread = effort[config][metric]
@@ -279,11 +322,8 @@ def summarize(db_path: Path, run_id: str, *, seed: int) -> dict[str, Any]:
         },
         "effort": effort,
         "difficulty": _difficulty(by_config),
-        "paired": [
-            _paired(a, b, by_config[a], by_config[b], seed=seed)
-            for a, b in PAIRS
-            if a in by_config and b in by_config
-        ],
+        "paired": paired(PAIRS),
+        "paired_secondary": paired(SECONDARY_PAIRS),
         "cost_quality": {
             c: {
                 "hit_at_5": quality_by[c]["hit_at_5"],
@@ -293,6 +333,7 @@ def summarize(db_path: Path, run_id: str, *, seed: int) -> dict[str, Any]:
             }
             for c in configs
         },
+        "billed": {c: billed(c) for c in configs},
         "errors": {c: sum(1 for e in errors if e["config"] == c) for c in configs},
         "error_examples": {
             c: [f"{e['qid']}: {e['error']}" for e in errors if e["config"] == c][:3]
@@ -347,8 +388,27 @@ def _ci(ci: Sequence[float] | None) -> str:
     return "–" if ci is None else f"[{ci[0]:+.3f}, {ci[1]:+.3f}]"
 
 
+def _paired_table(pairs: Sequence[dict[str, Any]]) -> list[str]:
+    lines = [
+        "| Comparison | n | ΔHit@5 [95% CI] | ΔMRR [95% CI] | McNemar (only A / only B) | p |",
+        "|---|---|---|---|---|---|",
+    ]
+    if not pairs:
+        lines.append("| (no comparable pair of configs in this run) | | | | | |")
+    for p in pairs:
+        m = p["mcnemar"]
+        primary = " (primary)" if (p["a"], p["b"]) == PRIMARY_PAIR else ""
+        lines.append(
+            f"| {p['a']} vs {p['b']}{primary} | {p['n']} "
+            f"| {_f(p['delta_hit_at_5'])} {_ci(p['ci_hit_at_5'])} "
+            f"| {_f(p['delta_mrr'])} {_ci(p['ci_mrr'])} | {m['a_only']} / {m['b_only']} "
+            f"| {m['p']:.3g} |"
+        )
+    return lines
+
+
 def render_markdown(summary: dict[str, Any]) -> str:
-    """summary.md: main, effort, difficulty, paired, cost-quality and error tables."""
+    """summary.md: main, effort, difficulty, paired, cost-quality, billed and error tables."""
     dirty = " (uncommitted changes to tracked files)" if summary["git_dirty"] else ""
     provenance = (
         f"Git {summary['git_commit'] or 'unknown'}{dirty}; corpus sha256 "
@@ -370,6 +430,14 @@ def render_markdown(summary: dict[str, Any]) -> str:
             f"| {c} | {q['n_ok']} | {q['n_error']} | {_f(q['hit_at_1'])} | {_f(q['hit_at_5'])} "
             f"| {_f(q['hit_at_10'])} | {_f(q['mrr'])} |"
         )
+    if any(c in SECONDARY_CONFIGS for c in summary["configs"]):
+        lines += [
+            "",
+            (
+                "B4-D and B5-D are secondary: B4 and B5 with B2 (dense) as the base retriever "
+                "instead of B3."
+            ),
+        ]
     lines += [
         "",
         "## Effort per query (mean / p50 / p95)",
@@ -398,22 +466,11 @@ def render_markdown(summary: dict[str, Any]) -> str:
             cells = difficulty["hit_at_5"][c]
             lines.append(f"| {c} | " + " | ".join(_f(cells[b]["hit_at_5"]) for b in BUCKETS) + " |")
 
-    lines += [
-        "",
-        "## Paired comparisons (queries that succeeded in both configs)",
-        "",
-        "| Comparison | n | ΔHit@5 [95% CI] | ΔMRR [95% CI] | McNemar (only A / only B) | p |",
-        "|---|---|---|---|---|---|",
-    ]
-    if not summary["paired"]:
-        lines.append("| (no comparable pair of configs in this run) | | | | | |")
-    for p in summary["paired"]:
-        m = p["mcnemar"]
-        lines.append(
-            f"| {p['a']} vs {p['b']} | {p['n']} | {_f(p['delta_hit_at_5'])} {_ci(p['ci_hit_at_5'])} "
-            f"| {_f(p['delta_mrr'])} {_ci(p['ci_mrr'])} | {m['a_only']} / {m['b_only']} "
-            f"| {m['p']:.3g} |"
-        )
+    lines += ["", "## Paired comparisons (queries that succeeded in both configs)", ""]
+    lines += _paired_table(summary["paired"])
+    if summary["paired_secondary"]:
+        lines += ["", "### Secondary comparisons (dense base)", ""]
+        lines += _paired_table(summary["paired_secondary"])
     lines += [
         "",
         "## Cost and quality",
@@ -427,6 +484,31 @@ def render_markdown(summary: dict[str, Any]) -> str:
             f"| {c} | {_f(cq['hit_at_5'])} | {_f(cq['mrr'])} | {_f(cq['mean_method_cost'], 5)} "
             f"| {_f(cq['mean_llm_calls'], 1)} |"
         )
+    lines += [
+        "",
+        "## Billed cost",
+        "",
+        (
+            "The tables above use computed cost: config prices times tokens for every LLM call, "
+            "cache hits included, so configs compare on what the method costs. Below are only "
+            "the calls this run actually sent (cache hits cost nothing), at the config prices "
+            "and as the API billed them; the two differ when a provider bills other than its "
+            "listed price. Rows run before billed costs were recorded have none (–)."
+        ),
+        "",
+        "| Config | Calls sent, computed ($) | Billed ($) | Billed vs computed |",
+        "|---|---|---|---|",
+    ]
+    for c in summary["configs"]:
+        b = summary["billed"][c]
+        billed, ratio = "–", "–"
+        if b["billed"] is not None:
+            billed = _f(b["billed"], 5)
+            if b["computed"]:
+                ratio = f"{b['billed'] / b['computed'] - 1:+.0%}"
+        elif b["unrecorded_rows"]:
+            billed = f"– ({b['unrecorded_rows']} rows not recorded)"
+        lines.append(f"| {c} | {_f(b['computed'], 5)} | {billed} | {ratio} |")
     lines += ["", "## Errors", "", "| Config | Errors | Examples |", "|---|---|---|"]
     for c in summary["configs"]:
         examples = "; ".join(summary["error_examples"][c]).replace("|", "\\|")
@@ -759,7 +841,7 @@ def log_to_mlflow(run_dir: Path, meta: dict[str, Any], run_cfg: RunConfig) -> di
         parent = client.create_run(experiment_id, run_name=meta["run_id"]).info.run_id
         client.log_batch(parent, params=params)
     paired: dict[str, float | None] = {}
-    for p in summary["paired"]:
+    for p in summary["paired"] + summary["paired_secondary"]:
         key = f"{p['a']}_vs_{p['b']}"
         paired[f"{key}.n"] = p["n"]
         paired[f"{key}.mcnemar_p"] = p["mcnemar"]["p"]

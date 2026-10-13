@@ -269,7 +269,7 @@ def rrf(rankings: Sequence[Sequence[str]], *, k: int = RRF_K, top_k: int = TOP_K
 
 
 def fuse_runs(runs: Sequence[Sequence[str]]) -> list[str]:
-    """The final ranking of B4, B5 and B5-U: RRF over the B3 list of every query run."""
+    """The final ranking of B4, B5 and their variants: RRF over every query's base ranking."""
     return rrf(runs)
 
 
@@ -310,6 +310,7 @@ class Trace:
             "completion_tokens": self.usage.completion_tokens,
             "method_cost": self.usage.method_cost,
             "money_spent": self.usage.money_spent,
+            "billed_cost": self.usage.billed_cost,
             "latency_s": self.latency_s,
             "errors": self.errors,
             "prompt_hashes": self.prompt_hashes,
@@ -328,6 +329,12 @@ class Retriever(Protocol):
     name: str
 
     def retrieve(self, query: str) -> Result: ...
+
+
+class Ranker(Protocol):
+    """The base of B4 and B5: one query in, one ranking out (B3, or B2 for the -D variants)."""
+
+    def rank(self, query: str) -> list[str]: ...
 
 
 class _SingleQuery:
@@ -411,14 +418,22 @@ def parse_rewrites(text: str, *, original: str, limit: int) -> list[str]:
 
 
 class RewriteRetriever:
-    """B4: one agent call proposes up to max_queries - 1 rewrites; B3 on each; fused."""
+    """B4: one agent call proposes up to max_queries - 1 rewrites; B3 on each; fused.
 
-    name = "B4"
+    B4-D is the same with B2 as the base retriever instead of B3.
+    """
 
     def __init__(
-        self, hybrid: HybridRetriever, agent: ChatModel, *, max_queries: int, prompt: Prompt
+        self,
+        base: Ranker,
+        agent: ChatModel,
+        *,
+        max_queries: int,
+        prompt: Prompt,
+        name: str = "B4",
     ) -> None:
-        self.hybrid = hybrid
+        self.name = name
+        self.base = base
         self.agent = agent
         self.max_queries = max_queries
         self.prompt = prompt
@@ -438,6 +453,6 @@ class RewriteRetriever:
                 trace.errors.append(f"rewrite_parse_error: {exc}; reply: {reply.text[:200]!r}")
         trace.queries = [query, *rewrites]
         trace.budget_used = len(trace.queries)
-        ranking = fuse_runs([self.hybrid.rank(q) for q in trace.queries])
+        ranking = fuse_runs([self.base.rank(q) for q in trace.queries])
         trace.latency_s = time.perf_counter() - start
         return Result(ranking, trace)

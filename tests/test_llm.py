@@ -55,8 +55,13 @@ def test_cache_hit_reuses_reply_and_still_counts_method_cost(
     assert (first.cached, second.cached) == (False, True)
     assert second.text == first.text == "The answer is 42."
     cost = token_cost(model, 4, 4)
-    assert first.usage == Usage(
-        calls=1, prompt_tokens=4, completion_tokens=4, method_cost=cost, money_spent=cost
+    assert first.usage == Usage(  # no billed cost reported, so the computed one stands in
+        calls=1,
+        prompt_tokens=4,
+        completion_tokens=4,
+        method_cost=cost,
+        money_spent=cost,
+        billed_cost=cost,
     )
     assert second.usage == Usage(
         calls=1, cache_hits=1, prompt_tokens=4, completion_tokens=4, method_cost=cost
@@ -249,7 +254,10 @@ def test_billed_cost_is_stored_next_to_the_computed_cost_and_counts_against_the_
             (computed, 0.9999)
         ]
     assert ledger.spent == pytest.approx(0.9999)  # billed, not the ~$0.00001 computed
-    assert out.usage.money_spent == computed  # Usage keeps the config-price cost
+    assert out.usage.money_spent == computed  # Usage keeps the config-price cost...
+    assert out.usage.billed_cost == 0.9999  # ...and the billed one beside it
+    again = client.complete(MSGS)
+    assert again.cached and again.usage.billed_cost == again.usage.money_spent == 0.0
     with pytest.raises(BudgetExceeded):  # computed spend alone would leave ~$1 of the cap
         client.complete(OTHER_MSGS)
     assert len(fake.calls) == 1

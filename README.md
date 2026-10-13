@@ -38,8 +38,9 @@ python -m rk report       runs/<timestamp>
 A run stores one row per configuration and query in `data/results.sqlite`
 (tables `runs` and `query_results`), writes a portable copy to
 `runs/<timestamp>/per_query/`, and summarises it in `summary.md` and
-`summary.json`. To resume an interrupted run, pass `--run-dir runs/<timestamp>`;
-add `--retry-errors` to redo the rows that ended in an LLM error.
+`summary.json`. To resume an interrupted run, or add configurations to a run,
+pass `--run-dir runs/<timestamp>`; add `--retry-errors` to redo the rows that
+ended in an LLM error.
 
 ## Experiment tracking
 

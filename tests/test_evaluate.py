@@ -24,6 +24,7 @@ from rk.evaluate import (
     SUMMARY_MD,
     EvalError,
     bucket,
+    connect,
     git_state,
     mcnemar_exact,
     ok_row,
@@ -114,7 +115,7 @@ def _paraphraser() -> FakeLLM:
     return FakeLLM(reply)
 
 
-def agent(*, failing_proposal: str | None = None) -> FakeLLM:
+def agent(*, failing_proposal: str | None = None, billed_cost: float | None = None) -> FakeLLM:
     """Rewrites for B4; for B5, one search then stop. Raises for one proposal if asked."""
 
     def reply(messages: list[dict[str, str]]) -> str:
@@ -125,7 +126,7 @@ def agent(*, failing_proposal: str | None = None) -> FakeLLM:
             return STOP if '\n2. "' in prompt else SEARCH
         return REWRITES
 
-    return FakeLLM(reply)
+    return FakeLLM(reply, billed_cost=billed_cost)
 
 
 @pytest.fixture
@@ -163,14 +164,21 @@ def test_llm_errors_mark_rows_and_are_left_out_of_paired_stats(cfg: Config) -> N
 
     rows = _rows(cfg, run_dir)
     errors = [(r["config"], r["qid"]) for r in rows if r["status"] == "error"]
-    assert errors == [("B4", Q2), ("B5", Q2), ("B5-U", Q2)]
+    llm_configs = ["B4", "B4-D", "B5", "B5-D", "B5-U"]
+    assert errors == [(c, Q2) for c in llm_configs]
     assert all(r["error"] == "LLMError: simulated outage" for r in rows if r["status"] == "error")
     summary = json.loads((run_dir / SUMMARY_JSON).read_text(encoding="utf-8"))
-    assert summary["errors"] == {"B1": 0, "B2": 0, "B3": 0, "B4": 1, "B5": 1, "B5-U": 1}
+    assert summary["errors"] == {c: int(c in llm_configs) for c in CONFIG_ORDER}
     assert {(p["a"], p["b"]): p["n"] for p in summary["paired"]} == {
         ("B4", "B3"): 2,
         ("B5", "B4"): 2,
         ("B5-U", "B5"): 2,
+    }
+    assert {(p["a"], p["b"]): p["n"] for p in summary["paired_secondary"]} == {
+        ("B2", "B3"): 3,
+        ("B4-D", "B2"): 2,
+        ("B5-D", "B2"): 2,
+        ("B5-D", "B4-D"): 2,
     }
     assert summary["quality"]["B4"]["n_ok"] == 2
 
@@ -194,7 +202,7 @@ def test_retry_errors_redoes_only_the_errored_rows(cfg: Config) -> None:
         for r in after
         if r["finished_at"] != before[(r["config"], r["qid"])]
     }
-    assert redone <= {("B4", Q2), ("B5", Q2), ("B5-U", Q2)}
+    assert redone <= {(c, Q2) for c in ("B4", "B4-D", "B5", "B5-D", "B5-U")}
     meta = json.loads((run_dir / RUN_FILE).read_text(encoding="utf-8"))
     assert [r["retry_errors"] for r in meta["resumed"]] == [False, True]
 
@@ -203,7 +211,7 @@ def test_rerunning_into_a_run_directory_resumes(cfg: Config) -> None:
     first = agent()
     run_dir = run_eval(cfg, first, FakeEncoder(), limit=1, log_mlflow=False)
     rows = _rows(cfg, run_dir)
-    assert len(rows) == len(CONFIG_ORDER)  # one query, six configs
+    assert len(rows) == len(CONFIG_ORDER)  # one query, every config
     assert {r["qid"] for r in rows} == {make_qid(0, ORDER[0])}  # --limit follows the seeded order
     done_proposal = _proposals(first)
 
@@ -212,6 +220,78 @@ def test_rerunning_into_a_run_directory_resumes(cfg: Config) -> None:
 
     assert len(_rows(cfg, run_dir)) == 3 * len(CONFIG_ORDER)
     assert _proposals(later).isdisjoint(done_proposal)  # the finished query wasn't redone
+
+
+def test_new_configs_can_be_added_to_an_existing_run(cfg: Config) -> None:
+    primary = ["B1", "B2", "B3", "B4", "B5", "B5-U"]
+    run_dir = run_eval(cfg, agent(), FakeEncoder(), configs=primary, log_mlflow=False)
+    before = {(r["config"], r["qid"]): r["finished_at"] for r in _rows(cfg, run_dir)}
+
+    added = agent()
+    run_eval(cfg, added, FakeEncoder(), configs=["B4-D", "B5-D"], run_dir=run_dir, log_mlflow=False)
+
+    rows = _rows(cfg, run_dir)
+    assert len(rows) == 3 * len(CONFIG_ORDER)
+    kept = {(r["config"], r["qid"]): r["finished_at"] for r in rows if r["config"] in primary}
+    assert kept == before  # the earlier configs' rows weren't redone
+    assert added.calls  # the new ones were
+    summary = json.loads((run_dir / SUMMARY_JSON).read_text(encoding="utf-8"))
+    assert summary["configs"] == list(CONFIG_ORDER)
+    assert [(p["a"], p["b"]) for p in summary["paired_secondary"]] == [
+        ("B2", "B3"),
+        ("B4-D", "B2"),
+        ("B5-D", "B2"),
+        ("B5-D", "B4-D"),
+    ]
+    markdown = (run_dir / SUMMARY_MD).read_text(encoding="utf-8")
+    assert "| B5 vs B4 (primary) |" in markdown
+    assert "### Secondary comparisons (dense base)" in markdown
+    assert "B4-D and B5-D are secondary" in markdown
+
+
+def test_billed_cost_is_reported_apart_from_the_computed_cost(cfg: Config) -> None:
+    run_dir = run_eval(cfg, agent(billed_cost=0.01), FakeEncoder(), log_mlflow=False)
+
+    b4 = [r for r in _rows(cfg, run_dir) if r["config"] == "B4"]
+    assert all(r["billed_cost"] == pytest.approx(0.01 * r["llm_calls"]) for r in b4)
+    summary = json.loads((run_dir / SUMMARY_JSON).read_text(encoding="utf-8"))
+    assert summary["billed"]["B1"] == {"computed": 0.0, "billed": 0.0, "unrecorded_rows": 0}
+    assert summary["billed"]["B4"]["billed"] == pytest.approx(0.03)
+    computed = sum(r["money_spent"] for r in b4)
+    assert summary["billed"]["B4"]["computed"] == pytest.approx(computed)
+    # The cost tables stay on computed cost.
+    assert summary["cost_quality"]["B4"]["mean_method_cost"] == pytest.approx(computed / 3)
+    assert "## Billed cost" in (run_dir / SUMMARY_MD).read_text(encoding="utf-8")
+
+
+def test_an_older_results_database_gets_the_billed_column(tmp_path: Path) -> None:
+    path = tmp_path / "old.sqlite"
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("CREATE TABLE query_results (run_id TEXT, config TEXT, llm_calls INTEGER)")
+        conn.execute("INSERT INTO query_results VALUES ('r', 'B4', 1)")
+        conn.commit()
+
+    with closing(connect(path)) as conn:
+        columns = [r["name"] for r in conn.execute("PRAGMA table_info(query_results)")]
+        assert "billed_cost" in columns
+        assert conn.execute("SELECT billed_cost FROM query_results").fetchone()[0] is None
+
+
+def test_rows_without_a_billed_cost_are_reported_as_not_recorded(cfg: Config) -> None:
+    run_dir = run_eval(cfg, agent(), FakeEncoder(), log_mlflow=False)
+    with closing(sqlite3.connect(cfg.run.results_db)) as conn:  # as rows from before billing
+        conn.execute("UPDATE query_results SET billed_cost = NULL")
+        conn.commit()
+
+    summary = report(run_dir)
+
+    assert summary["billed"]["B4"] == {
+        "computed": pytest.approx(summary["billed"]["B4"]["computed"]),
+        "billed": None,
+        "unrecorded_rows": 3,
+    }
+    assert summary["billed"]["B1"]["billed"] == 0.0  # no LLM calls, so nothing to bill
+    assert "– (3 rows not recorded)" in (run_dir / SUMMARY_MD).read_text(encoding="utf-8")
 
 
 def test_budget_exceeded_stops_the_whole_run_after_writing_the_summary(cfg: Config) -> None:
@@ -274,6 +354,11 @@ def test_end_to_end_cli_run_and_report_with_mlflow(
 ) -> None:
     from mlflow import MlflowClient
 
+    # An empty working directory, so the check at the end sees only what this test
+    # wrote there (the repo root holds a real run's mlartifacts/).
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.safe_dump(_config_dict(tmp_path)), encoding="utf-8")
     monkeypatch.setattr(cli, "LLMClient", lambda model, cache, ledger: agent())
@@ -296,6 +381,7 @@ def test_end_to_end_cli_run_and_report_with_mlflow(
     summary = json.loads((run_dir / SUMMARY_JSON).read_text(encoding="utf-8"))
     assert summary["configs"] == list(CONFIG_ORDER)
     assert summary["difficulty"]["bucket_sizes"] and len(summary["paired"]) == 3
+    assert len(summary["paired_secondary"]) == 4
     markdown = (run_dir / SUMMARY_MD).read_text(encoding="utf-8")
     headings = (
         "Retrieval quality",
@@ -303,6 +389,7 @@ def test_end_to_end_cli_run_and_report_with_mlflow(
         "Hit@5 by difficulty",
         "Paired comparisons",
         "Cost and quality",
+        "Billed cost",
         "Errors",
     )
     for heading in headings:
@@ -326,6 +413,7 @@ def test_end_to_end_cli_run_and_report_with_mlflow(
     assert children["B4"].data.metrics["hit_at_5"] == summary["quality"]["B4"]["hit_at_5"]
     assert children["B5"].data.params["model.encoder_revision"] == FakeEncoder.revision
     assert "B5_vs_B4.mcnemar_p" in parent.data.metrics
+    assert "B5-D_vs_B4-D.mcnemar_p" in parent.data.metrics  # secondary comparisons too
     child_artifacts = {a.path for a in client.list_artifacts(children["B1"].info.run_id)}
     assert "B1.jsonl" in child_artifacts
     parent_artifacts = {a.path for a in client.list_artifacts(parent.info.run_id)}

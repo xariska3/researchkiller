@@ -29,8 +29,8 @@ researchkiller/
 ¦   +-- corpus.py         # OpenAlex client, corpus build, dedupe, freeze
 ¦   +-- targets.py        # target selection
 ¦   +-- bench.py          # paraphrase generation + filters
-¦   +-- retrieval.py      # indexes, B1-B4, fusion
-¦   +-- agent.py          # B5, B5-U, all six configs wired from the config
+¦   +-- retrieval.py      # indexes, B1-B4 (and B4-D), fusion
+¦   +-- agent.py          # B5, B5-U, B5-D, all eight configs wired from the config
 ¦   +-- evaluate.py       # runner, metrics, paired statistics
 ¦   +-- cli.py            # CLI, run as `python -m rk`
 ¦   +-- __main__.py       # enables `python -m rk`
@@ -79,8 +79,10 @@ than every model's `training_cutoff`.
   `openrouter_metadata`, else the top-level `provider` string) is stored with
   the cached reply, returned on cache hits too, and recorded in every trace
   and spend row.
-- Usage tracking returns two numbers: **method cost** (counted even on cache
-  hits, so reported cost reflects the method) and **money spent** (real calls only).
+- Usage tracking returns three numbers: **method cost** (counted even on cache
+  hits, so reported cost reflects the method), **money spent** (real calls
+  only, at the config prices) and **billed cost** (what the API charged for
+  those same calls; money spent where it reports nothing).
 - `Ledger` with a hard cap (`run.budget_cap`, default 20) on spend **cumulative
   across all commands**: every real call appends a row (timestamp, command,
   model, prompt_tokens, completion_tokens, cost, billed_cost, provider) to a
@@ -287,9 +289,15 @@ hashes). Every ranking breaks ties by doc id.
 | B4 | One agent-model call returns JSON `{"queries": [...]}`: at most `max_queries - 1` rewrites, duplicates removed. Run B3 on the original + rewrites; RRF-fuse all lists. On a parse failure, the original query alone, with the error recorded |
 | B5 | The original query runs first with no LLM call. Each agent step sees the queries so far with the top-10 titles of each (titles only, to bound tokens) and returns `{"action": "search", "query": ...}` or `{"action": "stop", "reason": ...}`. Hard limits: `max_queries` queries in total and `max_llm_calls_agent` calls. A repeated query counts toward the budget but isn't re-run; a parse failure stops the loop and is recorded. Fused with exactly the same function as B4 |
 | B5-U | B5 with the larger unconstrained budgets, reported separately |
+| B4-D | Secondary: B4 with each query run through B2 instead of B3; same rewrites (the same agent request, so the LLM cache returns B4's), same fusion |
+| B5-D | Secondary: B5 with searches, and the top-10 titles the agent sees, from B2 instead of B3; same budgets and prompt |
 
 Prompts (`rewrite.txt`, `agent_step.txt`) frame the task as finding prior work
 for a research proposal and never mention a benchmark or a target paper.
+
+The -D variants were added after the pilot, where B3 scored below B2 (Hit@5
+0.733 vs 0.800 on 30 queries), and decided before the full run. B3 stays as
+specified; the -D variants show whether B4 and B5 gain more on a dense base.
 
 **Indexes** (`python -m rk build-index`): document text is "title. abstract".
 BM25 gets the project's own tokenisation (`content_tokens` + `stem`). The
@@ -311,28 +319,37 @@ dtype or max sequence length differs from the index's.
 - Per query and config: target rank (first position of the target or any
   alias in the top-100, else none), Hit@1/5/10, reciprocal rank, and the trace
   fields (queries issued, LLM calls, prompt/completion tokens, method cost,
-  latency, stop reason).
+  money spent, billed cost, latency, stop reason).
 - **Errors**: an LLM error marks that row `status=error` and the run continues
   (other errors, including `BudgetExceeded`, stop it after the summary is
   written). `--retry-errors` with `--run-dir` redoes only errored rows; a rerun
   into the same `--run-dir` skips finished rows, and refuses if the corpus,
-  bench, index, retrieval config, agent model or retrieval prompts changed.
+  bench, index, retrieval config, agent model or retrieval prompts changed. A
+  rerun can add configs to a run (`--configs B4-D,B5-D --run-dir ...`).
 - **Results database** (`run.results_db`, default `data/results.sqlite`):
   tables `runs` (run metadata) and `query_results` (one row per run, config and
   query), written as rows finish. `per_query/<config>.jsonl` is a portable
   copy. `python -m rk report` rebuilds the summary from the database with SQL.
+  A database from before billed costs were recorded gets the `billed_cost`
+  column added on open; its earlier rows have none.
 - **Metrics**: per config Hit@1/5/10 and MRR, and mean/p50/p95 of queries
   issued, LLM calls, tokens, method cost and latency (successful rows only).
 - **Difficulty**: each query's B1 target rank is its difficulty (recorded,
   **never filtered on**). Hit@5 per config within B1-rank buckets 1, 2–10,
   11–100 and not found (only when B1 is part of the run).
-- **Paired comparisons**: B4 vs B3, B5 vs B4, B5-U vs B5, on queries that
-  succeeded in both configs: seeded paired bootstrap (10,000 resamples,
-  `run.seed`) 95% CI on ΔHit@5 and ΔMRR, and an exact McNemar test on Hit@5.
-- A cost–quality table: Hit@5 and MRR next to mean method cost per query.
+- **Paired comparisons**: B4 vs B3, **B5 vs B4 (the primary comparison)**,
+  B5-U vs B5; secondary: B2 vs B3, B4-D vs B2, B5-D vs B2, B5-D vs B4-D. All on
+  queries that succeeded in both configs: seeded paired bootstrap (10,000
+  resamples, `run.seed`) 95% CI on ΔHit@5 and ΔMRR, and an exact McNemar test
+  on Hit@5.
+- A cost–quality table: Hit@5 and MRR next to mean method cost per query. Cost
+  tables use computed cost (config prices); billed cost is reported
+  separately, per config: the calls the run actually sent, at the config
+  prices next to what the API billed, with a note on why they differ.
 - Outputs per run in `runs/<timestamp>/`: `run.json`, `config.yaml`,
   `per_query/<config>.jsonl`, `summary.json` and `summary.md` (main,
-  effort, difficulty, paired, cost–quality and error tables).
+  effort, difficulty, paired (primary and secondary), cost–quality, billed
+  cost and error tables).
 - **MLflow** (core dependency) with the documented default SQLite backend
   (`run.mlflow_tracking_uri`, default `sqlite:///mlflow.db` at the repo root,
   artifacts in `mlartifacts/` beside it): one parent run per benchmark run and
