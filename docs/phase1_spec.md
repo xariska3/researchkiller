@@ -269,7 +269,9 @@ cost; skipped targets had no attempt, so they aren't in the attempt counts).
 rerun resumes: targets already accepted or exhausted are skipped, an
 interrupted target continues with its next attempt, and outputs made with other
 prompts, models or another corpus are refused. Stop at `n_targets` accepted
-queries. The BM25 rank of each target is not computed here (see Evaluation).
+queries. If the frozen targets run out first, the bench is smaller: no targets
+are added, since their references aren't in the corpus and they would be
+easier. The BM25 rank of each target is not computed here (see Evaluation).
 
 ## Retrieval configurations (`retrieval.py`, `agent.py`)
 All implement one interface, `retrieve(query)`, returning a ranked list of up
