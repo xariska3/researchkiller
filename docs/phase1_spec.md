@@ -342,6 +342,11 @@ dtype or max sequence length differs from the index's.
   queries that succeeded in both configs: seeded paired bootstrap (10,000
   resamples, `run.seed`) 95% CI on ΔHit@5 and ΔMRR, and an exact McNemar test
   on Hit@5.
+- **Analysis plan**: the full run's analyses are fixed in
+  `docs/analysis_plan.md`, written before the full run. Besides the tables
+  above, it adds every config vs B2, the main table and primary comparison
+  without the pilot targets, and a check of which targets the bench exhausts;
+  `python -m rk report` doesn't compute those three yet.
 - A cost–quality table: Hit@5 and MRR next to mean method cost per query. Cost
   tables use computed cost (config prices); billed cost is reported
   separately, per config: the calls the run actually sent, at the config
