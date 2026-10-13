@@ -13,6 +13,7 @@ import itertools
 import re
 import types
 import typing
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -21,6 +22,8 @@ from typing import Any, TypeVar
 import yaml
 
 T = TypeVar("T")
+
+ENCODER_DTYPES = ("float32", "float16", "bfloat16")  # torch dtype names
 
 
 class ConfigError(ValueError):
@@ -59,9 +62,16 @@ class BenchConfig:
     max_content_jaccard: float
     seed: int
     out_dir: Path
+    # A title content stem is banned from proposals only if it is rarer than this
+    # (document frequency as a fraction of the corpus); 1.0 bans every title stem.
+    title_stem_max_df: float = 1.0
 
     def __post_init__(self) -> None:
         _require(self.n_targets >= 1, "n_targets must be >= 1")
+        _require(
+            0.0 < self.title_stem_max_df <= 1.0,
+            "title_stem_max_df is a fraction of documents, so must be in (0, 1]",
+        )
         _require(self.max_attempts_per_target >= 1, "max_attempts_per_target must be >= 1")
         _require(
             0.0 <= self.max_distinctive_overlap <= 1.0,
@@ -80,11 +90,21 @@ class RetrievalConfig:
     index_dir: Path
     encoder_revision: str  # Hugging Face commit hash of the encoder, for reproducibility
     encoder: str = "BAAI/bge-small-en-v1.5"
+    encoder_dtype: str = "float32"  # weights and activations; one of ENCODER_DTYPES
+    encoder_max_seq_length: int | None = None  # longer inputs are truncated; None: model default
 
     def __post_init__(self) -> None:
         _require(
             re.fullmatch(r"[0-9a-f]{40}", self.encoder_revision) is not None,
             "encoder_revision must be a 40-character Hugging Face commit hash",
+        )
+        _require(
+            self.encoder_dtype in ENCODER_DTYPES,
+            f"encoder_dtype must be one of {list(ENCODER_DTYPES)}, got {self.encoder_dtype!r}",
+        )
+        _require(
+            self.encoder_max_seq_length is None or self.encoder_max_seq_length >= 1,
+            "encoder_max_seq_length must be >= 1 (or null for the model's default)",
         )
         _require(self.max_queries >= 1, "max_queries must be >= 1")
         _require(self.max_llm_calls_agent >= 1, "max_llm_calls_agent must be >= 1")
@@ -126,10 +146,17 @@ class ModelConfig:
     max_tokens: int
     seed: int
     training_cutoff: date  # targets must be published after this
+    # OpenRouter endpoint slug to pin (e.g. "openai", "novita/fp8"), sent with fallbacks
+    # disabled; None lets OpenRouter route.
+    provider: str | None = None
 
     def __post_init__(self) -> None:
         _require(bool(self.name.strip()), "name must not be empty")
         _require(bool(self.family.strip()), "family must not be empty")
+        _require(
+            self.provider is None or bool(self.provider.strip()),
+            "provider must not be empty (leave it out to let OpenRouter route)",
+        )
         _require(self.price_in_per_m >= 0 and self.price_out_per_m >= 0, "prices must be >= 0")
         _require(self.temperature >= 0, "temperature must be >= 0")
         _require(self.max_tokens >= 1, "max_tokens must be >= 1")
@@ -192,10 +219,31 @@ def check_training_cutoffs(target_from_date: date, models: dict[str, ModelConfig
         )
 
 
-def load_config(path: str | Path) -> Config:
-    """Read a YAML config file into a validated Config."""
+def load_config(path: str | Path, overrides: Sequence[str] = ()) -> Config:
+    """Read a YAML config file into a validated Config.
+
+    `overrides` are "section.key=value" strings (the CLI's --set), applied before
+    validation; values are parsed as YAML, so numbers and dates keep their types.
+    """
     text = Path(path).read_text(encoding="utf-8")
-    return config_from_dict(yaml.load(text, Loader=_UniqueKeyLoader))
+    data = yaml.load(text, Loader=_UniqueKeyLoader)
+    for override in overrides:
+        apply_override(data, override)
+    return config_from_dict(data)
+
+
+def apply_override(data: Any, override: str) -> None:
+    """Set one "section.key=value" in a parsed config mapping, in place."""
+    dotted, sep, raw = override.partition("=")
+    keys = dotted.strip().split(".")
+    if not sep or not all(keys):
+        raise ConfigError(f"override {override!r}: expected section.key=value")
+    node = data
+    for key in keys[:-1]:
+        if not isinstance(node, dict) or not isinstance(node.get(key), dict):
+            raise ConfigError(f"override {override!r}: no section {key!r}")
+        node = node[key]
+    node[keys[-1]] = yaml.load(raw, Loader=_UniqueKeyLoader)
 
 
 def config_from_dict(data: Any) -> Config:

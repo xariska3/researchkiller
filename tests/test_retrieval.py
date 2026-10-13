@@ -3,20 +3,23 @@ from __future__ import annotations
 import itertools
 import json
 import shutil
+import sys
+import types
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pytest
 import yaml
 from bench_data import ABSTRACTS, T1, T2, TITLES, corpus_records, target_rows
-from conftest import FakeEncoder, FakeLLM, corpus_config_dict
+from conftest import FakeEncoder, FakeLLM, corpus_config_dict, make_model_config
 
 from rk import cli, retrieval
 from rk.agent import AgentRetriever, make_retrievers, parse_action
 from rk.config import Config, config_from_dict
 from rk.corpus import freeze
-from rk.llm import load_prompt
+from rk.llm import LLMCache, LLMClient, load_prompt
 from rk.retrieval import (
     INDEX_MANIFEST,
     BM25Retriever,
@@ -61,9 +64,9 @@ def hybrid(index: Index) -> HybridRetriever:
 
 
 def _agent(
-    hybrid: Any, replies: Any, *, max_queries: int, max_calls: int
+    hybrid: Any, replies: Any, *, max_queries: int, max_calls: int, provider: str | None = None
 ) -> tuple[AgentRetriever, FakeLLM]:
-    llm = FakeLLM(replies)
+    llm = FakeLLM(replies, provider=provider)
     retriever = AgentRetriever(
         hybrid,
         llm,
@@ -123,16 +126,95 @@ def test_index_is_never_overwritten(cfg: Config, index: Index) -> None:
 
 
 @pytest.mark.parametrize(
-    ("attribute", "value"),
-    [("name", "another-encoder"), ("revision", "1111111111111111111111111111111111111111")],
+    ("attribute", "value", "message"),
+    [
+        ("name", "another-encoder", "encoder 'fake-encoder' in the index but 'another-encoder'"),
+        ("revision", "1" * 40, f"encoder_revision '{FakeEncoder.revision}' in the index but '1"),
+        ("dtype", "float16", "encoder_dtype 'float32' in the index but 'float16' now"),
+        ("max_seq_length", 512, "encoder_max_seq_length None in the index but 512 now"),
+    ],
 )
-def test_dense_retriever_refuses_another_encoder_or_revision(
-    index: Index, attribute: str, value: str
+def test_dense_retriever_refuses_other_encoder_settings(
+    index: Index, attribute: str, value: Any, message: str
 ) -> None:
     other = FakeEncoder()
     setattr(other, attribute, value)
-    with pytest.raises(RetrievalError, match="built with encoder 'fake-encoder' at revision"):
+    with pytest.raises(RetrievalError, match=f"other encoder settings \\({message}"):
         DenseRetriever(index, other)
+
+
+def test_index_manifest_records_encoder_dtype_and_max_seq_length(cfg: Config) -> None:
+    encoder = FakeEncoder()
+    encoder.dtype, encoder.max_seq_length = "float16", 512
+    manifest = build_index(cfg, encoder)
+    saved = json.loads((cfg.retrieval.index_dir / INDEX_MANIFEST).read_text(encoding="utf-8"))
+    assert saved == manifest
+    assert (saved["encoder_dtype"], saved["encoder_max_seq_length"]) == ("float16", 512)
+    DenseRetriever(load_index(cfg), encoder)  # the same settings are accepted
+
+
+@pytest.fixture
+def fake_sentence_transformers(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    """Stand-ins for torch and sentence_transformers; returns the models built."""
+    built: list[Any] = []
+
+    class SentenceTransformer:
+        def __init__(self, name: str, **kwargs: Any) -> None:
+            self.name, self.kwargs = name, kwargs
+            self.max_seq_length = 32768  # Qwen3-Embedding's own default
+            self.encoded: list[list[str]] = []
+            built.append(self)
+
+        def encode(self, texts: list[str], **kwargs: Any) -> np.ndarray:
+            self.encoded.append(list(texts))
+            return np.ones((len(texts), 4), dtype=np.float16)
+
+    torch = types.SimpleNamespace(
+        cuda=types.SimpleNamespace(is_available=lambda: False),
+        float32="torch.float32",
+        float16="torch.float16",
+        bfloat16="torch.bfloat16",
+    )
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    st = types.SimpleNamespace(SentenceTransformer=SentenceTransformer)
+    monkeypatch.setitem(sys.modules, "sentence_transformers", st)
+    return built
+
+
+def test_encoder_gets_dtype_max_seq_length_and_a_query_only_instruction(
+    tmp_path: Path, fake_sentence_transformers: list[Any]
+) -> None:
+    data = _config_dict(tmp_path)
+    data["retrieval"].update(
+        encoder="Qwen/Qwen3-Embedding-0.6B",
+        encoder_dtype="float16",
+        encoder_max_seq_length=512,
+        query_prefix="Instruct: Find papers on the same idea\nQuery:",
+    )
+    cfg = config_from_dict(data)
+
+    encoder = retrieval.make_encoder(cfg.retrieval)
+    (model,) = fake_sentence_transformers
+    vectors = encoder.encode_queries(["a proposal"])
+    encoder.encode_docs(["Title. Abstract."])
+
+    assert model.name == "Qwen/Qwen3-Embedding-0.6B"
+    assert model.kwargs["revision"] == cfg.retrieval.encoder_revision
+    assert model.kwargs["model_kwargs"] == {"dtype": "torch.float16"}
+    assert (encoder.dtype, encoder.max_seq_length, model.max_seq_length) == ("float16", 512, 512)
+    assert model.encoded == [  # the model card's format for queries; documents get no prefix
+        ["Instruct: Find papers on the same idea\nQuery:a proposal"],
+        ["Title. Abstract."],
+    ]
+    assert vectors.dtype == np.float32  # fp16 model, float32 vectors for FAISS
+
+
+def test_encoder_without_a_max_seq_length_records_the_models_own(
+    tmp_path: Path, fake_sentence_transformers: list[Any]
+) -> None:
+    encoder = retrieval.make_encoder(config_from_dict(_config_dict(tmp_path)).retrieval)
+    assert (encoder.dtype, encoder.max_seq_length) == ("float32", 32768)
+    assert fake_sentence_transformers[0].kwargs["model_kwargs"] == {"dtype": "torch.float32"}
 
 
 # --- B1-B3 -------------------------------------------------------------------
@@ -194,6 +276,23 @@ def test_b4_caps_and_deduplicates_rewrites(hybrid: HybridRetriever) -> None:
     assert "Write up to 2 search queries" in llm.calls[0][-1]["content"]
     assert result.trace.prompt_hashes == {"rewrite": load_prompt("rewrite").sha256}
     assert result.doc_ids == fuse_runs([hybrid.rank(q) for q in result.trace.queries])
+
+
+def test_b4_and_b5_traces_record_who_served_each_llm_call(hybrid: HybridRetriever) -> None:
+    llm = FakeLLM([json.dumps({"queries": ["memory saving"]})], provider="Parasail")
+    b4 = RewriteRetriever(hybrid, llm, max_queries=3, prompt=load_prompt("rewrite"))
+    assert b4.retrieve(QUERY).trace.to_dict()["providers"] == ["Parasail"]
+
+    stop = '{"action": "stop", "reason": "covered"}'
+    b5, _ = _agent(
+        hybrid, [_search("memory saving"), stop], max_queries=5, max_calls=6, provider="Parasail"
+    )
+    trace = b5.retrieve(QUERY).trace.to_dict()
+    assert trace["providers"] == ["Parasail", "Parasail"]
+    assert trace["llm_calls"] == 2
+
+    b1 = BM25Retriever(hybrid.bm25.index)
+    assert b1.retrieve(QUERY).trace.to_dict()["providers"] == []  # no LLM, no provider
 
 
 # --- B5 ----------------------------------------------------------------------
@@ -303,20 +402,68 @@ def test_b4_and_b5_share_the_fusion_function(
 # --- wiring, prompts, CLI ----------------------------------------------------
 
 
-def test_make_retrievers_wires_all_six_with_config_budgets(cfg: Config, index: Index) -> None:
+def test_make_retrievers_wires_all_eight_with_config_budgets(cfg: Config, index: Index) -> None:
     retrievers = make_retrievers(cfg, index, FakeEncoder(), FakeLLM([]))
-    assert list(retrievers) == ["B1", "B2", "B3", "B4", "B5", "B5-U"]
+    assert list(retrievers) == ["B1", "B2", "B3", "B4", "B5", "B5-U", "B4-D", "B5-D"]
     r = cfg.retrieval
     b4: Any = retrievers["B4"]
     b5: Any = retrievers["B5"]
     b5u: Any = retrievers["B5-U"]
-    assert b4.max_queries == r.max_queries
+    b4d: Any = retrievers["B4-D"]
+    b5d: Any = retrievers["B5-D"]
+    assert b4.max_queries == b4d.max_queries == r.max_queries
     assert (b5.max_queries, b5.max_llm_calls) == (r.max_queries, r.max_llm_calls_agent)
+    assert (b5d.max_queries, b5d.max_llm_calls) == (r.max_queries, r.max_llm_calls_agent)
     assert (b5u.max_queries, b5u.max_llm_calls) == (
         r.max_queries_unconstrained,
         r.max_llm_calls_agent_unconstrained,
     )
     assert {name: ret.name for name, ret in retrievers.items()} == {n: n for n in retrievers}
+    # The -D variants differ only in their base retriever: B2 instead of B3.
+    assert b4.base is b5.base is b5u.base is retrievers["B3"]
+    assert b4d.base is b5d.base is retrievers["B2"]
+    assert b4d.prompt is b4.prompt and b5d.prompt is b5.prompt is b5u.prompt
+    assert b5d.titles is b5.titles
+
+
+def test_b4_d_reuses_b4s_rewrites_and_ranks_them_with_b2(
+    hybrid: HybridRetriever, llm_cache: LLMCache, make_ledger: Any, api_key: str
+) -> None:
+    fake = FakeLLM([json.dumps({"queries": ["memory saving", "fast attention"]})])
+    client = LLMClient(make_model_config(), llm_cache, make_ledger(), transport=fake.transport)
+    prompt = load_prompt("rewrite")
+    b4 = RewriteRetriever(hybrid, client, max_queries=3, prompt=prompt)
+    b4d = RewriteRetriever(hybrid.dense, client, max_queries=3, prompt=prompt, name="B4-D")
+
+    first, second = b4.retrieve(QUERY), b4d.retrieve(QUERY)
+
+    assert len(fake.calls) == 1  # B4-D's request is B4's, so the cache answers it
+    assert second.trace.queries == first.trace.queries == [QUERY, "memory saving", "fast attention"]
+    assert second.trace.usage.method_cost == first.trace.usage.method_cost > 0
+    assert second.trace.usage.money_spent == second.trace.usage.billed_cost == 0.0
+    assert first.doc_ids == fuse_runs([hybrid.rank(q) for q in first.trace.queries])
+    assert second.doc_ids == fuse_runs([hybrid.dense.rank(q) for q in second.trace.queries])
+    assert second.doc_ids != first.doc_ids
+
+
+def test_b5_d_searches_and_shows_titles_from_b2(cfg: Config, index: Index) -> None:
+    second = "reward model calibration"
+    llm = FakeLLM([_search(second), '{"action": "stop"}'])
+    retrievers = make_retrievers(cfg, index, FakeEncoder(), llm)
+    dense, hybrid = retrievers["B2"], retrievers["B3"]
+    assert isinstance(dense, DenseRetriever) and isinstance(hybrid, HybridRetriever)
+
+    result = retrievers["B5-D"].retrieve(QUERY)
+
+    history = llm.calls[1][-1]["content"].split("Searches so far")[1].split("You can run")[0]
+    shown = [line[len("   - ") :] for line in history.splitlines() if line.startswith("   - ")]
+    titles = {r["id"]: r["title"] for r in corpus_records()}
+
+    def top_titles(ranker: Any) -> list[str]:
+        return [titles[d] for q in (QUERY, second) for d in ranker.rank(q)[:10]]
+
+    assert shown == top_titles(dense) != top_titles(hybrid)
+    assert result.doc_ids == fuse_runs([dense.rank(q) for q in [QUERY, second]])
 
 
 @pytest.mark.parametrize("name", ["rewrite", "agent_step"])

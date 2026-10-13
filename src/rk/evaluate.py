@@ -5,8 +5,10 @@
 one finishes, so a rerun into the same run directory resumes, and
 --retry-errors redoes only the rows whose LLM call failed. `summarize` builds
 the summary from the database with SQL; paired statistics use only queries
-that succeeded in both configs. Every run is logged to MLflow as a parent run
-with one child run per config.
+that succeeded in both configs. The summary also has the analyses fixed in
+docs/analysis_plan.md: the robustness subset without the pilot targets, and
+the exhaustion check of the run's bench. Every run is logged to MLflow as a
+parent run with one child run per config.
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ import json
 import math
 import sqlite3
 import subprocess
+from collections import Counter
 from collections.abc import Iterable, Sequence
 from contextlib import closing
 from datetime import datetime, timezone
@@ -27,14 +30,30 @@ import numpy as np
 import yaml
 
 from rk.agent import make_retrievers
-from rk.bench import ACCEPTED_FILE, STATS_FILE
+from rk.bench import ACCEPTED_FILE, STATS_FILE, qid_position
 from rk.config import Config, RunConfig
 from rk.corpus import CORPUS_FILE, load_frozen_corpus
+from rk.exhaustion import exhaustion_check
 from rk.llm import ChatModel, LLMError, load_prompt
-from rk.retrieval import TOP_K, Encoder, Result, load_index
+from rk.retrieval import ENCODER_SETTINGS, TOP_K, Encoder, Result, load_index
 
-CONFIG_ORDER = ("B1", "B2", "B3", "B4", "B5", "B5-U")
-PAIRS = (("B4", "B3"), ("B5", "B4"), ("B5-U", "B5"))
+CONFIG_ORDER = ("B1", "B2", "B3", "B4", "B5", "B5-U", "B4-D", "B5-D")
+SECONDARY_CONFIGS = ("B4-D", "B5-D")  # B4 and B5 with B2 as the base instead of B3
+PRIMARY_PAIR = ("B5", "B4")  # (a, b): a minus b
+# docs/analysis_plan.md: the other comparisons, then every config vs B2 (B3 vs B2 is B2 vs B3).
+SECONDARY_PAIRS = (
+    ("B4", "B3"),
+    ("B5-U", "B5"),
+    ("B2", "B3"),
+    ("B4-D", "B2"),
+    ("B5-D", "B2"),
+    ("B5-D", "B4-D"),
+    ("B1", "B2"),
+    ("B4", "B2"),
+    ("B5", "B2"),
+    ("B5-U", "B2"),
+)
+PILOT_POSITIONS = 45  # qids A0000-A0044: the targets the bench design was tuned on
 HIT_KS = (1, 5, 10)
 BOOTSTRAP_RESAMPLES = 10_000
 BUCKETS = ("1", "2-10", "11-100", "not found")  # B1 rank of the target
@@ -83,6 +102,7 @@ CREATE TABLE IF NOT EXISTS query_results (
     completion_tokens INTEGER,
     method_cost REAL,
     money_spent REAL,
+    billed_cost REAL,
     latency_s REAL,
     stop_reason TEXT,
     trace TEXT,
@@ -95,17 +115,25 @@ CREATE TABLE IF NOT EXISTS query_results (
 _COLUMNS = (
     "run_id", "config", "qid", "target_id", "status", "error", "target_rank", "hit_at_1",
     "hit_at_5", "hit_at_10", "reciprocal_rank", "queries_issued", "llm_calls", "prompt_tokens",
-    "completion_tokens", "method_cost", "money_spent", "latency_s", "stop_reason", "trace",
-    "doc_ids", "finished_at",
+    "completion_tokens", "method_cost", "money_spent", "billed_cost", "latency_s", "stop_reason",
+    "trace", "doc_ids", "finished_at",
 )
 
 
 def connect(path: Path) -> sqlite3.Connection:
-    """The results database, created with its tables if needed."""
+    """The results database, created with its tables if needed.
+
+    A database from before billed costs were recorded gets the billed_cost
+    column added; its earlier rows keep NULL there.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
     conn.executescript(_SCHEMA)
+    columns = {r["name"] for r in conn.execute("PRAGMA table_info(query_results)")}
+    if "billed_cost" not in columns:
+        conn.execute("ALTER TABLE query_results ADD COLUMN billed_cost REAL")
+        conn.commit()
     return conn
 
 
@@ -149,6 +177,7 @@ def ok_row(run_id: str, config: str, query: dict[str, Any], result: Result) -> d
         "completion_tokens": trace.usage.completion_tokens,
         "method_cost": trace.usage.method_cost,
         "money_spent": trace.usage.money_spent,
+        "billed_cost": trace.usage.billed_cost,
         "latency_s": trace.latency_s,
         "stop_reason": trace.stop_reason,
         "trace": json.dumps(trace.to_dict(), ensure_ascii=False),
@@ -213,8 +242,13 @@ def bucket(rank: int | None) -> str:
 # --- summary -----------------------------------------------------------------
 
 
-def summarize(db_path: Path, run_id: str, *, seed: int) -> dict[str, Any]:
-    """Every table of the run summary, computed from the results database."""
+def summarize(
+    db_path: Path, run_id: str, *, seed: int, resumed: Sequence[dict[str, Any]] = ()
+) -> dict[str, Any]:
+    """Every table of the run summary, computed from the results database.
+
+    `resumed` is run.json's list of resumes (when, at which commit), for the header.
+    """
     with closing(connect(db_path)) as conn:
         run = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
         if run is None:
@@ -234,7 +268,7 @@ def summarize(db_path: Path, run_id: str, *, seed: int) -> dict[str, Any]:
         ).fetchall()
         ok = conn.execute(
             """
-            SELECT config, qid, target_rank, hit_at_5, reciprocal_rank,
+            SELECT config, qid, target_rank, hit_at_1, hit_at_5, hit_at_10, reciprocal_rank,
                    queries_issued AS queries, llm_calls,
                    prompt_tokens + completion_tokens AS tokens, method_cost, latency_s
             FROM query_results WHERE run_id = ? AND status = 'ok' ORDER BY config, qid
@@ -244,6 +278,18 @@ def summarize(db_path: Path, run_id: str, *, seed: int) -> dict[str, Any]:
         errors = conn.execute(
             "SELECT config, qid, error FROM query_results "
             "WHERE run_id = ? AND status = 'error' ORDER BY config, qid",
+            (run_id,),
+        ).fetchall()
+        # Calls actually sent in this run, at the config prices and as billed. A row
+        # without LLM calls cost nothing; one from before billing was recorded has NULL.
+        spend = conn.execute(
+            """
+            SELECT config,
+                   SUM(money_spent) AS computed,
+                   SUM(COALESCE(billed_cost, CASE WHEN llm_calls = 0 THEN 0.0 END)) AS billed,
+                   SUM(llm_calls > 0 AND billed_cost IS NULL) AS unrecorded
+            FROM query_results WHERE run_id = ? AND status = 'ok' GROUP BY config
+            """,
             (run_id,),
         ).fetchall()
 
@@ -256,6 +302,24 @@ def summarize(db_path: Path, run_id: str, *, seed: int) -> dict[str, Any]:
         c: {m: _spread([r[m] for r in by_config[c].values()]) for m in EFFORT} for c in configs
     }
     quality_by = {r["config"]: r for r in quality}
+    spend_by = {r["config"]: r for r in spend}
+
+    def billed(config: str) -> dict[str, Any]:
+        row = spend_by.get(config)
+        if row is None:  # no successful rows
+            return {"computed": None, "billed": None, "unrecorded_rows": 0}
+        return {
+            "computed": row["computed"],
+            "billed": None if row["unrecorded"] else row["billed"],
+            "unrecorded_rows": row["unrecorded"],
+        }
+
+    def paired(pairs: Sequence[tuple[str, str]]) -> list[dict[str, Any]]:
+        return [
+            _paired(a, b, by_config[a], by_config[b], seed=seed)
+            for a, b in pairs
+            if a in by_config and b in by_config
+        ]
 
     def mean_of(config: str, metric: str) -> float | None:
         spread = effort[config][metric]
@@ -266,6 +330,10 @@ def summarize(db_path: Path, run_id: str, *, seed: int) -> dict[str, Any]:
         "created_at": run["created_at"],
         "git_commit": run["git_commit"],
         "git_dirty": None if run["git_dirty"] is None else bool(run["git_dirty"]),
+        "resumed": [
+            {key: r.get(key) for key in ("at", "git_commit", "git_dirty", "retry_errors")}
+            for r in resumed
+        ],
         "corpus_sha256": run["corpus_sha256"],
         "bench_sha256": run["bench_sha256"],
         "configs": configs,
@@ -279,11 +347,9 @@ def summarize(db_path: Path, run_id: str, *, seed: int) -> dict[str, Any]:
         },
         "effort": effort,
         "difficulty": _difficulty(by_config),
-        "paired": [
-            _paired(a, b, by_config[a], by_config[b], seed=seed)
-            for a, b in PAIRS
-            if a in by_config and b in by_config
-        ],
+        "paired": paired([PRIMARY_PAIR]),
+        "paired_secondary": paired(SECONDARY_PAIRS),
+        "robustness": _robustness(by_config, errors, configs, seed=seed),
         "cost_quality": {
             c: {
                 "hit_at_5": quality_by[c]["hit_at_5"],
@@ -293,6 +359,7 @@ def summarize(db_path: Path, run_id: str, *, seed: int) -> dict[str, Any]:
             }
             for c in configs
         },
+        "billed": {c: billed(c) for c in configs},
         "errors": {c: sum(1 for e in errors if e["config"] == c) for c in configs},
         "error_examples": {
             c: [f"{e['qid']}: {e['error']}" for e in errors if e["config"] == c][:3]
@@ -316,6 +383,43 @@ def _difficulty(by_config: dict[str, dict[str, sqlite3.Row]]) -> dict[str, Any] 
             cells[b] = {"n": len(hits), "hit_at_5": sum(hits) / len(hits) if hits else None}
         table[config] = cells
     return {"bucket_sizes": counts, "hit_at_5": table}
+
+
+def _robustness(
+    by_config: dict[str, dict[str, sqlite3.Row]],
+    errors: Sequence[sqlite3.Row],
+    configs: Sequence[str],
+    *,
+    seed: int,
+) -> dict[str, Any]:
+    """The main table and primary comparison on the queries after the pilot targets."""
+
+    def kept(qid: str) -> bool:
+        return qid_position(qid) >= PILOT_POSITIONS
+
+    rows = {c: {q: r for q, r in by_config[c].items() if kept(q)} for c in configs}
+    n_error = Counter(e["config"] for e in errors if kept(e["qid"]))
+    qids = {q for c in configs for q in rows[c]} | {e["qid"] for e in errors if kept(e["qid"])}
+
+    def mean(config: str, key: str) -> float | None:
+        values = [r[key] for r in rows[config].values()]
+        return float(np.mean(values)) if values else None
+
+    a, b = PRIMARY_PAIR
+    return {
+        "first_qid": f"A{PILOT_POSITIONS:04d}",
+        "n_queries": len(qids),
+        "quality": {
+            c: {
+                "n_ok": len(rows[c]),
+                "n_error": n_error[c],
+                **{f"hit_at_{k}": mean(c, f"hit_at_{k}") for k in HIT_KS},
+                "mrr": mean(c, "reciprocal_rank"),
+            }
+            for c in configs
+        },
+        "primary": _paired(a, b, rows[a], rows[b], seed=seed) if a in rows and b in rows else None,
+    }
 
 
 def _paired(
@@ -343,13 +447,147 @@ def _f(value: float | None, digits: int = 3) -> str:
     return "–" if value is None else f"{value:.{digits}f}"
 
 
-def _ci(ci: Sequence[float] | None) -> str:
-    return "–" if ci is None else f"[{ci[0]:+.3f}, {ci[1]:+.3f}]"
+def _ci(ci: Sequence[float] | None, digits: int = 3) -> str:
+    return "–" if ci is None else f"[{ci[0]:+.{digits}f}, {ci[1]:+.{digits}f}]"
+
+
+def _p(p: float | None) -> str:
+    return "–" if p is None else f"{p:.3g}"
+
+
+def _quality_table(configs: Sequence[str], quality: dict[str, dict[str, Any]]) -> list[str]:
+    lines = [
+        "| Config | Queries | Errors | Hit@1 | Hit@5 | Hit@10 | MRR |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for c in configs:
+        q = quality[c]
+        lines.append(
+            f"| {c} | {q['n_ok']} | {q['n_error']} | {_f(q['hit_at_1'])} | {_f(q['hit_at_5'])} "
+            f"| {_f(q['hit_at_10'])} | {_f(q['mrr'])} |"
+        )
+    return lines
+
+
+def _paired_table(pairs: Sequence[dict[str, Any]]) -> list[str]:
+    lines = [
+        "| Comparison | n | ΔHit@5 [95% CI] | ΔMRR [95% CI] | McNemar (only A / only B) | p |",
+        "|---|---|---|---|---|---|",
+    ]
+    if not pairs:
+        lines.append("| (no comparable pair of configs in this run) | | | | | |")
+    for p in pairs:
+        m = p["mcnemar"]
+        primary = " (primary)" if (p["a"], p["b"]) == PRIMARY_PAIR else ""
+        lines.append(
+            f"| {p['a']} vs {p['b']}{primary} | {p['n']} "
+            f"| {_f(p['delta_hit_at_5'])} {_ci(p['ci_hit_at_5'])} "
+            f"| {_f(p['delta_mrr'])} {_ci(p['ci_mrr'])} | {m['a_only']} / {m['b_only']} "
+            f"| {m['p']:.3g} |"
+        )
+    return lines
+
+
+def _resumes(resumed: Sequence[dict[str, Any]]) -> list[str]:
+    """One header line with when, and at which commit, the run was resumed; none if never."""
+    if not resumed:
+        return []
+    parts = []
+    for r in resumed:
+        dirty = " (uncommitted changes to tracked files)" if r["git_dirty"] else ""
+        retry = ", retrying errors" if r["retry_errors"] else ""
+        parts.append(f"{r['at']} at git {r['git_commit'] or 'unknown'}{dirty}{retry}")
+    return ["", "Resumed " + "; ".join(parts) + "."]
+
+
+def _robustness_lines(summary: dict[str, Any]) -> list[str]:
+    r = summary["robustness"]
+    lines = [
+        "",
+        "## Robustness: without the pilot targets (exploratory)",
+        "",
+        (
+            f"Only the queries from qid {r['first_qid']} onward: the bench design was tuned on "
+            "the targets before it (docs/analysis_plan.md)."
+        ),
+        "",
+    ]
+    if not r["n_queries"]:
+        return [*lines, "This run has none of those queries."]
+    lines += _quality_table(summary["configs"], r["quality"])
+    return [*lines, "", *_paired_table([r["primary"]] if r["primary"] else [])]
+
+
+MEASURE_LABELS = {  # exhaustion-check measure: (row label, digits)
+    "abstract_words": ("Abstract length (words)", 1),
+    "number_sentence_share": ("Share of sentences with a number", 3),
+    "results_sentence_share": ("Share of sentences with a results cue", 3),
+}
+
+
+def _exhaustion_lines(ex: dict[str, Any]) -> list[str]:
+    lines = ["", "## Exhaustion check (exploratory)", ""]
+    if "unavailable" in ex:
+        return [*lines, f"Not computed: {ex['unavailable']}."]
+    n = ex["n"]
+    lines += [
+        (
+            f"Targets make-bench paraphrased: {n['accepted']} accepted and {n['exhausted']} "
+            f"exhausted (all {ex['max_attempts']} attempts rejected); {n['skipped']} skipped "
+            f"as not research contributions and {n['unfinished']} unfinished are left out. "
+            "Differences are exhausted minus accepted, with a bootstrap 95% CI and a "
+            "permutation p-value (docs/analysis_plan.md)."
+        ),
+        "",
+        (
+            f"| Measure | Exhausted (n={n['exhausted']}) | Accepted (n={n['accepted']}) "
+            "| Difference [95% CI] | p |"
+        ),
+        "|---|---|---|---|---|",
+    ]
+    for m, (label, d) in MEASURE_LABELS.items():
+        g = ex["measures"][m]
+        lines.append(
+            f"| {label} | {_f(g['mean_a'], d)} | {_f(g['mean_b'], d)} "
+            f"| {_f(g['diff'], d)} {_ci(g['ci'], d)} | {_p(g['p'])} |"
+        )
+    for key, name in (("subfield", "Subfield"), ("topic", "Topic")):
+        lines += ["", f"| {name} | Accepted | Exhausted | Exhaustion rate |", "|---|---|---|---|"]
+        for label, cell in ex[key]["rates"].items():
+            lines.append(
+                f"| {label} | {cell['accepted']} | {cell['exhausted']} | {_f(cell['rate'])} |"
+            )
+    diff = ex["subfield"]["difference"]
+    lines += [
+        "",
+        (
+            f"Exhaustion rate, {diff['a']} minus {diff['b']}: {_f(diff['diff'])} "
+            f"{_ci(diff['ci'])}, p {_p(diff['p'])}. Topic is descriptive only."
+        ),
+    ]
+    rej = ex["exhausted_rejections"]
+    facets = "; ".join(
+        f"{direction}: "
+        + (", ".join(f"{f} {k}" for f, k in counts.items() if k) or "none")
+        for direction, counts in rej["judge_failed_facets"].items()
+    )
+    lines += [
+        "",
+        (
+            f"The exhausted targets' {rej['attempts']} rejected attempts: {rej['judge_attempts']} "
+            f"by the judge (on {rej['targets_with_a_judge_rejection']} of {n['exhausted']} "
+            "targets), the rest by the length and leak checks. Facets the judge failed: "
+            f"{facets}."
+        ),
+    ]
+    reasons = [f"| {reason} | {k} |" for reason, k in rej["by_reason"].items()]
+    return [*lines, "", "| Rejection reason | Attempts |", "|---|---|", *(reasons or ["| – | 0 |"])]
 
 
 def render_markdown(summary: dict[str, Any]) -> str:
-    """summary.md: main, effort, difficulty, paired, cost-quality and error tables."""
-    dirty = " (uncommitted changes)" if summary["git_dirty"] else ""
+    """summary.md: main, effort, difficulty, primary and secondary comparisons, robustness,
+    exhaustion check, cost-quality, billed and error tables."""
+    dirty = " (uncommitted changes to tracked files)" if summary["git_dirty"] else ""
     provenance = (
         f"Git {summary['git_commit'] or 'unknown'}{dirty}; corpus sha256 "
         f"{summary['corpus_sha256'][:12]}; bench sha256 {summary['bench_sha256'][:12]}."
@@ -358,18 +596,20 @@ def render_markdown(summary: dict[str, Any]) -> str:
         f"# Run {summary['run_id']}",
         "",
         provenance,
+        *_resumes(summary["resumed"]),
         "",
         "## Retrieval quality",
         "",
-        "| Config | Queries | Errors | Hit@1 | Hit@5 | Hit@10 | MRR |",
-        "|---|---|---|---|---|---|---|",
+        *_quality_table(summary["configs"], summary["quality"]),
     ]
-    for c in summary["configs"]:
-        q = summary["quality"][c]
-        lines.append(
-            f"| {c} | {q['n_ok']} | {q['n_error']} | {_f(q['hit_at_1'])} | {_f(q['hit_at_5'])} "
-            f"| {_f(q['hit_at_10'])} | {_f(q['mrr'])} |"
-        )
+    if any(c in SECONDARY_CONFIGS for c in summary["configs"]):
+        lines += [
+            "",
+            (
+                "B4-D and B5-D are secondary: B4 and B5 with B2 (dense) as the base retriever "
+                "instead of B3."
+            ),
+        ]
     lines += [
         "",
         "## Effort per query (mean / p50 / p95)",
@@ -398,22 +638,18 @@ def render_markdown(summary: dict[str, Any]) -> str:
             cells = difficulty["hit_at_5"][c]
             lines.append(f"| {c} | " + " | ".join(_f(cells[b]["hit_at_5"]) for b in BUCKETS) + " |")
 
+    lines += ["", "## Primary comparison (queries that succeeded in both configs)", ""]
+    lines += _paired_table(summary["paired"])
     lines += [
         "",
-        "## Paired comparisons (queries that succeeded in both configs)",
+        "Hit@5 with the McNemar test decides the primary comparison; MRR is supporting.",
         "",
-        "| Comparison | n | ΔHit@5 [95% CI] | ΔMRR [95% CI] | McNemar (only A / only B) | p |",
-        "|---|---|---|---|---|---|",
+        "## Secondary comparisons (exploratory)",
+        "",
+        *_paired_table(summary["paired_secondary"]),
+        *_robustness_lines(summary),
+        *_exhaustion_lines(summary["exhaustion"]),
     ]
-    if not summary["paired"]:
-        lines.append("| (no comparable pair of configs in this run) | | | | | |")
-    for p in summary["paired"]:
-        m = p["mcnemar"]
-        lines.append(
-            f"| {p['a']} vs {p['b']} | {p['n']} | {_f(p['delta_hit_at_5'])} {_ci(p['ci_hit_at_5'])} "
-            f"| {_f(p['delta_mrr'])} {_ci(p['ci_mrr'])} | {m['a_only']} / {m['b_only']} "
-            f"| {m['p']:.3g} |"
-        )
     lines += [
         "",
         "## Cost and quality",
@@ -427,6 +663,31 @@ def render_markdown(summary: dict[str, Any]) -> str:
             f"| {c} | {_f(cq['hit_at_5'])} | {_f(cq['mrr'])} | {_f(cq['mean_method_cost'], 5)} "
             f"| {_f(cq['mean_llm_calls'], 1)} |"
         )
+    lines += [
+        "",
+        "## Billed cost",
+        "",
+        (
+            "The tables above use computed cost: config prices times tokens for every LLM call, "
+            "cache hits included, so configs compare on what the method costs. Below are only "
+            "the calls this run actually sent (cache hits cost nothing), at the config prices "
+            "and as the API billed them; the two differ when a provider bills other than its "
+            "listed price. Rows run before billed costs were recorded have none (–)."
+        ),
+        "",
+        "| Config | Calls sent, computed ($) | Billed ($) | Billed vs computed |",
+        "|---|---|---|---|",
+    ]
+    for c in summary["configs"]:
+        b = summary["billed"][c]
+        billed, ratio = "–", "–"
+        if b["billed"] is not None:
+            billed = _f(b["billed"], 5)
+            if b["computed"]:
+                ratio = f"{b['billed'] / b['computed'] - 1:+.0%}"
+        elif b["unrecorded_rows"]:
+            billed = f"– ({b['unrecorded_rows']} rows not recorded)"
+        lines.append(f"| {c} | {_f(b['computed'], 5)} | {billed} | {ratio} |")
     lines += ["", "## Errors", "", "| Config | Errors | Examples |", "|---|---|---|"]
     for c in summary["configs"]:
         examples = "; ".join(summary["error_examples"][c]).replace("|", "\\|")
@@ -447,8 +708,27 @@ def report(run_dir: Path) -> dict[str, Any]:
     if not meta_path.exists():
         raise EvalError(f"{run_dir} is not a run directory (no {RUN_FILE})")
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    summary = summarize(Path(meta["results_db"]), meta["run_id"], seed=meta["seed"])
+    summary = run_summary(meta, Path(meta["results_db"]), seed=meta["seed"])
     write_summary(run_dir, summary)
+    return summary
+
+
+def run_summary(meta: dict[str, Any], db_path: Path, *, seed: int) -> dict[str, Any]:
+    """summarize() with the resumes from run.json and the exhaustion check of the run's bench.
+
+    The bench and corpus are found through the config snapshot in run.json, so
+    relative paths there are read from the current directory, as `run` read them.
+    """
+    summary = summarize(db_path, meta["run_id"], seed=seed, resumed=meta.get("resumed", []))
+    bench, corpus = meta["config"]["bench"], meta["config"]["corpus"]
+    summary["exhaustion"] = exhaustion_check(
+        Path(bench["out_dir"]),
+        Path(corpus["out_dir"]),
+        max_attempts=bench["max_attempts_per_target"],
+        bench_sha256=meta["bench_sha256"],
+        corpus_sha256=meta["corpus_sha256"],
+        seed=seed,
+    )
     return summary
 
 
@@ -476,18 +756,29 @@ def load_bench(
     return rows, stats, hashlib.sha256(data).hexdigest()
 
 
-def git_state() -> tuple[str | None, bool | None]:
-    """HEAD commit and whether the working tree has uncommitted changes (None if unknown)."""
+MAX_UNTRACKED_LISTED = 200
+
+
+def git_state(cwd: Path | None = None) -> tuple[str | None, bool | None, list[str] | None]:
+    """HEAD commit, whether tracked files have uncommitted changes, and the untracked files.
+
+    Untracked files (not git-ignored) don't make the tree dirty; they are only
+    listed, as information. Everything is None if git isn't available.
+    """
+
+    def git(*args: str) -> str:
+        done = subprocess.run(
+            ["git", *args], capture_output=True, text=True, check=True, cwd=cwd
+        )
+        return done.stdout
+
     try:
-        head = subprocess.run(
-            ["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True
-        )
-        status = subprocess.run(
-            ["git", "status", "--porcelain"], capture_output=True, text=True, check=True
-        )
+        head = git("rev-parse", "HEAD").strip()
+        tracked = git("status", "--porcelain", "--untracked-files=no")
+        untracked = git("ls-files", "--others", "--exclude-standard").splitlines()
     except (OSError, subprocess.CalledProcessError):
-        return None, None
-    return head.stdout.strip(), bool(status.stdout.strip())
+        return None, None, None
+    return head, bool(tracked.strip()), sorted(untracked)[:MAX_UNTRACKED_LISTED]
 
 
 def _jsonable(value: Any) -> Any:
@@ -500,7 +791,7 @@ def _fingerprint(meta: dict[str, Any]) -> dict[str, Any]:
     return {
         "corpus_sha256": meta["corpus_sha256"],
         "bench_sha256": meta["bench_sha256"],
-        "index": {k: meta["index"].get(k) for k in ("corpus_sha256", "encoder", "encoder_revision")},
+        "index": {k: meta["index"].get(k) for k in ("corpus_sha256", *ENCODER_SETTINGS)},
         "retrieval": config["retrieval"],
         "agent": config["agent"],
         "retrieval_prompts": meta["prompt_hashes"]["retrieval"],
@@ -538,10 +829,11 @@ def run_eval(
         raise EvalError(f"unknown configs {unknown}; choose from {list(CONFIG_ORDER)}")
     retrievers = make_retrievers(cfg, index, encoder, agent)
 
-    commit, dirty = git_state()
+    commit, dirty, untracked = git_state()
     meta: dict[str, Any] = {
         "git_commit": commit,
-        "git_dirty": dirty,
+        "git_dirty": dirty,  # tracked files only
+        "git_untracked": untracked,  # information, not part of "dirty"
         "corpus_sha256": corpus_sha,
         "bench_sha256": bench_sha,
         "index": index.manifest,
@@ -553,8 +845,7 @@ def run_eval(
             "paraphraser": cfg.paraphraser.name,
             "judge": cfg.judge.name,
             "agent": cfg.agent.name,
-            "encoder": index.manifest["encoder"],
-            "encoder_revision": index.manifest.get("encoder_revision"),
+            **{key: index.manifest.get(key) for key in ENCODER_SETTINGS},
         },
         "config": _jsonable(dataclasses.asdict(cfg)),
         "seed": cfg.run.seed,
@@ -584,7 +875,7 @@ def run_eval(
                     _put(conn, row)
         finally:
             export_jsonl(conn, run_id, run_dir)
-            write_summary(run_dir, summarize(cfg.run.results_db, run_id, seed=cfg.run.seed))
+            write_summary(run_dir, run_summary(run_meta, cfg.run.results_db, seed=cfg.run.seed))
     finally:
         conn.close()
     if log_mlflow:
@@ -615,6 +906,7 @@ def _open_run(
             "at": _now(),
             "git_commit": meta["git_commit"],
             "git_dirty": meta["git_dirty"],
+            "git_untracked": meta["git_untracked"],
             "retry_errors": retry_errors,
         }
         run_meta.setdefault("resumed", []).append(resumed)
@@ -747,7 +1039,7 @@ def log_to_mlflow(run_dir: Path, meta: dict[str, Any], run_cfg: RunConfig) -> di
         parent = client.create_run(experiment_id, run_name=meta["run_id"]).info.run_id
         client.log_batch(parent, params=params)
     paired: dict[str, float | None] = {}
-    for p in summary["paired"]:
+    for p in summary["paired"] + summary["paired_secondary"]:
         key = f"{p['a']}_vs_{p['b']}"
         paired[f"{key}.n"] = p["n"]
         paired[f"{key}.mcnemar_p"] = p["mcnemar"]["p"]

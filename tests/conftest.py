@@ -11,7 +11,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -52,7 +52,10 @@ class FakeLLM:
     messages to a reply. Token usage is whitespace word counts, so tests can
     predict it. Use it directly as a ChatModel (`complete`) or under a real
     LLMClient via `transport`, which answers like a /chat/completions endpoint.
-    Every prompt received is recorded in `calls`.
+    Every prompt received is recorded in `calls`; over the transport, every
+    request body and header set in `requests` and `headers`. With `provider`,
+    replies name it as the serving provider, as OpenRouter's router metadata does;
+    with `billed_cost`, they report it as OpenRouter's usage.cost.
     """
 
     def __init__(
@@ -60,11 +63,18 @@ class FakeLLM:
         replies: Sequence[str] | Callable[[list[dict[str, str]]], str],
         *,
         model: ModelConfig | None = None,
+        provider: str | None = None,
+        billed_cost: Any = None,  # any JSON value, to test parsing; None leaves it out
     ) -> None:
         self.model = model or make_model_config()
+        self.provider = provider
+        self.billed_cost = billed_cost
         self._replies = replies if callable(replies) else list(replies)
         self.calls: list[list[dict[str, str]]] = []
         self.seeds: list[int | None] = []  # the seed= of each direct complete() call
+        self.response_formats: list[Mapping[str, Any] | None] = []  # and its response_format=
+        self.requests: list[dict[str, Any]] = []
+        self.headers: list[httpx.Headers] = []
 
     @staticmethod
     def count_tokens(text: str) -> int:
@@ -82,45 +92,73 @@ class FakeLLM:
         prompt_tokens = sum(self.count_tokens(m["content"]) for m in msgs)
         return text, prompt_tokens, self.count_tokens(text)
 
-    def complete(self, messages: Sequence[Message], *, seed: int | None = None) -> Completion:
+    def complete(
+        self,
+        messages: Sequence[Message],
+        *,
+        seed: int | None = None,
+        response_format: Mapping[str, Any] | None = None,
+    ) -> Completion:
         self.seeds.append(seed)
+        self.response_formats.append(response_format)
         text, prompt_tokens, completion_tokens = self._reply(messages)
         cost = token_cost(self.model, prompt_tokens, completion_tokens)
+        billed = self.billed_cost if isinstance(self.billed_cost, float) else cost
         usage = Usage(
             calls=1,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             method_cost=cost,
             money_spent=cost,
+            billed_cost=billed,
         )
         return Completion(
-            text=text, usage=usage, cached=False, model=self.model.name, finish_reason="stop"
+            text=text,
+            usage=usage,
+            cached=False,
+            model=self.model.name,
+            finish_reason="stop",
+            provider=self.provider,
         )
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         """httpx.MockTransport handler speaking the /chat/completions protocol."""
         body = json.loads(request.content)
+        self.requests.append(body)
+        self.headers.append(request.headers)
         text, prompt_tokens, completion_tokens = self._reply(body["messages"])
-        return httpx.Response(
-            200,
-            json={
-                "id": f"fake-{len(self.calls)}",
-                "object": "chat.completion",
-                "model": body["model"],
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {"role": "assistant", "content": text},
-                        "finish_reason": "stop",
-                    }
-                ],
-                "usage": {
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": completion_tokens,
-                    "total_tokens": prompt_tokens + completion_tokens,
-                },
+        reply: dict[str, Any] = {
+            "id": f"fake-{len(self.calls)}",
+            "object": "chat.completion",
+            "model": body["model"],
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": text},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
             },
-        )
+        }
+        if self.billed_cost is not None:
+            reply["usage"]["cost"] = self.billed_cost
+        if self.provider is not None:  # the shape of a real OpenRouter reply (2026-10-12)
+            reply["openrouter_metadata"] = {
+                "requested": body["model"],
+                "attempt": 1,
+                "endpoints": {
+                    "total": 2,
+                    "available": [
+                        {"provider": "Elsewhere", "model": body["model"], "selected": False},
+                        {"provider": self.provider, "model": body["model"], "selected": True},
+                    ],
+                },
+            }
+        return httpx.Response(200, json=reply)
 
     @property
     def transport(self) -> httpx.MockTransport:
@@ -142,6 +180,8 @@ class FakeEncoder:
     name = "fake-encoder"
     revision = "fa4e000000000000000000000000000000000000"  # a valid-looking commit hash
     device = "cpu"
+    dtype = "float32"
+    max_seq_length: int | None = None
 
     def __init__(self, dim: int = 256) -> None:
         self.dim = dim

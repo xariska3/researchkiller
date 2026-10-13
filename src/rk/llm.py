@@ -1,18 +1,29 @@
 """OpenAI-compatible chat client with a SQLite response cache and a hard-capped cost ledger.
 
-Cost accounting keeps two numbers (see Usage). *Method cost* is what the method
+Cost accounting keeps three numbers (see Usage). *Method cost* is what the method
 costs from scratch and is counted on cache hits too, so reported cost reflects
-the method. *Money spent* counts real API calls only. Before every real call the
+the method. *Money spent* counts real API calls only, at the config prices, and
+*billed cost* is what the API charged for those same calls. Before every real call the
 client charges a pessimistic estimate to the Ledger, which refuses calls that
 could take cumulative spend (across all commands, persisted next to the cache)
 over its cap. Cache hits never touch the network, the ledger or the API key, so
 a cached run replays offline and for free.
+
+On OpenRouter, a model's `provider` pins one endpoint with fallbacks disabled
+and every request parameter required
+(https://openrouter.ai/docs/guides/routing/provider-selection), and every
+request asks for router metadata (https://openrouter.ai/docs/guides/features/router-metadata)
+so the provider that served each call is stored with the reply and its spend row.
+The billed cost OpenRouter returns in `usage.cost` (USD, on every non-streaming
+reply: https://openrouter.ai/docs/guides/guides/usage-accounting) is stored
+next to the cost computed from the config prices, and the ledger counts it.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
@@ -34,6 +45,8 @@ if TYPE_CHECKING:  # annotation only: typing.Self needs Python 3.11
     from typing_extensions import Self
 
 Message = Mapping[str, str]  # {"role": ..., "content": ...}
+
+METADATA_HEADER = {"X-OpenRouter-Metadata": "enabled"}  # other servers ignore it
 
 
 class _Closing:
@@ -71,7 +84,8 @@ class Usage:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     method_cost: float = 0.0  # counted on cache hits too
-    money_spent: float = 0.0  # real API calls only
+    money_spent: float = 0.0  # real API calls only, at the config prices
+    billed_cost: float = 0.0  # what the API charged for those calls (money_spent if not reported)
 
     def __add__(self, other: Usage) -> Usage:
         if not isinstance(other, Usage):
@@ -83,6 +97,7 @@ class Usage:
             completion_tokens=self.completion_tokens + other.completion_tokens,
             method_cost=self.method_cost + other.method_cost,
             money_spent=self.money_spent + other.money_spent,
+            billed_cost=self.billed_cost + other.billed_cost,
         )
 
 
@@ -93,12 +108,19 @@ class Completion:
     cached: bool
     model: str
     finish_reason: str | None
+    provider: str | None = None  # who served it, as OpenRouter reports (also on cache hits)
 
 
 class ChatModel(Protocol):
     """Anything that answers chat messages: LLMClient, or FakeLLM in tests."""
 
-    def complete(self, messages: Sequence[Message], *, seed: int | None = None) -> Completion: ...
+    def complete(
+        self,
+        messages: Sequence[Message],
+        *,
+        seed: int | None = None,
+        response_format: Mapping[str, Any] | None = None,
+    ) -> Completion: ...
 
 
 @dataclass(frozen=True)
@@ -146,16 +168,31 @@ def pessimistic_cost(model: ModelConfig, messages: Sequence[Message]) -> float:
 
 
 def cache_key(
-    model: str, messages: Sequence[Message], temperature: float, seed: int, max_tokens: int
+    model: str,
+    messages: Sequence[Message],
+    temperature: float,
+    seed: int,
+    max_tokens: int,
+    provider: Mapping[str, Any] | None = None,
+    response_format: Mapping[str, Any] | None = None,
 ) -> str:
-    """sha256 of the canonical JSON of (model, messages, temperature, seed, max_tokens)."""
-    payload = {
+    """sha256 of the canonical JSON of (model, messages, temperature, seed, max_tokens).
+
+    A provider pin (OpenRouter routing) and a response format (e.g. a JSON
+    schema) are part of the key when set, so a reply is never served for a
+    request that differs in either; without them the key is unchanged.
+    """
+    payload: dict[str, Any] = {
         "model": model,
         "messages": [dict(m) for m in messages],
         "temperature": float(temperature),
         "seed": int(seed),
         "max_tokens": int(max_tokens),
     }
+    if provider is not None:
+        payload["provider"] = dict(provider)
+    if response_format is not None:
+        payload["response_format"] = dict(response_format)
     blob = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
@@ -166,6 +203,8 @@ class CachedReply:
     finish_reason: str | None
     prompt_tokens: int
     completion_tokens: int
+    provider: str | None = None
+    billed_cost: float | None = None  # not cached: a cache hit is never billed
 
 
 _SCHEMA = """
@@ -177,7 +216,8 @@ CREATE TABLE IF NOT EXISTS completions (
     finish_reason TEXT,
     prompt_tokens INTEGER NOT NULL,
     completion_tokens INTEGER NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    provider TEXT
 )
 """
 
@@ -189,7 +229,9 @@ CREATE TABLE IF NOT EXISTS spend (
     model TEXT NOT NULL,
     prompt_tokens INTEGER NOT NULL,
     completion_tokens INTEGER NOT NULL,
-    cost REAL NOT NULL
+    cost REAL NOT NULL,
+    billed_cost REAL,
+    provider TEXT
 )
 """
 
@@ -215,7 +257,7 @@ class LLMCache(_Closing):
 
     def get(self, key: str) -> CachedReply | None:
         row = self._conn.execute(
-            "SELECT text, finish_reason, prompt_tokens, completion_tokens"
+            "SELECT text, finish_reason, prompt_tokens, completion_tokens, provider"
             " FROM completions WHERE key = ?",
             (key,),
         ).fetchone()
@@ -224,7 +266,9 @@ class LLMCache(_Closing):
     def put(self, key: str, request: Mapping[str, Any], reply: CachedReply) -> None:
         """Store a reply with its full request, committing at once so paid calls survive a crash."""
         self._conn.execute(
-            "INSERT OR REPLACE INTO completions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO completions (key, model, request, text, finish_reason,"
+            " prompt_tokens, completion_tokens, created_at, provider)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 key,
                 request["model"],
@@ -234,6 +278,7 @@ class LLMCache(_Closing):
                 reply.prompt_tokens,
                 reply.completion_tokens,
                 _utc_now(),
+                reply.provider,
             ),
         )
         self._conn.commit()
@@ -252,7 +297,9 @@ class Ledger(_Closing):
     and process using that file: the running total is read at startup. Before a
     real call the client reserves a pessimistic estimate (`charge`); afterwards it
     `record`s what the call cost, which releases the reservation and appends a
-    spend row. A failed call is recorded at its estimate if any request was sent
+    spend row. A row's spend is its `billed_cost` (what the API reports it
+    charged) when present, else its `cost` (computed from the config prices).
+    A failed call is recorded at its estimate if any request was sent
     without a 4xx coming back (timeouts, transport errors, 5xx, malformed 200s,
     Ctrl-C mid-request), since it may have been billed; otherwise its reservation
     is just `release`d. Spend by a command running concurrently is only seen
@@ -265,7 +312,9 @@ class Ledger(_Closing):
         self.cap = cap
         self.command = command
         self._conn = _connect(path, _SPEND_SCHEMA)
-        row = self._conn.execute("SELECT COALESCE(SUM(cost), 0.0) FROM spend").fetchone()
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(COALESCE(billed_cost, cost)), 0.0) FROM spend"
+        ).fetchone()
         self._recorded = float(row[0])
         self._reserved = 0.0
 
@@ -295,15 +344,31 @@ class Ledger(_Closing):
         prompt_tokens: int,
         completion_tokens: int,
         cost: float,
+        billed_cost: float | None = None,
+        provider: str | None = None,
     ) -> None:
-        """Release a reservation and persist what the call cost."""
+        """Release a reservation and persist what the call cost, and who served it if known.
+
+        `cost` is computed from the config prices; `billed_cost`, if the API
+        reported one, is what it charged and is what counts against the cap.
+        """
         self._conn.execute(
-            "INSERT INTO spend VALUES (?, ?, ?, ?, ?, ?)",
-            (_utc_now(), self.command, model, prompt_tokens, completion_tokens, cost),
+            "INSERT INTO spend (timestamp, command, model, prompt_tokens, completion_tokens,"
+            " cost, billed_cost, provider) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                _utc_now(),
+                self.command,
+                model,
+                prompt_tokens,
+                completion_tokens,
+                cost,
+                billed_cost,
+                provider,
+            ),
         )
         self._conn.commit()
         self._reserved -= reserved
-        self._recorded += cost
+        self._recorded += cost if billed_cost is None else billed_cost
 
     def release(self, reserved: float) -> None:
         """Drop a reservation for a call that cost nothing."""
@@ -339,11 +404,20 @@ class LLMClient(_Closing):
         self._sleep = sleep
         self._http = httpx.Client(base_url=model.base_url, timeout=timeout, transport=transport)
 
-    def complete(self, messages: Sequence[Message], *, seed: int | None = None) -> Completion:
+    def complete(
+        self,
+        messages: Sequence[Message],
+        *,
+        seed: int | None = None,
+        response_format: Mapping[str, Any] | None = None,
+    ) -> Completion:
         """Answer `messages`, from the cache when possible.
 
         `seed` overrides the model's configured seed, e.g. to get a fresh sample
-        on a retry; it is part of the cache key.
+        on a retry. `response_format` is sent as the OpenAI-style field (e.g.
+        {"type": "json_schema", ...}); with a pinned provider, require_parameters
+        makes OpenRouter refuse an endpoint that can't honour it. Both are part
+        of the cache key.
         """
         request: dict[str, Any] = {
             "model": self.model.name,
@@ -352,6 +426,10 @@ class LLMClient(_Closing):
             "max_tokens": self.model.max_tokens,
             "seed": self.model.seed if seed is None else seed,
         }
+        if self.model.provider is not None:
+            request["provider"] = provider_routing(self.model.provider)
+        if response_format is not None:
+            request["response_format"] = dict(response_format)
         key = cache_key(**request)
         reply = self.cache.get(key)
         cached = reply is not None
@@ -359,13 +437,15 @@ class LLMClient(_Closing):
             reply = self._real_call(request)
             self.cache.put(key, request, reply)
         cost = token_cost(self.model, reply.prompt_tokens, reply.completion_tokens)
+        spent = 0.0 if cached else cost
         usage = Usage(
             calls=1,
             cache_hits=int(cached),
             prompt_tokens=reply.prompt_tokens,
             completion_tokens=reply.completion_tokens,
             method_cost=cost,
-            money_spent=0.0 if cached else cost,
+            money_spent=spent,
+            billed_cost=spent if cached or reply.billed_cost is None else reply.billed_cost,
         )
         self.usage += usage
         return Completion(
@@ -374,6 +454,7 @@ class LLMClient(_Closing):
             cached=cached,
             model=self.model.name,
             finish_reason=reply.finish_reason,
+            provider=reply.provider,
         )
 
     def _real_call(self, request: dict[str, Any]) -> CachedReply:
@@ -384,11 +465,14 @@ class LLMClient(_Closing):
                 f"(needed for {self.model.name})"
             )
         prompt_bound = prompt_token_bound(request["messages"])
+        if "response_format" in request:  # a schema is sent to the model too
+            prompt_bound += len(json.dumps(request["response_format"]).encode("utf-8"))
         estimate = token_cost(self.model, prompt_bound, self.model.max_tokens)
         self.ledger.charge(estimate, label=self.model.name)
         billing = _Billing()
         try:
-            reply = _parse_reply(self._post(request, api_key, billing), self.model.name)
+            data = self._post(request, api_key, billing)
+            reply = _parse_reply(data, self.model.name)
         except BaseException:  # includes KeyboardInterrupt: book, then re-raise
             if billing.possible:
                 self.ledger.record(
@@ -407,6 +491,8 @@ class LLMClient(_Closing):
             prompt_tokens=reply.prompt_tokens,
             completion_tokens=reply.completion_tokens,
             cost=token_cost(self.model, reply.prompt_tokens, reply.completion_tokens),
+            billed_cost=reply.billed_cost,
+            provider=reply.provider,
         )
         return reply
 
@@ -417,7 +503,7 @@ class LLMClient(_Closing):
         4xx response clears that again. `billing` carries the verdict out, even
         when the call ends in an exception.
         """
-        headers = {"Authorization": f"Bearer {api_key}"}
+        headers = {"Authorization": f"Bearer {api_key}", **METADATA_HEADER}
         for attempt in range(self.max_retries + 1):
             retry_after: float | None = None
             billed_before = billing.possible
@@ -490,7 +576,46 @@ def _parse_reply(data: Any, model_name: str) -> CachedReply:
         finish_reason=choice.get("finish_reason"),
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
+        provider=served_provider(data),
+        billed_cost=billed_cost(data),
     )
+
+
+def provider_routing(slug: str) -> dict[str, Any]:
+    """OpenRouter's `provider` request field: only this endpoint, no fallbacks.
+
+    With require_parameters, OpenRouter refuses the request (a 4xx, so neither
+    retried nor booked) rather than send it to an endpoint that would ignore a
+    parameter such as `seed`.
+    """
+    return {"order": [slug], "allow_fallbacks": False, "require_parameters": True}
+
+
+def billed_cost(data: Mapping[str, Any]) -> float | None:
+    """What the API says it charged for a completion (OpenRouter's usage.cost, USD), else None."""
+    try:
+        cost = data["usage"]["cost"]
+    except (KeyError, TypeError):
+        return None
+    if isinstance(cost, bool) or not isinstance(cost, (int, float)):
+        return None
+    return float(cost) if math.isfinite(cost) and cost >= 0 else None
+
+
+def served_provider(data: Mapping[str, Any]) -> str | None:
+    """The provider OpenRouter reports as having served a completion, else None.
+
+    The documented place is the `selected` entry of
+    openrouter_metadata.endpoints.available (sent because of METADATA_HEADER);
+    responses also carry a top-level "provider" string, used as the fallback.
+    """
+    try:
+        available = data["openrouter_metadata"]["endpoints"]["available"]
+        selected = [e["provider"] for e in available if e.get("selected") is True]
+    except (KeyError, TypeError, AttributeError):
+        selected = []
+    provider = selected[0] if selected else data.get("provider")
+    return provider if isinstance(provider, str) else None
 
 
 def retry_after_seconds(response: httpx.Response) -> float | None:

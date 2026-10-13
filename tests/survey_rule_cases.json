@@ -1,0 +1,56 @@
+[
+  {
+    "qid": "A0003-W7203468421",
+    "title": "Query Rewriting in Retrieval-Augmented Generation as an Application of NLP Technology for Understanding and Transforming Human Language",
+    "abstract_excerpt": "In this paper, the main exploration, cutting-edge applications and various technologies of retrieval-augmented generation (RAG) technology in the current field are reviewed, covering the whole process from query understanding to retrieval optimization to generation of controllable links.",
+    "skip": true
+  },
+  {
+    "qid": "A0005-W7165199615",
+    "title": "External Knowledge Integration in Large Language Models: A Survey on Methods, Challenges, and Future Directions",
+    "abstract_excerpt": "This survey investigates the integration of external knowledge into LLMs to address these limitations. This survey supports software developers and natural language processing (NLP) researchers in designing NLU systems for specialized domains by leveraging pre-trained LLMs.",
+    "skip": true
+  },
+  {
+    "qid": "A0015-W7213002528",
+    "title": "Graph-Based Retrieval-Augmented Generation: Applications, Challenges, Solutions, and Opportunities",
+    "abstract_excerpt": "In this tutorial, we first highlight the real-world applications of graph-based RAG and the unique challenges that need to be addressed.",
+    "skip": true
+  },
+  {
+    "qid": "A0028-W7172519303",
+    "title": "Retrieval‐Augmented Generation for Large Language Models: Evolution, Architectures, Applications, and Challenges (2020–2025)",
+    "abstract_excerpt": "This Advanced Review presents a PRISMA‐guided synthesis of 91 studies published between January 2020 and December 2025. The review examines how retrieval granularity, indexing, reranking, context construction, and retriever‐generator integration affect recall, precision, latency, robustness, and governance. The review therefore synthesizes current evaluation practices, promotes reproducibility‐oriented reporting through RAG Cards, and identifies open research directions for secure, efficient, transparent, and domain‐aware RAG systems.",
+    "skip": true
+  },
+  {
+    "qid": "A0002-W7167690171",
+    "title": "TopicSelectNet: A Hybrid Approach to Abstractive Summarization using Dynamic Content Selection",
+    "abstract_excerpt": "These improvements underscore the value of incorporating topic aware content selection, enabling more accurate, coherent, and informative legal document summaries that can significantly streamline legal research and review.",
+    "skip": false
+  },
+  {
+    "qid": "A0008-W4414113477",
+    "title": "An LLM-based multi-agent system for geoscience legacy document processing, knowledge extraction and quality control",
+    "abstract_excerpt": "To address concerns about the quality of AI-generated content, the framework utilizes a series of quality control mechanisms, including multi-version reviewing, error reflection, and term matching validation, to ensure the reliability of the extracted knowledge and the robustness of the automated process.",
+    "skip": false
+  },
+  {
+    "qid": "A0012-W7154374526",
+    "title": "Classification of Cochrane Plain Language Summaries by Conclusiveness Using Transformer-Based Models and ChatGPT: Retrospective Observational Study",
+    "abstract_excerpt": "Background: Cochrane plain language summaries (PLSs) aim to make systematic review findings more accessible to the general public. Methods: We used a publicly available dataset containing 4405 Cochrane PLSs of systematic reviews published until 2019, already classified by humans according to 9 categories of conclusiveness regarding the intervention's effectiveness or safety.",
+    "skip": false
+  },
+  {
+    "qid": "A0023-W7132849045",
+    "title": "Don't Break the Flow: Supporting Deferral and Review of Potentially Serendipitous Information in Library Search",
+    "abstract_excerpt": "Revelio provides a low-effort mechanism for deferring potentially serendipitous information encounters, and a semantic similarity approach for subsequently reviewing and saving such search results within a multi-workspace structure. Compared to those who used a baseline search interface, participants who used Revelio were able to effectively defer and subsequently review encountered information, resulting in positive opinions about the interface, increased performance in both prescribed search tasks, and greater perceived knowledge gain. These findings demonstrate the value of search interfaces that explicitly support the deferral and subsequent review of potentially serendipitous information.",
+    "skip": false
+  },
+  {
+    "qid": "A0032-W7204435040",
+    "title": "Context‐engineering large language models for scalable structured metadata extraction in ecological literature reviews",
+    "abstract_excerpt": "Abstract Hundreds of thousands of peer‐reviewed articles and grey‐literature reports appear each year in ecology and conservation, creating a pressing need for scalable synthesis tools.",
+    "skip": false
+  }
+]

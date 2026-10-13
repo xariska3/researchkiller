@@ -9,13 +9,37 @@ from collections.abc import Sequence
 from contextlib import ExitStack, closing
 from pathlib import Path
 
-from rk.bench import BenchError, format_accepted, make_bench
+from dotenv import load_dotenv
+
+from rk.bench import (
+    HUMAN_CHECK_FILE,
+    JUDGE_VALIDATION_DIR,
+    BenchError,
+    export_human_check,
+    format_accepted,
+    make_bench,
+    validate_judge,
+)
 from rk.config import ConfigError, load_config
 from rk.corpus import CorpusError, OpenAlexClient, OpenAlexError, build_corpus
 from rk.evaluate import CONFIG_ORDER, SUMMARY_MD, EvalError, report, run_eval
 from rk.llm import BudgetExceeded, Ledger, LLMCache, LLMClient, LLMError
 from rk.retrieval import RetrievalError, build_index, make_encoder
 from rk.targets import TargetSelectionError
+
+ENV_FILE = Path(".env")  # API keys; relative to the repo root, like the config's paths
+
+
+def load_env_file(path: Path = ENV_FILE) -> bool:
+    """Load KEY=value lines from `path` into the environment, if the file exists.
+
+    Variables already set in the environment win over the file. Returns
+    whether a file was found.
+    """
+    if not path.is_file():
+        return False
+    load_dotenv(path, override=False)
+    return True
 
 
 def _positive_int(text: str) -> int:
@@ -35,6 +59,18 @@ def _config_list(text: str) -> list[str]:
     return names
 
 
+def _add_config_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument(
+        "--set",
+        dest="overrides",
+        action="append",
+        default=[],
+        metavar="SECTION.KEY=VALUE",
+        help="override one config value (repeatable), e.g. --set judge.name=openai/gpt-4.1",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="rk", description="ResearchKiller Phase 1: terminology-shift retrieval benchmark."
@@ -42,7 +78,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
     corpus = sub.add_parser("build-corpus", help="build and freeze the OpenAlex corpus and targets")
-    corpus.add_argument("--config", type=Path, required=True)
+    _add_config_arguments(corpus)
     corpus.add_argument(
         "--max-works",
         type=_positive_int,
@@ -50,10 +86,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     index = sub.add_parser("build-index", help="build the BM25 and dense indexes")
-    index.add_argument("--config", type=Path, required=True)
+    _add_config_arguments(index)
 
     bench = sub.add_parser("make-bench", help="generate (or resume) the Test A benchmark")
-    bench.add_argument("--config", type=Path, required=True)
+    _add_config_arguments(bench)
     bench.add_argument(
         "--limit", type=_positive_int, help="work on at most N targets in this run"
     )
@@ -63,8 +99,43 @@ def build_parser() -> argparse.ArgumentParser:
         help="print title, abstract opening and proposal for each accepted target",
     )
 
+    validate = sub.add_parser(
+        "validate-judge",
+        help="measure the judge on accepted pairs and on deliberately corrupted proposals",
+    )
+    _add_config_arguments(validate)
+    validate.add_argument(
+        "--n", type=_positive_int, default=30, help="use the first N accepted pairs (default 30)"
+    )
+    validate.add_argument(
+        "--out-dir",
+        type=Path,
+        default=JUDGE_VALIDATION_DIR,
+        help=f"where to write the results (default {JUDGE_VALIDATION_DIR})",
+    )
+
+    check = sub.add_parser(
+        "export-human-check", help="write a random sample of accepted pairs to a CSV to check by hand"
+    )
+    _add_config_arguments(check)
+    check.add_argument(
+        "--n", type=_positive_int, default=20, help="how many pairs to sample (default 20)"
+    )
+    check.add_argument(
+        "--out",
+        type=Path,
+        default=HUMAN_CHECK_FILE,
+        help=f"CSV to write; never overwritten (default {HUMAN_CHECK_FILE})",
+    )
+    check.add_argument(
+        "--validation-dir",
+        type=Path,
+        default=None,
+        help="also add the originals the judge rejected in this validate-judge run (part B)",
+    )
+
     run = sub.add_parser("run", help="evaluate retrieval configurations on the benchmark")
-    run.add_argument("--config", type=Path, required=True)
+    _add_config_arguments(run)
     run.add_argument(
         "--configs",
         type=_config_list,
@@ -85,8 +156,10 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def build_corpus_command(config_path: Path, max_works: int | None) -> int:
-    cfg = load_config(config_path)
+def build_corpus_command(
+    config_path: Path, max_works: int | None, overrides: Sequence[str] = ()
+) -> int:
+    cfg = load_config(config_path, overrides)
     if max_works is not None:
         corpus = dataclasses.replace(cfg.corpus, max_works_per_sweep=max_works)
         cfg = dataclasses.replace(cfg, corpus=corpus)
@@ -103,8 +176,8 @@ def build_corpus_command(config_path: Path, max_works: int | None) -> int:
     return 0
 
 
-def build_index_command(config_path: Path) -> int:
-    cfg = load_config(config_path)
+def build_index_command(config_path: Path, overrides: Sequence[str] = ()) -> int:
+    cfg = load_config(config_path, overrides)
     encoder = make_encoder(cfg.retrieval)
     manifest = build_index(cfg, encoder)
     print(
@@ -115,8 +188,10 @@ def build_index_command(config_path: Path) -> int:
     return 0
 
 
-def make_bench_command(config_path: Path, limit: int | None, show: bool) -> int:
-    cfg = load_config(config_path)
+def make_bench_command(
+    config_path: Path, limit: int | None, show: bool, overrides: Sequence[str] = ()
+) -> int:
+    cfg = load_config(config_path, overrides)
     with ExitStack() as stack:
         cache = stack.enter_context(LLMCache(cfg.run.cache_path))
         ledger = stack.enter_context(
@@ -127,12 +202,57 @@ def make_bench_command(config_path: Path, limit: int | None, show: bool) -> int:
         stats = make_bench(cfg, paraphraser, judge, limit=limit)
     print(
         f"rk make-bench: {stats['accepted']} of {stats['n_targets_goal']} queries accepted "
-        f"({stats['rejected']} rejected attempts, {stats['exhausted']} targets exhausted); "
+        f"({stats['rejected']} rejected attempts, {stats['exhausted']} targets exhausted, "
+        f"{stats['skipped']} skipped as not research contributions); "
         f"method cost ${stats['method_cost']:.4f}, money spent ${stats['money_spent']:.4f}; "
         f"outputs in {cfg.bench.out_dir}"
     )
     if show:
         print(format_accepted(cfg), end="")
+    return 0
+
+
+def validate_judge_command(
+    config_path: Path, n: int, out_dir: Path, overrides: Sequence[str] = ()
+) -> int:
+    cfg = load_config(config_path, overrides)
+    with ExitStack() as stack:
+        cache = stack.enter_context(LLMCache(cfg.run.cache_path))
+        ledger = stack.enter_context(
+            Ledger(cfg.run.cache_path, cfg.run.budget_cap, command="validate-judge")
+        )
+        paraphraser = stack.enter_context(closing(LLMClient(cfg.paraphraser, cache, ledger)))
+        judge = stack.enter_context(closing(LLMClient(cfg.judge, cache, ledger)))
+        summary = validate_judge(cfg, paraphraser, judge, n=n, out_dir=out_dir)
+    lines = [f"rk validate-judge: {summary['n_pairs']} pairs from {summary['bench_dir']}"]
+    for variant, s in summary["variants"].items():
+        verb, count, rate = (
+            ("accepted", s["accepted"], s["acceptance_rate"])
+            if variant == "original"
+            else ("rejected", s["rejected"], s["rejection_rate"])
+        )
+        lines.append(f"  {variant:12} {verb} {count}/{s['n']} ({rate:.0%})")
+    lines.append(
+        f"method cost ${summary['method_cost']:.4f}, money spent ${summary['money_spent']:.4f}; "
+        f"outputs in {out_dir}"
+    )
+    print("\n".join(lines))
+    return 0
+
+
+def export_human_check_command(
+    config_path: Path,
+    n: int,
+    out: Path,
+    validation_dir: Path | None = None,
+    overrides: Sequence[str] = (),
+) -> int:
+    cfg = load_config(config_path, overrides)
+    part_a, part_b = export_human_check(cfg, n=n, out_path=out, validation_dir=validation_dir)
+    line = f"rk export-human-check: wrote {part_a} accepted pairs from {cfg.bench.out_dir}"
+    if validation_dir is not None:
+        line += f" and {part_b} rejected originals from {validation_dir}"
+    print(f"{line} to {out}")
     return 0
 
 
@@ -142,8 +262,9 @@ def run_command(
     limit: int | None,
     run_dir: Path | None,
     retry_errors: bool,
+    overrides: Sequence[str] = (),
 ) -> int:
-    cfg = load_config(config_path)
+    cfg = load_config(config_path, overrides)
     with ExitStack() as stack:
         cache = stack.enter_context(LLMCache(cfg.run.cache_path))
         ledger = stack.enter_context(Ledger(cfg.run.cache_path, cfg.run.budget_cap, command="run"))
@@ -178,14 +299,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--retry-errors needs --run-dir (the run whose errors to retry)")
     try:
         if args.command == "build-corpus":
-            return build_corpus_command(args.config, args.max_works)
+            return build_corpus_command(args.config, args.max_works, args.overrides)
         if args.command == "build-index":
-            return build_index_command(args.config)
+            return build_index_command(args.config, args.overrides)
         if args.command == "make-bench":
-            return make_bench_command(args.config, args.limit, args.show)
+            return make_bench_command(args.config, args.limit, args.show, args.overrides)
+        if args.command == "validate-judge":
+            return validate_judge_command(args.config, args.n, args.out_dir, args.overrides)
+        if args.command == "export-human-check":
+            return export_human_check_command(
+                args.config, args.n, args.out, args.validation_dir, args.overrides
+            )
         if args.command == "run":
             return run_command(
-                args.config, args.configs, args.limit, args.run_dir, args.retry_errors
+                args.config,
+                args.configs,
+                args.limit,
+                args.run_dir,
+                args.retry_errors,
+                args.overrides,
             )
         return report_command(args.run_dir)
     except (
@@ -203,5 +335,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
 
+def entry() -> int:
+    """Process entry point (`python -m rk` and the `rk` script): load .env, then run main()."""
+    load_env_file()
+    return main()
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(entry())

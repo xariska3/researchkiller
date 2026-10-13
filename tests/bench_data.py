@@ -7,9 +7,37 @@ is the corresponding GOOD proposal with one change that trips one check.
 
 from __future__ import annotations
 
+import json
+from collections.abc import Mapping
 from typing import Any
 
 T1, T2, T3 = "W101", "W102", "W103"
+
+FACETS = ("problem", "method", "domain", "claim")
+
+
+def judge_reply(
+    failed: Mapping[str, str] | None = None, *, verdict: str | None = None, reason: str = "ok"
+) -> str:
+    """A facet-by-facet judge answer in the prompts' JSON format.
+
+    `failed` maps facets to the reason they don't match; the verdict defaults
+    to "no" if any facet failed, else "yes".
+    """
+    failed = dict(failed or {})
+    return json.dumps(
+        {
+            "facets": {f: {"paper": f"paper {f}", "proposal": f"proposal {f}"} for f in FACETS},
+            "match": {
+                f: {"match": "no", "reason": failed[f]}
+                if f in failed
+                else {"match": "yes", "reason": "same"}
+                for f in FACETS
+            },
+            "verdict": verdict or ("no" if failed else "yes"),
+            "reason": reason,
+        }
+    )
 
 TITLES = {
     T1: "Sparse attention routing for long document summarisation",

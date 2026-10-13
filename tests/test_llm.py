@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Callable
 from contextlib import closing
@@ -17,10 +18,13 @@ from rk.llm import (
     LLMClient,
     LLMError,
     Usage,
+    billed_cost,
     cache_key,
     parse_json,
     pessimistic_cost,
     prompt_token_bound,
+    provider_routing,
+    served_provider,
     token_cost,
 )
 
@@ -51,8 +55,13 @@ def test_cache_hit_reuses_reply_and_still_counts_method_cost(
     assert (first.cached, second.cached) == (False, True)
     assert second.text == first.text == "The answer is 42."
     cost = token_cost(model, 4, 4)
-    assert first.usage == Usage(
-        calls=1, prompt_tokens=4, completion_tokens=4, method_cost=cost, money_spent=cost
+    assert first.usage == Usage(  # no billed cost reported, so the computed one stands in
+        calls=1,
+        prompt_tokens=4,
+        completion_tokens=4,
+        method_cost=cost,
+        money_spent=cost,
+        billed_cost=cost,
     )
     assert second.usage == Usage(
         calls=1, cache_hits=1, prompt_tokens=4, completion_tokens=4, method_cost=cost
@@ -101,6 +110,191 @@ def test_cache_key_covers_every_request_field(change: dict[str, Any]) -> None:
     }
     assert cache_key(**base) == cache_key(**{**base, "temperature": 0})  # int vs float
     assert cache_key(**base) != cache_key(**{**base, **change})
+
+
+def test_cache_key_covers_a_provider_pin_and_is_unchanged_without_one() -> None:
+    base: dict[str, Any] = {
+        "model": "m",
+        "messages": MSGS,
+        "temperature": 0.0,
+        "seed": 7,
+        "max_tokens": 64,
+    }
+    unpinned = cache_key(**base)
+    assert cache_key(**base, provider=None) == unpinned
+    novita = cache_key(**base, provider=provider_routing("novita/fp8"))
+    parasail = cache_key(**base, provider=provider_routing("parasail/fp8"))
+    assert len({unpinned, novita, parasail}) == 3
+
+
+def test_pinned_provider_is_sent_without_fallbacks_and_the_served_one_is_recorded(
+    db_path: Path, llm_cache: LLMCache, make_ledger: MakeLedger, api_key: str
+) -> None:
+    fake = FakeLLM(["reply"], provider="Novita")
+    model = make_model_config(provider="novita/fp8")
+    client = LLMClient(model, llm_cache, make_ledger(), transport=fake.transport)
+
+    first = client.complete(MSGS)
+    second = client.complete(MSGS)  # from the cache
+
+    assert fake.requests[0]["provider"] == {
+        "order": ["novita/fp8"],
+        "allow_fallbacks": False,
+        "require_parameters": True,  # refuse rather than drop seed, temperature, max_tokens
+    }
+    assert fake.headers[0]["X-OpenRouter-Metadata"] == "enabled"
+    assert (first.provider, second.cached, second.provider) == ("Novita", True, "Novita")
+    with closing(sqlite3.connect(db_path)) as conn:
+        spend = conn.execute("SELECT model, provider FROM spend").fetchall()
+        stored = conn.execute("SELECT provider, request FROM completions").fetchall()
+    assert spend == [("fake-model", "Novita")]
+    assert stored[0][0] == "Novita" and '"require_parameters": true' in stored[0][1]
+
+
+def test_unpinned_requests_have_no_provider_field(
+    db_path: Path, llm_cache: LLMCache, make_ledger: MakeLedger, api_key: str
+) -> None:
+    fake = FakeLLM(["reply"])  # like a server that doesn't report a provider
+    client = LLMClient(make_model_config(), llm_cache, make_ledger(), transport=fake.transport)
+    assert client.complete(MSGS).provider is None
+    assert "provider" not in fake.requests[0]
+    assert fake.headers[0]["X-OpenRouter-Metadata"] == "enabled"  # harmless elsewhere
+    with closing(sqlite3.connect(db_path)) as conn:  # nothing reported, nothing invented
+        assert conn.execute("SELECT billed_cost, provider FROM spend").fetchall() == [(None, None)]
+
+
+SCHEMA = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "answer",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {"verdict": {"type": "string"}},
+            "required": ["verdict"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+def test_response_format_is_sent_and_is_part_of_the_cache_key(
+    llm_cache: LLMCache, make_ledger: MakeLedger, api_key: str
+) -> None:
+    fake = FakeLLM(['{"verdict": "yes"}', "free text"])
+    ledger = make_ledger(cap=1.0)
+    client = LLMClient(make_model_config(), llm_cache, ledger, transport=fake.transport)
+
+    structured = client.complete(MSGS, response_format=SCHEMA)
+    free = client.complete(MSGS)  # same messages, no schema: not served from the cache
+
+    assert fake.requests[0]["response_format"] == SCHEMA
+    assert "response_format" not in fake.requests[1]
+    assert (structured.text, free.text, free.cached) == ('{"verdict": "yes"}', "free text", False)
+    assert client.complete(MSGS, response_format=SCHEMA).cached
+    base: dict[str, Any] = {
+        "model": "m", "messages": MSGS, "temperature": 0.0, "seed": 7, "max_tokens": 64,
+    }
+    assert cache_key(**base) == cache_key(**base, response_format=None)
+    assert cache_key(**base) != cache_key(**base, response_format=SCHEMA)
+
+
+def test_the_reservation_covers_the_schema_too(
+    llm_cache: LLMCache, make_ledger: MakeLedger, api_key: str
+) -> None:
+    model = make_model_config()
+    seen: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(ledger.spent)  # the reservation while the call is in flight
+        return FakeLLM(["ok"]).handle(request)
+
+    ledger = make_ledger(cap=1.0)
+    client = LLMClient(model, llm_cache, ledger, transport=httpx.MockTransport(handler))
+    client.complete(MSGS, response_format=SCHEMA)
+    schema_bytes = len(json.dumps(SCHEMA).encode("utf-8"))
+    assert seen[0] == pytest.approx(
+        token_cost(model, prompt_token_bound(MSGS) + schema_bytes, model.max_tokens)
+    )
+
+
+def _metadata(*endpoints: tuple[str, bool]) -> dict[str, Any]:
+    available = [{"provider": p, "model": "m", "selected": s} for p, s in endpoints]
+    return {"endpoints": {"total": len(available), "available": available}}
+
+
+@pytest.mark.parametrize(
+    ("data", "expected"),
+    [
+        ({"openrouter_metadata": _metadata(("A", False), ("B", True)), "provider": "C"}, "B"),
+        ({"provider": "Liquid"}, "Liquid"),  # the top-level field, without metadata
+        ({"openrouter_metadata": _metadata(("A", False)), "provider": "Liquid"}, "Liquid"),
+        ({"openrouter_metadata": {"endpoints": "garbled"}}, None),
+        ({"provider": 5}, None),
+        ({}, None),
+    ],
+)
+def test_served_provider(data: dict[str, Any], expected: str | None) -> None:
+    assert served_provider(data) == expected
+
+
+def test_billed_cost_is_stored_next_to_the_computed_cost_and_counts_against_the_cap(
+    db_path: Path, llm_cache: LLMCache, make_ledger: MakeLedger, api_key: str
+) -> None:
+    model = make_model_config()
+    fake = FakeLLM(["The answer is 42.", "unused"], billed_cost=0.9999)
+    ledger = make_ledger(cap=1.0)
+    client = LLMClient(model, llm_cache, ledger, transport=fake.transport)
+
+    out = client.complete(MSGS)
+
+    computed = token_cost(model, 4, 4)
+    with closing(sqlite3.connect(db_path)) as conn:
+        assert conn.execute("SELECT cost, billed_cost FROM spend").fetchall() == [
+            (computed, 0.9999)
+        ]
+    assert ledger.spent == pytest.approx(0.9999)  # billed, not the ~$0.00001 computed
+    assert out.usage.money_spent == computed  # Usage keeps the config-price cost...
+    assert out.usage.billed_cost == 0.9999  # ...and the billed one beside it
+    again = client.complete(MSGS)
+    assert again.cached and again.usage.billed_cost == again.usage.money_spent == 0.0
+    with pytest.raises(BudgetExceeded):  # computed spend alone would leave ~$1 of the cap
+        client.complete(OTHER_MSGS)
+    assert len(fake.calls) == 1
+
+
+def test_ledger_counts_billed_cost_when_present_else_computed_cost(db_path: Path) -> None:
+    with Ledger(db_path, cap=5.0, command="make-bench") as ledger:
+        for billed in (0.75, None):
+            ledger.charge(1.0)
+            ledger.record(
+                reserved=1.0,
+                model="m",
+                prompt_tokens=1,
+                completion_tokens=1,
+                cost=0.5,
+                billed_cost=billed,
+            )
+        assert ledger.spent == 1.25
+    with Ledger(db_path, cap=5.0, command="run") as later:  # the persisted total agrees
+        assert later.spent == 1.25
+
+
+@pytest.mark.parametrize(
+    ("data", "expected"),
+    [
+        ({"usage": {"cost": 0.0012}}, 0.0012),
+        ({"usage": {"cost": 0}}, 0.0),  # a free call is billed $0, which is not "unknown"
+        ({"usage": {"cost": "0.1"}}, None),
+        ({"usage": {"cost": True}}, None),
+        ({"usage": {"cost": -1.0}}, None),
+        ({"usage": {"cost": float("nan")}}, None),
+        ({"usage": {"prompt_tokens": 4}}, None),  # a server that doesn't report it
+        ({}, None),
+    ],
+)
+def test_billed_cost(data: dict[str, Any], expected: float | None) -> None:
+    assert billed_cost(data) == expected
 
 
 def test_seed_override_is_a_separate_cache_entry(

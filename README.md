@@ -18,12 +18,19 @@ encoding on Windows, first install a CUDA build of torch
 (`pip install torch --index-url https://download.pytorch.org/whl/cu128`), since
 the PyPI wheel is CPU-only.
 
+API keys go in `.env` at the repo root (copy `.env.example`; `.env` is
+git-ignored): `OPENROUTER_API_KEY` for the paraphraser, judge and agent, and
+optionally `OPENALEX_API_KEY`. `python -m rk` loads the file at startup;
+variables already set in the environment take precedence.
+
 ## Running
 
 ```
 python -m rk build-corpus --config configs/phase1.yaml [--max-works N]
 python -m rk build-index  --config configs/phase1.yaml
 python -m rk make-bench   --config configs/phase1.yaml [--limit N] [--show]
+python -m rk validate-judge --config configs/phase1.yaml [--n 30]
+python -m rk export-human-check --config configs/phase1.yaml [--n 20]
 python -m rk run          --config configs/phase1.yaml [--configs B1,B4,B5] [--limit N]
 python -m rk report       runs/<timestamp>
 ```
@@ -31,8 +38,9 @@ python -m rk report       runs/<timestamp>
 A run stores one row per configuration and query in `data/results.sqlite`
 (tables `runs` and `query_results`), writes a portable copy to
 `runs/<timestamp>/per_query/`, and summarises it in `summary.md` and
-`summary.json`. To resume an interrupted run, pass `--run-dir runs/<timestamp>`;
-add `--retry-errors` to redo the rows that ended in an LLM error.
+`summary.json`. To resume an interrupted run, or add configurations to a run,
+pass `--run-dir runs/<timestamp>`; add `--retry-errors` to redo the rows that
+ended in an LLM error.
 
 ## Experiment tracking
 
