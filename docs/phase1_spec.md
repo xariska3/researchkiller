@@ -19,6 +19,7 @@ researchkiller/
 +-- .github/workflows/ci.yml  # Python 3.10: ruff check, then pytest
 +-- configs/phase1.yaml
 +-- docs/phase1_spec.md
++-- docs/analysis_plan.md
 +-- src/rk/
 ¦   +-- __init__.py
 ¦   +-- config.py         # YAML -> dataclasses
@@ -31,7 +32,8 @@ researchkiller/
 ¦   +-- bench.py          # paraphrase generation + filters
 ¦   +-- retrieval.py      # indexes, B1-B4 (and B4-D), fusion
 ¦   +-- agent.py          # B5, B5-U, B5-D, all eight configs wired from the config
-¦   +-- evaluate.py       # runner, metrics, paired statistics
+¦   +-- evaluate.py       # runner, metrics, paired statistics, robustness subset
+¦   +-- exhaustion.py     # exhaustion check of the bench (docs/analysis_plan.md)
 ¦   +-- cli.py            # CLI, run as `python -m rk`
 ¦   +-- __main__.py       # enables `python -m rk`
 +-- tests/
@@ -329,7 +331,8 @@ dtype or max sequence length differs from the index's.
 - **Results database** (`run.results_db`, default `data/results.sqlite`):
   tables `runs` (run metadata) and `query_results` (one row per run, config and
   query), written as rows finish. `per_query/<config>.jsonl` is a portable
-  copy. `python -m rk report` rebuilds the summary from the database with SQL.
+  copy. `python -m rk report` rebuilds the summary from the database with SQL
+  (and the exhaustion check from the bench).
   A database from before billed costs were recorded gets the `billed_cost`
   column added on open; its earlier rows have none.
 - **Metrics**: per config Hit@1/5/10 and MRR, and mean/p50/p95 of queries
@@ -337,24 +340,33 @@ dtype or max sequence length differs from the index's.
 - **Difficulty**: each query's B1 target rank is its difficulty (recorded,
   **never filtered on**). Hit@5 per config within B1-rank buckets 1, 2–10,
   11–100 and not found (only when B1 is part of the run).
-- **Paired comparisons**: B4 vs B3, **B5 vs B4 (the primary comparison)**,
-  B5-U vs B5; secondary: B2 vs B3, B4-D vs B2, B5-D vs B2, B5-D vs B4-D. All on
-  queries that succeeded in both configs: seeded paired bootstrap (10,000
-  resamples, `run.seed`) 95% CI on ΔHit@5 and ΔMRR, and an exact McNemar test
-  on Hit@5.
+- **Paired comparisons**: **B5 vs B4 is the primary comparison**, decided by
+  Hit@5 with the McNemar test (MRR is supporting). Secondary (exploratory):
+  B4 vs B3, B5-U vs B5, B2 vs B3, B4-D vs B2, B5-D vs B2, B5-D vs B4-D, and
+  every other config vs B2 (B1, B4, B5, B5-U). All on queries that succeeded in
+  both configs: seeded paired bootstrap (10,000 resamples, `run.seed`) 95% CI
+  on ΔHit@5 and ΔMRR, and an exact McNemar test on Hit@5.
 - **Analysis plan**: the full run's analyses are fixed in
-  `docs/analysis_plan.md`, written before the full run. Besides the tables
-  above, it adds every config vs B2, the main table and primary comparison
-  without the pilot targets, and a check of which targets the bench exhausts;
-  `python -m rk report` doesn't compute those three yet.
+  `docs/analysis_plan.md`, written before the full run. It adds two analyses:
+  - **Robustness**: the main table and primary comparison repeated without
+    the pilot targets the bench design was tuned on, qids A0000–A0044
+    (`PILOT_POSITIONS`).
+  - **Exhaustion check** (`rk/exhaustion.py`): exhausted vs accepted targets
+    on abstract length, the share of sentences with a number or a results
+    cue, and subfield (topic descriptively). It gives a bootstrap CI and a
+    permutation p for each, plus the rejection reasons of the exhausted
+    targets. It reads the bench and corpus through the run's config snapshot
+    and is computed only while `test_a.jsonl` has the sha256 the run
+    recorded.
 - A cost–quality table: Hit@5 and MRR next to mean method cost per query. Cost
   tables use computed cost (config prices); billed cost is reported
   separately, per config: the calls the run actually sent, at the config
   prices next to what the API billed, with a note on why they differ.
 - Outputs per run in `runs/<timestamp>/`: `run.json`, `config.yaml`,
   `per_query/<config>.jsonl`, `summary.json` and `summary.md` (main,
-  effort, difficulty, paired (primary and secondary), cost–quality, billed
-  cost and error tables). The summary's header gives the commit the run was
+  effort, difficulty, primary comparison, secondary comparisons, robustness,
+  exhaustion check, cost–quality, billed cost and error tables). The summary's
+  header gives the commit the run was
   created at and, for every resume recorded in `run.json`, when and at which
   commit it was resumed.
 - **MLflow** (core dependency) with the documented default SQLite backend
@@ -395,7 +407,8 @@ on Windows, so docs always use `python -m rk`.
 4. Retrieval B1–B5, tests on the fixture corpus.
 5. Evaluation runner, metrics, paired stats, CLI wiring, end-to-end test on fixtures.
 6. Pilot on real data (small: ~30 targets) and fix what breaks.
-7. Full run, README with results and limitations, push.
+7. Finish the bench (`make-bench` up to `n_targets`), full run, README with
+   results and limitations, push.
 
 ## Out of scope for Phase 1
 Test B (false prior-art accusations; needs independent novelty labels such as

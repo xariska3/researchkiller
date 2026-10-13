@@ -9,17 +9,28 @@ from typing import Any
 
 import pytest
 import yaml
-from bench_data import GOOD, T2, TITLES, corpus_records, judge_reply, target_rows
+from bench_data import (
+    ABSTRACTS,
+    GOOD,
+    T1,
+    T2,
+    T3,
+    TITLES,
+    corpus_records,
+    judge_reply,
+    target_rows,
+)
 from conftest import FakeEncoder, FakeLLM, corpus_config_dict
 
 from rk import cli
-from rk.bench import _visit_order, make_bench, make_qid
+from rk.bench import _visit_order, make_bench, make_qid, qid_position
 from rk.config import Config, config_from_dict
 from rk.corpus import freeze
 from rk.evaluate import (
     CONFIG_ORDER,
     PER_QUERY_DIR,
     RUN_FILE,
+    SECONDARY_PAIRS,
     SUMMARY_JSON,
     SUMMARY_MD,
     EvalError,
@@ -169,16 +180,18 @@ def test_llm_errors_mark_rows_and_are_left_out_of_paired_stats(cfg: Config) -> N
     assert all(r["error"] == "LLMError: simulated outage" for r in rows if r["status"] == "error")
     summary = json.loads((run_dir / SUMMARY_JSON).read_text(encoding="utf-8"))
     assert summary["errors"] == {c: int(c in llm_configs) for c in CONFIG_ORDER}
-    assert {(p["a"], p["b"]): p["n"] for p in summary["paired"]} == {
-        ("B4", "B3"): 2,
-        ("B5", "B4"): 2,
-        ("B5-U", "B5"): 2,
-    }
+    assert {(p["a"], p["b"]): p["n"] for p in summary["paired"]} == {("B5", "B4"): 2}
     assert {(p["a"], p["b"]): p["n"] for p in summary["paired_secondary"]} == {
+        ("B4", "B3"): 2,
+        ("B5-U", "B5"): 2,
         ("B2", "B3"): 3,
         ("B4-D", "B2"): 2,
         ("B5-D", "B2"): 2,
         ("B5-D", "B4-D"): 2,
+        ("B1", "B2"): 3,
+        ("B4", "B2"): 2,
+        ("B5", "B2"): 2,
+        ("B5-U", "B2"): 2,
     }
     assert summary["quality"]["B4"]["n_ok"] == 2
 
@@ -244,6 +257,132 @@ def test_the_summary_lists_the_commits_a_run_was_resumed_at(
     assert report(run_dir) == summary  # report reads the resumes from run.json too
 
 
+# --- analysis plan: robustness subset and exhaustion check --------------------
+
+
+def test_robustness_repeats_the_main_table_and_primary_comparison_after_the_pilot_qids(
+    cfg: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("rk.evaluate.PILOT_POSITIONS", 1)  # the fixture's qids are A0000-A0002
+    run_dir = run_eval(cfg, agent(), FakeEncoder(), log_mlflow=False)
+
+    summary = json.loads((run_dir / SUMMARY_JSON).read_text(encoding="utf-8"))
+    robust = summary["robustness"]
+    assert (robust["first_qid"], robust["n_queries"]) == ("A0001", 2)
+    kept = [r for r in _rows(cfg, run_dir) if qid_position(r["qid"]) >= 1]
+    for config in CONFIG_ORDER:
+        rows = [r for r in kept if r["config"] == config]
+        quality = robust["quality"][config]
+        assert (quality["n_ok"], quality["n_error"]) == (2, 0)
+        for k in (1, 5, 10):
+            hits = sum(r[f"hit_at_{k}"] for r in rows) / 2
+            assert quality[f"hit_at_{k}"] == pytest.approx(hits)
+        assert quality["mrr"] == pytest.approx(sum(r["reciprocal_rank"] for r in rows) / 2)
+    primary = robust["primary"]
+    assert (primary["a"], primary["b"], primary["n"]) == ("B5", "B4", 2)
+    markdown = (run_dir / SUMMARY_MD).read_text(encoding="utf-8")
+    section = markdown.split("## Robustness: without the pilot targets (exploratory)", 1)[1]
+    assert "Only the queries from qid A0001 onward" in section
+    assert "| B5 vs B4 (primary) | 2 |" in section.split("## Exhaustion check", 1)[0]
+
+
+def test_a_run_of_pilot_queries_only_has_no_robustness_subset(cfg: Config) -> None:
+    run_dir = run_eval(cfg, agent(), FakeEncoder(), log_mlflow=False)  # qids A0000-A0002
+
+    robust = json.loads((run_dir / SUMMARY_JSON).read_text(encoding="utf-8"))["robustness"]
+    assert (robust["first_qid"], robust["n_queries"]) == ("A0045", 0)
+    assert robust["quality"]["B1"]["n_ok"] == 0 and robust["quality"]["B1"]["hit_at_5"] is None
+    assert "This run has none of those queries." in (run_dir / SUMMARY_MD).read_text("utf-8")
+
+
+SUBFIELDS = {  # (subfield, topic) of each fixture target
+    T1: ("Artificial Intelligence", "Topic Modeling"),
+    T2: ("Artificial Intelligence", "Natural Language Processing Techniques"),
+    T3: ("Information Systems", "Information Retrieval and Search Behavior"),
+}
+
+
+@pytest.fixture
+def cfg_one_exhausted(tmp_path: Path) -> Config:
+    """Targets with subfields and topics; the judge rejects every proposal for T3 on its claim."""
+    config = config_from_dict(_config_dict(tmp_path))
+    records = corpus_records()
+    for record in records:
+        if record["id"] in SUBFIELDS:
+            subfield, topic = SUBFIELDS[record["id"]]
+            record["primary_topic"] = {"subfield": subfield, "display_name": topic}
+    freeze(config.corpus.out_dir, records, target_rows(), {})
+    build_index(config, FakeEncoder())
+    aims = judge_reply({"claim": "states aims rather than the paper's findings"})
+
+    def judge(messages: list[dict[str, str]]) -> str:
+        return aims if GOOD[T3] in messages[-1]["content"] else YES
+
+    stats = make_bench(config, _paraphraser(), FakeLLM(judge))
+    assert (stats["accepted"], stats["exhausted"]) == (2, 1)
+    return config
+
+
+def test_the_exhaustion_check_compares_exhausted_and_accepted_targets(
+    cfg_one_exhausted: Config,
+) -> None:
+    cfg = cfg_one_exhausted
+    run_dir = run_eval(cfg, agent(), FakeEncoder(), configs=["B1"], log_mlflow=False)
+
+    ex = json.loads((run_dir / SUMMARY_JSON).read_text(encoding="utf-8"))["exhaustion"]
+    attempts = cfg.bench.max_attempts_per_target
+    assert ex["max_attempts"] == attempts
+    assert ex["n"] == {"accepted": 2, "exhausted": 1, "unfinished": 0, "skipped": 0}
+    words = ex["measures"]["abstract_words"]  # a = exhausted (T3), b = accepted (T1, T2)
+    assert words["mean_a"] == len(ABSTRACTS[T3].split())
+    assert words["mean_b"] == (len(ABSTRACTS[T1].split()) + len(ABSTRACTS[T2].split())) / 2
+    # "show" is the only results cue: in 1 of T1's 4 sentences and 1 of T2's 3; none in T3.
+    results = ex["measures"]["results_sentence_share"]
+    assert results["mean_a"] == 0.0 and results["mean_b"] == pytest.approx((1 / 4 + 1 / 3) / 2)
+    assert results["diff"] == pytest.approx(-(1 / 4 + 1 / 3) / 2)
+    assert ex["measures"]["number_sentence_share"]["diff"] == 0.0  # no digits in any of them
+    assert ex["subfield"]["rates"] == {
+        "Artificial Intelligence": {"accepted": 2, "exhausted": 0, "rate": 0.0},
+        "Information Systems": {"accepted": 0, "exhausted": 1, "rate": 1.0},
+    }
+    difference = ex["subfield"]["difference"]
+    assert (difference["a"], difference["b"], difference["diff"]) == (
+        "Information Systems",
+        "Artificial Intelligence",
+        1.0,
+    )
+    assert ex["topic"]["rates"]["Information Retrieval and Search Behavior"]["rate"] == 1.0
+    rejections = ex["exhausted_rejections"]
+    assert rejections["by_reason"] == {"judge_captures": attempts}
+    assert (rejections["judge_attempts"], rejections["targets_with_a_judge_rejection"]) == (
+        attempts,
+        1,
+    )
+    assert rejections["judge_failed_facets"]["captures"]["claim"] == attempts
+    markdown = (run_dir / SUMMARY_MD).read_text(encoding="utf-8")
+    section = markdown.split("## Exhaustion check (exploratory)", 1)[1].split("## Cost", 1)[0]
+    assert "2 accepted and 1 exhausted" in section
+    assert "| Share of sentences with a results cue | 0.000 | 0.292 |" in section
+    assert "| Information Systems | 0 | 1 | 1.000 |" in section
+    assert f"| judge_captures | {attempts} |" in section
+    assert report(run_dir)["exhaustion"] == ex  # report rebuilds it the same way
+
+
+def test_the_exhaustion_check_needs_the_bench_the_run_used(cfg: Config) -> None:
+    run_dir = run_eval(cfg, agent(), FakeEncoder(), configs=["B1"], log_mlflow=False)
+    bench = cfg.bench.out_dir / "test_a.jsonl"
+    first_line = bench.read_text(encoding="utf-8").splitlines()[0]
+    with bench.open("a", encoding="utf-8") as fh:  # the bench grows after the run
+        fh.write(first_line + "\n")
+
+    exhaustion = report(run_dir)["exhaustion"]
+
+    assert exhaustion == {"unavailable": f"{bench} has changed since this run"}
+    assert f"Not computed: {bench} has changed since this run." in (
+        (run_dir / SUMMARY_MD).read_text(encoding="utf-8")
+    )
+
+
 def test_new_configs_can_be_added_to_an_existing_run(cfg: Config) -> None:
     primary = ["B1", "B2", "B3", "B4", "B5", "B5-U"]
     run_dir = run_eval(cfg, agent(), FakeEncoder(), configs=primary, log_mlflow=False)
@@ -260,15 +399,35 @@ def test_new_configs_can_be_added_to_an_existing_run(cfg: Config) -> None:
     summary = json.loads((run_dir / SUMMARY_JSON).read_text(encoding="utf-8"))
     assert summary["configs"] == list(CONFIG_ORDER)
     assert [(p["a"], p["b"]) for p in summary["paired_secondary"]] == [
+        ("B4", "B3"),
+        ("B5-U", "B5"),
         ("B2", "B3"),
         ("B4-D", "B2"),
         ("B5-D", "B2"),
         ("B5-D", "B4-D"),
+        ("B1", "B2"),
+        ("B4", "B2"),
+        ("B5", "B2"),
+        ("B5-U", "B2"),
     ]
     markdown = (run_dir / SUMMARY_MD).read_text(encoding="utf-8")
-    assert "| B5 vs B4 (primary) |" in markdown
-    assert "### Secondary comparisons (dense base)" in markdown
     assert "B4-D and B5-D are secondary" in markdown
+
+
+def test_only_the_primary_comparison_is_in_the_primary_table(cfg: Config) -> None:
+    run_dir = run_eval(cfg, agent(), FakeEncoder(), log_mlflow=False)
+
+    summary = json.loads((run_dir / SUMMARY_JSON).read_text(encoding="utf-8"))
+    assert [(p["a"], p["b"]) for p in summary["paired"]] == [("B5", "B4")]
+    markdown = (run_dir / SUMMARY_MD).read_text(encoding="utf-8")
+    primary, rest = markdown.split("## Primary comparison", 1)[1].split("## Secondary", 1)
+    assert "| B5 vs B4 (primary) |" in primary
+    assert "B4 vs B3" not in primary and "B5-U vs B5" not in primary
+    assert "Hit@5 with the McNemar test decides the primary comparison" in primary
+    secondary = rest.split("## Robustness", 1)[0]
+    assert "comparisons (exploratory)" in secondary
+    for a, b in SECONDARY_PAIRS:
+        assert f"| {a} vs {b} |" in secondary
 
 
 def test_billed_cost_is_reported_apart_from_the_computed_cost(cfg: Config) -> None:
@@ -402,14 +561,17 @@ def test_end_to_end_cli_run_and_report_with_mlflow(
     )
     summary = json.loads((run_dir / SUMMARY_JSON).read_text(encoding="utf-8"))
     assert summary["configs"] == list(CONFIG_ORDER)
-    assert summary["difficulty"]["bucket_sizes"] and len(summary["paired"]) == 3
-    assert len(summary["paired_secondary"]) == 4
+    assert summary["difficulty"]["bucket_sizes"] and len(summary["paired"]) == 1
+    assert len(summary["paired_secondary"]) == len(SECONDARY_PAIRS)
     markdown = (run_dir / SUMMARY_MD).read_text(encoding="utf-8")
     headings = (
         "Retrieval quality",
         "Effort per query",
         "Hit@5 by difficulty",
-        "Paired comparisons",
+        "Primary comparison",
+        "Secondary comparisons (exploratory)",
+        "Robustness: without the pilot targets (exploratory)",
+        "Exhaustion check (exploratory)",
         "Cost and quality",
         "Billed cost",
         "Errors",

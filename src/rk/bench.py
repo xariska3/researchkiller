@@ -659,6 +659,11 @@ def make_qid(position: int, target_id: str, width: int = 4) -> str:
     return f"A{position:0{width}d}-{target_id}"
 
 
+def qid_position(qid: str) -> int:
+    """The position in the seeded visiting order that make_qid wrote into a qid."""
+    return int(qid[1:].split("-", 1)[0])
+
+
 def _by_attempt(row: dict[str, Any]) -> int:
     return int(row["attempt"])
 

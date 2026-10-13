@@ -26,6 +26,10 @@ how. The design itself is in [phase1_spec.md](phase1_spec.md).
   resamples, `run.seed`);
 - an exact two-sided McNemar test on Hit@5 (only-B5 vs only-B4 hits).
 
+**Decision rule**: Hit@5 with the McNemar test decides the primary comparison,
+at α = 0.05. ΔHit@5 and its CI give the size of the difference. MRR supports
+the result: ΔMRR and its CI are reported, but they don't decide it.
+
 ## Secondary comparisons
 
 These use the same statistics as the primary comparison and are always given
@@ -108,7 +112,8 @@ The implementation must match them.
 - **Measures 1–3**: the mean in each group, and the difference (exhausted minus
   accepted) with a seeded bootstrap 95% CI. The CI uses 10,000 resamples within
   each group and `run.seed`. A two-sided permutation p-value comes from 10,000
-  label permutations, also seeded with `run.seed`.
+  label permutations, also seeded with `run.seed`: p = (1 + the number of
+  permutations whose |difference| is at least the observed one) / 10,001.
 - **Subfield**: the exhaustion rate per subfield, i.e. exhausted / (accepted +
   exhausted). Its difference (Information Systems minus Artificial
   Intelligence) gets the same CI and permutation test.
@@ -126,8 +131,9 @@ or added.
 
 ## Interpretation and reporting
 
-- A difference is called significant when its 95% CI excludes zero. For Hit@5,
-  the McNemar p-value is reported alongside.
+- The primary comparison is decided as stated above. Elsewhere, a difference
+  is called significant when its 95% CI excludes zero. For Hit@5, the McNemar
+  p-value is reported alongside.
 - Only the primary comparison is confirmatory. The secondary comparisons, the
   difficulty and robustness analyses and the exhaustion check are exploratory.
   They are reported without a multiple-comparison correction and labelled as
@@ -144,14 +150,24 @@ or added.
   amendment at the end of this file, with its reason. The text above stays as
   it is.
 
-## Implementation status
+## Implementation
 
-`python -m rk report` already produces:
-- the main, effort, difficulty, cost–quality, billed-cost and error tables;
-- B5 vs B4, B4 vs B3, B5-U vs B5, B2 vs B3, B4-D vs B2, B5-D vs B2 and B5-D vs
-  B4-D.
+`python -m rk run` (at its end) and `python -m rk report` produce everything
+in this plan in `summary.md` and `summary.json`. The sections of `summary.md`:
+- Retrieval quality;
+- Effort per query;
+- Hit@5 by difficulty;
+- Primary comparison, holding only B5 vs B4, with the decision rule;
+- Secondary comparisons (exploratory), in the order listed above;
+- Robustness: without the pilot targets (exploratory);
+- Exhaustion check (exploratory);
+- Cost and quality;
+- Billed cost;
+- Errors.
 
-It doesn't yet produce:
-- B1, B4, B5 and B5-U vs B2;
-- the robustness subset;
-- the exhaustion check.
+The definitions are in `rk.exhaustion` (`NUMBER_RE`, `RESULTS_CUES`) and in
+`rk.evaluate` (`PRIMARY_PAIR`, `SECONDARY_PAIRS`, `PILOT_POSITIONS`).
+
+The exhaustion check reads the bench and frozen corpus through the run's
+config snapshot. It runs only if `test_a.jsonl` still has the sha256 the run
+recorded; otherwise the summary says it wasn't computed.

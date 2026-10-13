@@ -5,8 +5,10 @@
 one finishes, so a rerun into the same run directory resumes, and
 --retry-errors redoes only the rows whose LLM call failed. `summarize` builds
 the summary from the database with SQL; paired statistics use only queries
-that succeeded in both configs. Every run is logged to MLflow as a parent run
-with one child run per config.
+that succeeded in both configs. The summary also has the analyses fixed in
+docs/analysis_plan.md: the robustness subset without the pilot targets, and
+the exhaustion check of the run's bench. Every run is logged to MLflow as a
+parent run with one child run per config.
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ import json
 import math
 import sqlite3
 import subprocess
+from collections import Counter
 from collections.abc import Iterable, Sequence
 from contextlib import closing
 from datetime import datetime, timezone
@@ -27,17 +30,30 @@ import numpy as np
 import yaml
 
 from rk.agent import make_retrievers
-from rk.bench import ACCEPTED_FILE, STATS_FILE
+from rk.bench import ACCEPTED_FILE, STATS_FILE, qid_position
 from rk.config import Config, RunConfig
 from rk.corpus import CORPUS_FILE, load_frozen_corpus
+from rk.exhaustion import exhaustion_check
 from rk.llm import ChatModel, LLMError, load_prompt
 from rk.retrieval import ENCODER_SETTINGS, TOP_K, Encoder, Result, load_index
 
 CONFIG_ORDER = ("B1", "B2", "B3", "B4", "B5", "B5-U", "B4-D", "B5-D")
 SECONDARY_CONFIGS = ("B4-D", "B5-D")  # B4 and B5 with B2 as the base instead of B3
-PRIMARY_PAIR = ("B5", "B4")
-PAIRS = (("B4", "B3"), PRIMARY_PAIR, ("B5-U", "B5"))  # (a, b): a minus b
-SECONDARY_PAIRS = (("B2", "B3"), ("B4-D", "B2"), ("B5-D", "B2"), ("B5-D", "B4-D"))
+PRIMARY_PAIR = ("B5", "B4")  # (a, b): a minus b
+# docs/analysis_plan.md: the other comparisons, then every config vs B2 (B3 vs B2 is B2 vs B3).
+SECONDARY_PAIRS = (
+    ("B4", "B3"),
+    ("B5-U", "B5"),
+    ("B2", "B3"),
+    ("B4-D", "B2"),
+    ("B5-D", "B2"),
+    ("B5-D", "B4-D"),
+    ("B1", "B2"),
+    ("B4", "B2"),
+    ("B5", "B2"),
+    ("B5-U", "B2"),
+)
+PILOT_POSITIONS = 45  # qids A0000-A0044: the targets the bench design was tuned on
 HIT_KS = (1, 5, 10)
 BOOTSTRAP_RESAMPLES = 10_000
 BUCKETS = ("1", "2-10", "11-100", "not found")  # B1 rank of the target
@@ -252,7 +268,7 @@ def summarize(
         ).fetchall()
         ok = conn.execute(
             """
-            SELECT config, qid, target_rank, hit_at_5, reciprocal_rank,
+            SELECT config, qid, target_rank, hit_at_1, hit_at_5, hit_at_10, reciprocal_rank,
                    queries_issued AS queries, llm_calls,
                    prompt_tokens + completion_tokens AS tokens, method_cost, latency_s
             FROM query_results WHERE run_id = ? AND status = 'ok' ORDER BY config, qid
@@ -331,8 +347,9 @@ def summarize(
         },
         "effort": effort,
         "difficulty": _difficulty(by_config),
-        "paired": paired(PAIRS),
+        "paired": paired([PRIMARY_PAIR]),
         "paired_secondary": paired(SECONDARY_PAIRS),
+        "robustness": _robustness(by_config, errors, configs, seed=seed),
         "cost_quality": {
             c: {
                 "hit_at_5": quality_by[c]["hit_at_5"],
@@ -368,6 +385,43 @@ def _difficulty(by_config: dict[str, dict[str, sqlite3.Row]]) -> dict[str, Any] 
     return {"bucket_sizes": counts, "hit_at_5": table}
 
 
+def _robustness(
+    by_config: dict[str, dict[str, sqlite3.Row]],
+    errors: Sequence[sqlite3.Row],
+    configs: Sequence[str],
+    *,
+    seed: int,
+) -> dict[str, Any]:
+    """The main table and primary comparison on the queries after the pilot targets."""
+
+    def kept(qid: str) -> bool:
+        return qid_position(qid) >= PILOT_POSITIONS
+
+    rows = {c: {q: r for q, r in by_config[c].items() if kept(q)} for c in configs}
+    n_error = Counter(e["config"] for e in errors if kept(e["qid"]))
+    qids = {q for c in configs for q in rows[c]} | {e["qid"] for e in errors if kept(e["qid"])}
+
+    def mean(config: str, key: str) -> float | None:
+        values = [r[key] for r in rows[config].values()]
+        return float(np.mean(values)) if values else None
+
+    a, b = PRIMARY_PAIR
+    return {
+        "first_qid": f"A{PILOT_POSITIONS:04d}",
+        "n_queries": len(qids),
+        "quality": {
+            c: {
+                "n_ok": len(rows[c]),
+                "n_error": n_error[c],
+                **{f"hit_at_{k}": mean(c, f"hit_at_{k}") for k in HIT_KS},
+                "mrr": mean(c, "reciprocal_rank"),
+            }
+            for c in configs
+        },
+        "primary": _paired(a, b, rows[a], rows[b], seed=seed) if a in rows and b in rows else None,
+    }
+
+
 def _paired(
     a: str, b: str, rows_a: dict[str, sqlite3.Row], rows_b: dict[str, sqlite3.Row], *, seed: int
 ) -> dict[str, Any]:
@@ -393,8 +447,26 @@ def _f(value: float | None, digits: int = 3) -> str:
     return "–" if value is None else f"{value:.{digits}f}"
 
 
-def _ci(ci: Sequence[float] | None) -> str:
-    return "–" if ci is None else f"[{ci[0]:+.3f}, {ci[1]:+.3f}]"
+def _ci(ci: Sequence[float] | None, digits: int = 3) -> str:
+    return "–" if ci is None else f"[{ci[0]:+.{digits}f}, {ci[1]:+.{digits}f}]"
+
+
+def _p(p: float | None) -> str:
+    return "–" if p is None else f"{p:.3g}"
+
+
+def _quality_table(configs: Sequence[str], quality: dict[str, dict[str, Any]]) -> list[str]:
+    lines = [
+        "| Config | Queries | Errors | Hit@1 | Hit@5 | Hit@10 | MRR |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for c in configs:
+        q = quality[c]
+        lines.append(
+            f"| {c} | {q['n_ok']} | {q['n_error']} | {_f(q['hit_at_1'])} | {_f(q['hit_at_5'])} "
+            f"| {_f(q['hit_at_10'])} | {_f(q['mrr'])} |"
+        )
+    return lines
 
 
 def _paired_table(pairs: Sequence[dict[str, Any]]) -> list[str]:
@@ -428,8 +500,93 @@ def _resumes(resumed: Sequence[dict[str, Any]]) -> list[str]:
     return ["", "Resumed " + "; ".join(parts) + "."]
 
 
+def _robustness_lines(summary: dict[str, Any]) -> list[str]:
+    r = summary["robustness"]
+    lines = [
+        "",
+        "## Robustness: without the pilot targets (exploratory)",
+        "",
+        (
+            f"Only the queries from qid {r['first_qid']} onward: the bench design was tuned on "
+            "the targets before it (docs/analysis_plan.md)."
+        ),
+        "",
+    ]
+    if not r["n_queries"]:
+        return [*lines, "This run has none of those queries."]
+    lines += _quality_table(summary["configs"], r["quality"])
+    return [*lines, "", *_paired_table([r["primary"]] if r["primary"] else [])]
+
+
+MEASURE_LABELS = {  # exhaustion-check measure: (row label, digits)
+    "abstract_words": ("Abstract length (words)", 1),
+    "number_sentence_share": ("Share of sentences with a number", 3),
+    "results_sentence_share": ("Share of sentences with a results cue", 3),
+}
+
+
+def _exhaustion_lines(ex: dict[str, Any]) -> list[str]:
+    lines = ["", "## Exhaustion check (exploratory)", ""]
+    if "unavailable" in ex:
+        return [*lines, f"Not computed: {ex['unavailable']}."]
+    n = ex["n"]
+    lines += [
+        (
+            f"Targets make-bench paraphrased: {n['accepted']} accepted and {n['exhausted']} "
+            f"exhausted (all {ex['max_attempts']} attempts rejected); {n['skipped']} skipped "
+            f"as not research contributions and {n['unfinished']} unfinished are left out. "
+            "Differences are exhausted minus accepted, with a bootstrap 95% CI and a "
+            "permutation p-value (docs/analysis_plan.md)."
+        ),
+        "",
+        (
+            f"| Measure | Exhausted (n={n['exhausted']}) | Accepted (n={n['accepted']}) "
+            "| Difference [95% CI] | p |"
+        ),
+        "|---|---|---|---|---|",
+    ]
+    for m, (label, d) in MEASURE_LABELS.items():
+        g = ex["measures"][m]
+        lines.append(
+            f"| {label} | {_f(g['mean_a'], d)} | {_f(g['mean_b'], d)} "
+            f"| {_f(g['diff'], d)} {_ci(g['ci'], d)} | {_p(g['p'])} |"
+        )
+    for key, name in (("subfield", "Subfield"), ("topic", "Topic")):
+        lines += ["", f"| {name} | Accepted | Exhausted | Exhaustion rate |", "|---|---|---|---|"]
+        for label, cell in ex[key]["rates"].items():
+            lines.append(
+                f"| {label} | {cell['accepted']} | {cell['exhausted']} | {_f(cell['rate'])} |"
+            )
+    diff = ex["subfield"]["difference"]
+    lines += [
+        "",
+        (
+            f"Exhaustion rate, {diff['a']} minus {diff['b']}: {_f(diff['diff'])} "
+            f"{_ci(diff['ci'])}, p {_p(diff['p'])}. Topic is descriptive only."
+        ),
+    ]
+    rej = ex["exhausted_rejections"]
+    facets = "; ".join(
+        f"{direction}: "
+        + (", ".join(f"{f} {k}" for f, k in counts.items() if k) or "none")
+        for direction, counts in rej["judge_failed_facets"].items()
+    )
+    lines += [
+        "",
+        (
+            f"The exhausted targets' {rej['attempts']} rejected attempts: {rej['judge_attempts']} "
+            f"by the judge (on {rej['targets_with_a_judge_rejection']} of {n['exhausted']} "
+            "targets), the rest by the length and leak checks. Facets the judge failed: "
+            f"{facets}."
+        ),
+    ]
+    reasons = [f"| {reason} | {k} |" for reason, k in rej["by_reason"].items()]
+    return [*lines, "", "| Rejection reason | Attempts |", "|---|---|", *(reasons or ["| – | 0 |"])]
+
+
 def render_markdown(summary: dict[str, Any]) -> str:
-    """summary.md: main, effort, difficulty, paired, cost-quality, billed and error tables."""
+    """summary.md: main, effort, difficulty, primary and secondary comparisons, robustness,
+    exhaustion check, cost-quality, billed and error tables."""
     dirty = " (uncommitted changes to tracked files)" if summary["git_dirty"] else ""
     provenance = (
         f"Git {summary['git_commit'] or 'unknown'}{dirty}; corpus sha256 "
@@ -443,15 +600,8 @@ def render_markdown(summary: dict[str, Any]) -> str:
         "",
         "## Retrieval quality",
         "",
-        "| Config | Queries | Errors | Hit@1 | Hit@5 | Hit@10 | MRR |",
-        "|---|---|---|---|---|---|---|",
+        *_quality_table(summary["configs"], summary["quality"]),
     ]
-    for c in summary["configs"]:
-        q = summary["quality"][c]
-        lines.append(
-            f"| {c} | {q['n_ok']} | {q['n_error']} | {_f(q['hit_at_1'])} | {_f(q['hit_at_5'])} "
-            f"| {_f(q['hit_at_10'])} | {_f(q['mrr'])} |"
-        )
     if any(c in SECONDARY_CONFIGS for c in summary["configs"]):
         lines += [
             "",
@@ -488,11 +638,18 @@ def render_markdown(summary: dict[str, Any]) -> str:
             cells = difficulty["hit_at_5"][c]
             lines.append(f"| {c} | " + " | ".join(_f(cells[b]["hit_at_5"]) for b in BUCKETS) + " |")
 
-    lines += ["", "## Paired comparisons (queries that succeeded in both configs)", ""]
+    lines += ["", "## Primary comparison (queries that succeeded in both configs)", ""]
     lines += _paired_table(summary["paired"])
-    if summary["paired_secondary"]:
-        lines += ["", "### Secondary comparisons (dense base)", ""]
-        lines += _paired_table(summary["paired_secondary"])
+    lines += [
+        "",
+        "Hit@5 with the McNemar test decides the primary comparison; MRR is supporting.",
+        "",
+        "## Secondary comparisons (exploratory)",
+        "",
+        *_paired_table(summary["paired_secondary"]),
+        *_robustness_lines(summary),
+        *_exhaustion_lines(summary["exhaustion"]),
+    ]
     lines += [
         "",
         "## Cost and quality",
@@ -551,13 +708,27 @@ def report(run_dir: Path) -> dict[str, Any]:
     if not meta_path.exists():
         raise EvalError(f"{run_dir} is not a run directory (no {RUN_FILE})")
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    summary = summarize(
-        Path(meta["results_db"]),
-        meta["run_id"],
-        seed=meta["seed"],
-        resumed=meta.get("resumed", []),
-    )
+    summary = run_summary(meta, Path(meta["results_db"]), seed=meta["seed"])
     write_summary(run_dir, summary)
+    return summary
+
+
+def run_summary(meta: dict[str, Any], db_path: Path, *, seed: int) -> dict[str, Any]:
+    """summarize() with the resumes from run.json and the exhaustion check of the run's bench.
+
+    The bench and corpus are found through the config snapshot in run.json, so
+    relative paths there are read from the current directory, as `run` read them.
+    """
+    summary = summarize(db_path, meta["run_id"], seed=seed, resumed=meta.get("resumed", []))
+    bench, corpus = meta["config"]["bench"], meta["config"]["corpus"]
+    summary["exhaustion"] = exhaustion_check(
+        Path(bench["out_dir"]),
+        Path(corpus["out_dir"]),
+        max_attempts=bench["max_attempts_per_target"],
+        bench_sha256=meta["bench_sha256"],
+        corpus_sha256=meta["corpus_sha256"],
+        seed=seed,
+    )
     return summary
 
 
@@ -704,13 +875,7 @@ def run_eval(
                     _put(conn, row)
         finally:
             export_jsonl(conn, run_id, run_dir)
-            summary = summarize(
-                cfg.run.results_db,
-                run_id,
-                seed=cfg.run.seed,
-                resumed=run_meta.get("resumed", []),
-            )
-            write_summary(run_dir, summary)
+            write_summary(run_dir, run_summary(run_meta, cfg.run.results_db, seed=cfg.run.seed))
     finally:
         conn.close()
     if log_mlflow:
