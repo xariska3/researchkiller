@@ -222,6 +222,28 @@ def test_rerunning_into_a_run_directory_resumes(cfg: Config) -> None:
     assert _proposals(later).isdisjoint(done_proposal)  # the finished query wasn't redone
 
 
+def test_the_summary_lists_the_commits_a_run_was_resumed_at(
+    cfg: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    created, later = "a" * 40, "b" * 40
+    monkeypatch.setattr("rk.evaluate.git_state", lambda: (created, False, []))
+    run_dir = run_eval(cfg, agent(), FakeEncoder(), limit=1, log_mlflow=False)
+    first = (run_dir / SUMMARY_MD).read_text(encoding="utf-8")
+    assert "Resumed" not in first
+    monkeypatch.setattr("rk.evaluate.git_state", lambda: (later, True, []))
+    run_eval(cfg, agent(), FakeEncoder(), run_dir=run_dir, log_mlflow=False)
+
+    summary = json.loads((run_dir / SUMMARY_JSON).read_text(encoding="utf-8"))
+    assert summary["git_commit"] == created
+    [resume] = summary["resumed"]
+    assert (resume["git_commit"], resume["git_dirty"], resume["retry_errors"]) == (later, True, False)
+    markdown = (run_dir / SUMMARY_MD).read_text(encoding="utf-8")
+    assert f"Git {created};" in markdown
+    line = f"Resumed {resume['at']} at git {later} (uncommitted changes to tracked files)."
+    assert line in markdown
+    assert report(run_dir) == summary  # report reads the resumes from run.json too
+
+
 def test_new_configs_can_be_added_to_an_existing_run(cfg: Config) -> None:
     primary = ["B1", "B2", "B3", "B4", "B5", "B5-U"]
     run_dir = run_eval(cfg, agent(), FakeEncoder(), configs=primary, log_mlflow=False)

@@ -349,7 +349,9 @@ dtype or max sequence length differs from the index's.
 - Outputs per run in `runs/<timestamp>/`: `run.json`, `config.yaml`,
   `per_query/<config>.jsonl`, `summary.json` and `summary.md` (main,
   effort, difficulty, paired (primary and secondary), cost–quality, billed
-  cost and error tables).
+  cost and error tables). The summary's header gives the commit the run was
+  created at and, for every resume recorded in `run.json`, when and at which
+  commit it was resumed.
 - **MLflow** (core dependency) with the documented default SQLite backend
   (`run.mlflow_tracking_uri`, default `sqlite:///mlflow.db` at the repo root,
   artifacts in `mlartifacts/` beside it): one parent run per benchmark run and

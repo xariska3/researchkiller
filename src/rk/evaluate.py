@@ -226,8 +226,13 @@ def bucket(rank: int | None) -> str:
 # --- summary -----------------------------------------------------------------
 
 
-def summarize(db_path: Path, run_id: str, *, seed: int) -> dict[str, Any]:
-    """Every table of the run summary, computed from the results database."""
+def summarize(
+    db_path: Path, run_id: str, *, seed: int, resumed: Sequence[dict[str, Any]] = ()
+) -> dict[str, Any]:
+    """Every table of the run summary, computed from the results database.
+
+    `resumed` is run.json's list of resumes (when, at which commit), for the header.
+    """
     with closing(connect(db_path)) as conn:
         run = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
         if run is None:
@@ -309,6 +314,10 @@ def summarize(db_path: Path, run_id: str, *, seed: int) -> dict[str, Any]:
         "created_at": run["created_at"],
         "git_commit": run["git_commit"],
         "git_dirty": None if run["git_dirty"] is None else bool(run["git_dirty"]),
+        "resumed": [
+            {key: r.get(key) for key in ("at", "git_commit", "git_dirty", "retry_errors")}
+            for r in resumed
+        ],
         "corpus_sha256": run["corpus_sha256"],
         "bench_sha256": run["bench_sha256"],
         "configs": configs,
@@ -407,6 +416,18 @@ def _paired_table(pairs: Sequence[dict[str, Any]]) -> list[str]:
     return lines
 
 
+def _resumes(resumed: Sequence[dict[str, Any]]) -> list[str]:
+    """One header line with when, and at which commit, the run was resumed; none if never."""
+    if not resumed:
+        return []
+    parts = []
+    for r in resumed:
+        dirty = " (uncommitted changes to tracked files)" if r["git_dirty"] else ""
+        retry = ", retrying errors" if r["retry_errors"] else ""
+        parts.append(f"{r['at']} at git {r['git_commit'] or 'unknown'}{dirty}{retry}")
+    return ["", "Resumed " + "; ".join(parts) + "."]
+
+
 def render_markdown(summary: dict[str, Any]) -> str:
     """summary.md: main, effort, difficulty, paired, cost-quality, billed and error tables."""
     dirty = " (uncommitted changes to tracked files)" if summary["git_dirty"] else ""
@@ -418,6 +439,7 @@ def render_markdown(summary: dict[str, Any]) -> str:
         f"# Run {summary['run_id']}",
         "",
         provenance,
+        *_resumes(summary["resumed"]),
         "",
         "## Retrieval quality",
         "",
@@ -529,7 +551,12 @@ def report(run_dir: Path) -> dict[str, Any]:
     if not meta_path.exists():
         raise EvalError(f"{run_dir} is not a run directory (no {RUN_FILE})")
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    summary = summarize(Path(meta["results_db"]), meta["run_id"], seed=meta["seed"])
+    summary = summarize(
+        Path(meta["results_db"]),
+        meta["run_id"],
+        seed=meta["seed"],
+        resumed=meta.get("resumed", []),
+    )
     write_summary(run_dir, summary)
     return summary
 
@@ -677,7 +704,13 @@ def run_eval(
                     _put(conn, row)
         finally:
             export_jsonl(conn, run_id, run_dir)
-            write_summary(run_dir, summarize(cfg.run.results_db, run_id, seed=cfg.run.seed))
+            summary = summarize(
+                cfg.run.results_db,
+                run_id,
+                seed=cfg.run.seed,
+                resumed=run_meta.get("resumed", []),
+            )
+            write_summary(run_dir, summary)
     finally:
         conn.close()
     if log_mlflow:
