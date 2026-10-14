@@ -1,3 +1,8 @@
+# Hand checks
+
+- `human_check_results.csv`: the Phase 1 benchmark (below).
+- `live_misses.csv`: Phase 2 live retrieval's misses (at the end).
+
 # Human check of the benchmark
 
 `human_check_results.csv` is a hand review of the frozen bench design (Step 6
@@ -37,3 +42,27 @@ negative finding.
   proposal for stating aims rather than findings. The one right rejection is
   the same target, A0030: its earlier proposal was too general to identify
   the paper.
+
+# Live misses (Phase 2 Step 2)
+
+`live_misses.csv` holds 10 queries where the live pipeline (L5) missed the
+original paper in its top 5. They are a seeded random sample (`run.seed`, 42)
+of the 36 such queries in the 120-query dev run
+`runs/live-20261014-122144`. It was written by
+
+```
+python -m rk live-misses runs/live-20261014-122144
+```
+
+which rebuilds those checks offline from the cached OpenAlex responses: no
+new calls.
+
+- **Columns**:
+  - `qid`, `proposal`, `original_title`;
+  - `original_rank`: the original's rank in L5's top 20, or `none`;
+  - for each of L5's top 3 results, `topN_title`, `topN_year` and
+    `topN_abstract` (the first 300 characters);
+  - `top1_close_prior_art` and `note`: left empty for the reviewer.
+- **Question**: is L5's top result genuinely close prior art for the
+  proposal, so that the miss is partly the metric's (it credits only the
+  original), not the tool's?
