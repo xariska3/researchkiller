@@ -44,6 +44,10 @@ AGENT_PROMPT = "agent_step"  # Phase 1's B5 prompt
 class CheckCostCapExceeded(RuntimeError):
     """A call could take one check's cost over live.cost_cap_per_check."""
 
+    def __init__(self, message: str, ledger: CheckLedger | None = None) -> None:
+        super().__init__(message)
+        self.ledger = ledger  # what the check had cost when it stopped
+
 
 @dataclass
 class CheckLedger:
@@ -53,6 +57,8 @@ class CheckLedger:
     openalex_cost: float = 0.0  # every search, cache hits included
     openalex_spent: float = 0.0  # searches actually sent
     llm: Usage = field(default_factory=Usage)
+    searches: int = 0
+    searches_sent: int = 0
 
     @property
     def method_cost(self) -> float:
@@ -67,12 +73,15 @@ class CheckLedger:
         if self.method_cost + amount > self.cap:
             raise CheckCostCapExceeded(
                 f"{what} could cost ${amount:.4f}, and the check has already cost "
-                f"${self.method_cost:.4f} of its ${self.cap:.2f} cap"
+                f"${self.method_cost:.4f} of its ${self.cap:.2f} cap",
+                self,
             )
 
     def add_search(self, response: SearchResponse) -> None:
         self.openalex_cost += response.cost_usd
         self.openalex_spent += response.money_spent
+        self.searches += 1
+        self.searches_sent += not response.cached
 
 
 class CappedChatModel:

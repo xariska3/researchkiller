@@ -24,12 +24,15 @@ resumes. The OpenAlex cache is read as an evaluation: a response never
 expires, so a resumed or repeated run sees the same results. When OpenAlex's
 daily budget is spent, the run stops: the unfinished query gets no row, and
 resuming with --run-dir after midnight UTC redoes it, its earlier searches
-coming from the cache. Other OpenAlex errors, LLM errors and a check over its
-cost cap are error rows.
+coming from the cache. A check over its cost cap is a finished check that
+found nothing: a miss (stop_reason "cost_cap"), counted apart in the summary.
+Other OpenAlex errors and LLM errors are error rows.
 
-The summary compares the configs with Phase 1's B5 on the frozen corpus
-(live.phase1_run) on the same queries, pairs L5 with L0 and with L1 using
-Phase 1's statistics (paired bootstrap CIs, exact McNemar on Hit@5), and
+The comparisons were pre-declared in docs/phase2_spec.md (Evaluation): L5 vs
+L1 is primary, decided by Hit@5 with the exact McNemar test, with MRR
+supporting; L1 vs L0, L5 vs L0 and L5 vs Phase 1's B5 on the frozen corpus
+(live.phase1_run, on the same queries) are secondary. All use Phase 1's
+statistics (paired bootstrap CIs, exact McNemar on Hit@5). The summary also
 breaks Hit@5 down by Phase 1's difficulty buckets (the target's rank in that
 run's B1). Runs are logged to MLflow like Phase 1 runs, in
 live.mlflow_experiment.
@@ -47,6 +50,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from rk.bench import qid_position
 from rk.config import Config, LiveConfig
 from rk.corpus import CORPUS_FILE, OpenAlexBudgetExhausted, OpenAlexError, load_frozen_corpus
 from rk.evaluate import (
@@ -84,8 +88,10 @@ RUN_PREFIX = "live-"
 TABLE = "live_query_results"
 LIVE_CONFIGS = ("L0", "L1", "L5")
 PHASE1_B5 = "P1-B5"  # Phase 1's B5 on the frozen corpus, compared on the same queries
-PAIRS = (("L5", "L0"), ("L5", "L1"))  # (a, b): a minus b
-SECONDARY_PAIRS = (("L1", "L0"), ("L5", PHASE1_B5))
+# Pre-declared in docs/phase2_spec.md; (a, b) is a minus b.
+PRIMARY_PAIRS = (("L5", "L1"),)
+SECONDARY_PAIRS = (("L1", "L0"), ("L5", "L0"), ("L5", PHASE1_B5))
+COST_CAP = "cost_cap"  # stop_reason of a check over its cost cap: a miss
 CONFIG_LABELS = {
     "L0": "OpenAlex semantic search on the proposal, in OpenAlex's order (1 call, no LLM)",
     "L1": "the L0 results reranked locally (BM25 + dense, RRF)",
@@ -108,6 +114,7 @@ FOUND_BY = (
     "agent query, keyword",
     "agent query, semantic",
     "not returned",
+    "over its cost cap",
 )
 MATCHES = ("id", "alias", "doi", "title")
 
@@ -346,6 +353,41 @@ def ok_row(
     }
 
 
+def capped_row(
+    run_id: str,
+    config: str,
+    query: dict[str, Any],
+    exc: CheckCostCapExceeded,
+    latency_s: float,
+) -> dict[str, Any]:
+    """A check over its cost cap: it shows nothing, so it is a miss, with what it cost."""
+    ledger = exc.ledger or CheckLedger(cap=0.0)
+    return {
+        "run_id": run_id,
+        "config": config,
+        "qid": query["qid"],
+        "target_id": query["target_id"],
+        "status": "ok",
+        "error": f"{type(exc).__name__}: {exc}",
+        **{f"hit_at_{k}": 0 for k in HIT_KS},
+        "reciprocal_rank": 0.0,
+        "searches": ledger.searches,
+        "searches_sent": ledger.searches_sent,
+        "llm_calls": ledger.llm.calls,
+        "prompt_tokens": ledger.llm.prompt_tokens,
+        "completion_tokens": ledger.llm.completion_tokens,
+        "openalex_cost": ledger.openalex_cost,
+        "openalex_spent": ledger.openalex_spent,
+        "llm_cost": ledger.llm.method_cost,
+        "llm_billed_cost": ledger.llm.billed_cost,
+        "method_cost": ledger.method_cost,
+        "billed_cost": ledger.billed_cost,
+        "latency_s": latency_s,
+        "stop_reason": COST_CAP,
+        "finished_at": _now(),
+    }
+
+
 # --- the Phase 1 run compared with -------------------------------------------
 
 
@@ -427,6 +469,7 @@ def run_live_eval(
     search: LiveSearchClient,
     *,
     configs: Sequence[str] | None = None,
+    from_qid: str | None = None,
     limit: int | None = None,
     retry_errors: bool = False,
     run_dir: Path | None = None,
@@ -434,7 +477,9 @@ def run_live_eval(
 ) -> LiveEvalRun:
     """Run (or resume) a live evaluation of the first `limit` benchmark queries.
 
-    Finished rows are skipped; with retry_errors, error rows are run again.
+    The queries are in seeded (qid) order, starting at `from_qid` (e.g. A0045)
+    if given. Finished rows are skipped; with retry_errors, error rows are run
+    again.
     `search` should read its cache as an evaluation
     (LiveSearchClient.from_config(..., evaluation=True)). A spent OpenAlex
     budget stops the run with no row for the unfinished query; other
@@ -455,6 +500,9 @@ def run_live_eval(
     corpus_sha = corpus_manifest["files"][CORPUS_FILE]["sha256"]
     by_id = {r["id"]: r for r in corpus}
     queries, _, bench_sha = load_bench(cfg.bench.out_dir, corpus_sha, set(by_id))
+    if from_qid is not None:
+        first = qid_position(from_qid)
+        queries = [q for q in queries if qid_position(q["qid"]) >= first]
     queries = queries[:limit] if limit else queries
     originals = {q["qid"]: by_id[q["target_id"]] for q in queries}
     del corpus, by_id
@@ -509,6 +557,7 @@ def run_live_eval(
                     status = done.get((config, query["qid"]))
                     if status == "ok" or (status == "error" and not retry_errors):
                         continue
+                    start = time.perf_counter()
                     try:
                         outcome = runners[config](query["query"])
                         row = ok_row(
@@ -516,10 +565,12 @@ def run_live_eval(
                         )
                     except OpenAlexBudgetExhausted as exc:
                         stop = exc
+                    except CheckCostCapExceeded as exc:  # a miss, not an error
+                        row = capped_row(run_id, config, query, exc, time.perf_counter() - start)
                     except OpenAlexError as exc:
                         stop = spent_budget(search)
                         row = error_row(run_id, config, query, exc)
-                    except (LLMError, CheckCostCapExceeded) as exc:
+                    except LLMError as exc:
                         row = error_row(run_id, config, query, exc)
                     if stop is not None:
                         run_meta.setdefault("budget_stops", []).append(
@@ -578,18 +629,25 @@ def describe_budget(search: LiveSearchClient) -> str:
 
 
 def _found_by(row: sqlite3.Row) -> str:
+    if row["stop_reason"] == COST_CAP:
+        return "over its cost cap"
     if row["found_query"] is None:
         return "not returned"
     who = "proposal" if row["found_query"] == 0 else "agent query"
     return f"{who}, {row['found_kind']}"
 
 
-def _effort_value(row: sqlite3.Row, metric: str) -> float:
+def _effort_value(row: sqlite3.Row, metric: str) -> float | None:
+    """One effort measure of a row; None where a check over its cost cap didn't record it."""
     if metric == "queries":
         return row["queries_issued"]
     if metric == "tokens":
         return row["prompt_tokens"] + row["completion_tokens"]
     return row[metric]
+
+
+def _effort(rows: Sequence[sqlite3.Row], metric: str) -> dict[str, float] | None:
+    return _spread([v for r in rows if (v := _effort_value(r, metric)) is not None])
 
 
 def summarize(db_path: Path, meta: dict[str, Any], *, seed: int) -> dict[str, Any]:
@@ -634,6 +692,9 @@ def summarize(db_path: Path, meta: dict[str, Any], *, seed: int) -> dict[str, An
         return {
             "n_ok": len(values),
             "n_error": len(errors.get(config, [])),
+            "n_cost_cap": sum(
+                1 for r in ok.get(config, {}).values() if r["stop_reason"] == COST_CAP
+            ),
             **{f"hit_at_{k}": mean(f"hit_at_{k}") for k in HIT_KS},
             "mrr": mean("reciprocal_rank"),
         }
@@ -675,13 +736,12 @@ def summarize(db_path: Path, meta: dict[str, Any], *, seed: int) -> dict[str, An
         "configs": configs,
         "compared": compared,
         "n_queries": len(qids),
+        "first_qid": qids[0] if qids else None,
+        "last_qid": qids[-1] if qids else None,
         "quality": {c: quality(c) for c in compared},
-        "effort": {
-            c: {m: _spread([_effort_value(r, m) for r in ok[c].values()]) for m in EFFORT}
-            for c in configs
-        },
+        "effort": {c: {m: _effort(list(ok[c].values()), m) for m in EFFORT} for c in configs},
         "difficulty": difficulty,
-        "paired": paired(PAIRS),
+        "paired": paired(PRIMARY_PAIRS),
         "paired_secondary": paired(SECONDARY_PAIRS),
         "found_by": found,
         "matches": {
@@ -728,19 +788,25 @@ def render_markdown(summary: dict[str, Any]) -> str:
         "",
         (
             f"Ranks count within the top {k} (the list the tool shows), so MRR is MRR@{k} for "
-            f"every row, {PHASE1_B5} included. {summary['n_queries']} queries have results."
+            f"every row, {PHASE1_B5} included. {summary['n_queries']} queries have results "
+            f"({summary['first_qid'] or '–'} to {summary['last_qid'] or '–'} in seeded order)."
         ),
         "",
         "## Retrieval quality",
         "",
-        f"| Config | Queries | Errors | Hit@1 | Hit@5 | Hit@10 | MRR@{k} |",
-        "|---|---|---|---|---|---|---|",
+        (
+            "A check over its cost cap shows nothing, so it counts as a miss; such checks are "
+            "counted under Cost-cap misses and included in Queries."
+        ),
+        "",
+        f"| Config | Queries | Errors | Cost-cap misses | Hit@1 | Hit@5 | Hit@10 | MRR@{k} |",
+        "|---|---|---|---|---|---|---|---|",
     ]
     for c in summary["compared"]:
         q = summary["quality"][c]
         lines.append(
-            f"| {c} | {q['n_ok']} | {q['n_error']} | {_f(q['hit_at_1'])} | {_f(q['hit_at_5'])} "
-            f"| {_f(q['hit_at_10'])} | {_f(q['mrr'])} |"
+            f"| {c} | {q['n_ok']} | {q['n_error']} | {q['n_cost_cap']} | {_f(q['hit_at_1'])} "
+            f"| {_f(q['hit_at_5'])} | {_f(q['hit_at_10'])} | {_f(q['mrr'])} |"
         )
     lines += [
         "",
@@ -781,11 +847,14 @@ def render_markdown(summary: dict[str, Any]) -> str:
 
     lines += [
         "",
-        "## Paired comparisons (queries that succeeded in both configs)",
+        "## Primary comparison (queries that succeeded in both configs)",
         "",
         *_paired_table(summary["paired"]),
         "",
-        "Hit@5 with the McNemar test, as in Phase 1; MRR is supporting.",
+        (
+            "Pre-declared in docs/phase2_spec.md: L5 vs L1, decided by Hit@5 with the exact "
+            "McNemar test; MRR supports."
+        ),
         "",
         "## Secondary comparisons (exploratory)",
         "",

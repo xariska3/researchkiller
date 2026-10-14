@@ -357,18 +357,58 @@ def test_other_openalex_errors_are_error_rows_and_can_be_retried(cfg: Config) ->
     assert all(r["status"] == "ok" for r in _rows(cfg, done.run_dir).values())
 
 
-def test_llm_errors_and_the_cost_cap_are_error_rows(cfg: Config, tmp_path: Path) -> None:
+def test_llm_errors_are_error_rows(cfg: Config) -> None:
     done = _run(cfg, FakeLiveOpenAlex(), agent(failing_proposal=GOOD[T2]))
     rows = _rows(cfg, done.run_dir)
     assert [k for k, r in rows.items() if r["status"] == "error"] == [("L5", T2)]
     assert rows[("L5", T2)]["error"] == "LLMError: simulated outage"
+    assert _summary(done.run_dir)["quality"]["L5"]["n_ok"] == 2  # left out, as in Phase 1
 
+
+def test_a_check_over_its_cost_cap_is_a_miss_counted_apart(cfg: Config, tmp_path: Path) -> None:
     capped = config_from_dict(_config_dict(tmp_path, cost_cap_per_check=0.0015))
     done = _run(capped, FakeLiveOpenAlex(), limit=1)
     rows = _rows(capped, done.run_dir)
     (row,) = [r for (c, _), r in rows.items() if c == "L5"]
-    assert row["status"] == "error" and row["error"].startswith("CheckCostCapExceeded")
+    assert (row["status"], row["stop_reason"], row["hit_at_10"], row["reciprocal_rank"]) == (
+        "ok",
+        "cost_cap",
+        0,
+        0.0,
+    )
+    assert row["error"].startswith("CheckCostCapExceeded: an agent call could cost")
+    # What it cost before it stopped: the proposal's search, from L0's cache.
+    assert (row["searches"], row["searches_sent"], row["openalex_cost"]) == (1, 0, 0.001)
+    assert row["llm_calls"] == 0 and row["latency_s"] >= 0
     assert rows[("L0", row["target_id"])]["status"] == "ok"  # one search fits the cap
+    summary = _summary(done.run_dir)
+    assert summary["quality"]["L5"] == {
+        "n_ok": 1,
+        "n_error": 0,
+        "n_cost_cap": 1,
+        "hit_at_1": 0.0,
+        "hit_at_5": 0.0,
+        "hit_at_10": 0.0,
+        "mrr": 0.0,
+    }
+    assert summary["quality"]["L0"]["n_cost_cap"] == 0
+    assert summary["found_by"]["L5"]["over its cost cap"] == {"n": 1, "in_top_k": 0}
+    assert summary["effort"]["L5"]["queries"] is None  # not recorded for a capped check
+    assert summary["effort"]["L5"]["method_cost"]["mean"] == pytest.approx(0.001)
+
+    # A capped check is finished: --retry-errors doesn't run it again.
+    llm = agent()
+    _run(capped, FakeLiveOpenAlex(), llm, run_dir=done.run_dir, retry_errors=True, limit=1)
+    assert llm.calls == []
+
+
+def test_from_qid_starts_the_selection_in_seeded_order(cfg: Config) -> None:
+    qids = sorted(_qids(cfg).values())
+    done = _run(cfg, FakeLiveOpenAlex(), from_qid=qids[1][:5], limit=1)
+    rows = _rows(cfg, done.run_dir)
+    assert {r["qid"] for r in rows.values()} == {qids[1]}
+    summary = _summary(done.run_dir)
+    assert (summary["first_qid"], summary["last_qid"]) == (qids[1], qids[1])
 
 
 def test_resume_refuses_a_changed_live_config_or_a_phase1_run(
@@ -411,13 +451,12 @@ def test_the_summary_compares_with_phase1_b5_on_the_same_queries(cfg: Config) ->
         pytest.approx(2 / 3),
     )
     assert phase1["mrr"] == pytest.approx((1 + 1 / 3 + 0) / 3)  # rank 15 is beyond top 10
-    assert [(p["a"], p["b"], p["n"]) for p in summary["paired"]] == [
+    # Pre-declared: L5 vs L1 is primary; the rest are secondary.
+    assert [(p["a"], p["b"], p["n"]) for p in summary["paired"]] == [("L5", "L1", 3)]
+    assert [(p["a"], p["b"], p["n"]) for p in summary["paired_secondary"]] == [
+        ("L1", "L0", 3),
         ("L5", "L0", 3),
-        ("L5", "L1", 3),
-    ]
-    assert [(p["a"], p["b"]) for p in summary["paired_secondary"]] == [
-        ("L1", "L0"),
-        ("L5", PHASE1_B5),
+        ("L5", PHASE1_B5, 3),
     ]
     difficulty = summary["difficulty"]
     assert difficulty["bucket_sizes"] == {"1": 1, "2-10": 1, "11-100": 0, "not found": 1}
@@ -431,7 +470,7 @@ def test_the_summary_compares_with_phase1_b5_on_the_same_queries(cfg: Config) ->
         "Retrieval quality",
         "Effort per query",
         "Hit@5 by difficulty",
-        "Paired comparisons",
+        "Primary comparison",
         "Secondary comparisons (exploratory)",
         "Which search first returned the original",
         "How the original matched",
@@ -439,7 +478,8 @@ def test_the_summary_compares_with_phase1_b5_on_the_same_queries(cfg: Config) ->
         "Errors",
     ):
         assert f"## {heading}" in markdown
-    assert "| Config | Queries | Errors | Hit@1 | Hit@5 | Hit@10 | MRR@10 |" in markdown
+    header = "| Config | Queries | Errors | Cost-cap misses | Hit@1 | Hit@5 | Hit@10 | MRR@10 |"
+    assert header in markdown and "| L5 vs L1 | 3 |" in markdown
 
 
 def test_without_a_phase1_run_there_is_no_comparison(tmp_path: Path) -> None:
@@ -502,8 +542,9 @@ def test_live_eval_cli_with_mlflow_report_and_a_budget_stop(
     assert set(children) == {"L0", "L1", "L5"}
     assert children["L5"].data.metrics["hit_at_5"] == summary["quality"]["L5"]["hit_at_5"]
     assert children["L5"].data.params["live.top_k"] == "10"
-    assert "L5_vs_L0.mcnemar_p" in parent.data.metrics
+    assert {"L5_vs_L1.mcnemar_p", "L5_vs_L0.mcnemar_p"} <= set(parent.data.metrics)
     assert f"L5_vs_{PHASE1_B5}.delta_hit_at_5" in parent.data.metrics
+    assert children["L5"].data.metrics["n_cost_cap"] == 0
     assert not Path("mlartifacts").exists() and not Path("mlruns").exists()
 
     (run_dir / SUMMARY_MD).unlink()
@@ -528,3 +569,15 @@ def test_live_eval_cli_checks_its_arguments(capsys: pytest.CaptureFixture[str]) 
     with pytest.raises(SystemExit):
         cli.main(["live-eval", "--config", "x.yaml", "--retry-errors"])
     assert "--retry-errors needs --run-dir" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        cli.main(["live-eval", "--config", "x.yaml", "--from-qid", "45"])
+    assert "expected a qid prefix like A0045" in capsys.readouterr().err
+
+
+def test_the_resume_hint_keeps_the_selection() -> None:
+    config, run_dir = Path("configs/phase1.yaml"), Path("runs/live-1")
+    hint = cli.resume_hint(config, run_dir, None, "A0045", 200, ["live.top_k=20"])
+    assert hint == (
+        f"python -m rk live-eval --config {config} --run-dir {run_dir} "
+        '--from-qid A0045 --limit 200 --set "live.top_k=20"'
+    )

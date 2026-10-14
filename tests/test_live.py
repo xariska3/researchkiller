@@ -668,10 +668,13 @@ def test_an_agent_call_that_could_cross_the_cost_cap_fails_the_check(tmp_path: P
     fake = FakeLiveOpenAlex()
     llm = FakeLLM([_search("memory"), STOP])
     search = _client(capped, fake)
-    with pytest.raises(CheckCostCapExceeded, match="an agent call"):
+    with pytest.raises(CheckCostCapExceeded, match="an agent call") as caught:
         live_search(GOOD[T1], capped, search=search, encoder=FakeEncoder(), agent=llm)
     assert len(fake.requests) == 1  # the first search fit; the agent call never ran
     assert llm.calls == []
+    ledger = caught.value.ledger  # what the check cost when it stopped
+    assert ledger is not None
+    assert (ledger.searches, ledger.searches_sent, ledger.openalex_cost) == (1, 1, 0.001)
 
 
 def test_the_ledger_refuses_a_search_over_the_cap(cfg: Config) -> None:

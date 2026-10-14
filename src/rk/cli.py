@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import re
 import sys
 from collections.abc import Sequence
 from contextlib import ExitStack, closing
@@ -69,6 +70,12 @@ def _live_config_list(text: str) -> list[str]:
             f"unknown live configs {unknown}; choose from {','.join(live_eval.LIVE_CONFIGS)}"
         )
     return names
+
+
+def _qid_start(text: str) -> str:
+    if re.fullmatch(r"A\d{4,}", text) is None:
+        raise argparse.ArgumentTypeError(f"expected a qid prefix like A0045, got {text!r}")
+    return text
 
 
 def _add_config_arguments(parser: argparse.ArgumentParser) -> None:
@@ -172,7 +179,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=_live_config_list,
         help=f"comma-separated configs (default: all of {','.join(live_eval.LIVE_CONFIGS)})",
     )
-    live.add_argument("--limit", type=_positive_int, help="evaluate only the first N queries")
+    live.add_argument(
+        "--from-qid",
+        type=_qid_start,
+        help="start at this qid in seeded order, e.g. A0045 to leave out Phase 1's tuning targets",
+    )
+    live.add_argument(
+        "--limit", type=_positive_int, help="evaluate only the first N queries (from --from-qid)"
+    )
     live.add_argument(
         "--run-dir",
         type=Path,
@@ -319,6 +333,7 @@ def resume_hint(
     config_path: Path,
     run_dir: Path,
     configs: Sequence[str] | None,
+    from_qid: str | None,
     limit: int | None,
     overrides: Sequence[str],
 ) -> str:
@@ -326,6 +341,8 @@ def resume_hint(
     parts = ["python -m rk live-eval", f"--config {config_path}", f"--run-dir {run_dir}"]
     if configs:
         parts.append(f"--configs {','.join(configs)}")
+    if from_qid:
+        parts.append(f"--from-qid {from_qid}")
     if limit:
         parts.append(f"--limit {limit}")
     parts += [f'--set "{o}"' for o in overrides]
@@ -335,6 +352,7 @@ def resume_hint(
 def live_eval_command(
     config_path: Path,
     configs: list[str] | None,
+    from_qid: str | None,
     limit: int | None,
     run_dir: Path | None,
     retry_errors: bool,
@@ -360,6 +378,7 @@ def live_eval_command(
             make_encoder(cfg.retrieval),
             search,
             configs=configs,
+            from_qid=from_qid,
             limit=limit,
             retry_errors=retry_errors,
             run_dir=run_dir,
@@ -369,7 +388,7 @@ def live_eval_command(
     if done.budget_stop is None:
         print(f"rk live-eval: {progress}; results in {cfg.run.results_db}; summary in {summary}")
         return 0
-    hint = resume_hint(config_path, done.run_dir, configs, limit, overrides)
+    hint = resume_hint(config_path, done.run_dir, configs, from_qid, limit, overrides)
     print(
         f"rk live-eval: stopped: {done.budget_stop}. {progress}; the unfinished query has no "
         f"row. The budget resets in {live_eval.duration(done.budget_stop.resets_in_s)} "
@@ -423,6 +442,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return live_eval_command(
                 args.config,
                 args.configs,
+                args.from_qid,
                 args.limit,
                 args.run_dir,
                 args.retry_errors,
