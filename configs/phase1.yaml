@@ -47,6 +47,20 @@ retrieval:
   max_llm_calls_agent_unconstrained: 20   # placeholder; B5-U
   index_dir: data/index
 
+# Phase 2 live retrieval (docs/phase2_spec.md). The agent loop keeps the B5 caps
+# above (max_queries, max_llm_calls_agent) and the encoder settings above.
+live:
+  cache_path: data/cache/openalex.sqlite   # every OpenAlex response
+  results_per_query: 50           # keyword search, one page (OpenAlex max 100)
+  semantic_search: true           # OpenAlex search.semantic, merged into the pool
+  semantic_results_per_query: 50  # OpenAlex maximum
+  keyword_max_words: 32           # longer queries (the user's text) get semantic search only
+  max_pool_size: 500              # distinct candidates; 5 queries x 100 results never exceed it
+  top_k: 20                       # kept after the local hybrid rerank
+  explain_top_k: 10               # used by the overlap explainer (Step 3)
+  cost_cap_per_check: 0.10        # USD, OpenAlex + LLM; the check fails rather than exceed it
+  openalex_timeout_s: 30
+
 run:
   out_dir: runs
   cache_path: data/cache/llm.sqlite   # LLM cache + cumulative spend table

@@ -1,0 +1,533 @@
+"""Phase 2 live retrieval: OpenAlex search client, candidate pool, B5 on the live pool.
+
+OpenAlex is FakeLiveOpenAlex behind httpx.MockTransport; only the test marked
+`network` talks to the real API (run it with -m network).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from collections.abc import Sequence
+from datetime import date
+from pathlib import Path
+from typing import Any
+
+import httpx
+import numpy as np
+import pytest
+from bench_data import ABSTRACTS, GOOD, T1, T2, T3, TITLES, corpus_records, target_rows
+from conftest import FakeEncoder, FakeLLM, corpus_config_dict
+
+from rk.cli import load_env_file
+from rk.config import Config, ConfigError, LiveConfig, config_from_dict, load_config
+from rk.corpus import freeze
+from rk.live.openalex_search import (
+    KEYWORD,
+    SELECT,
+    SEMANTIC,
+    SEMANTIC_MAX_CHARS,
+    LiveSearchClient,
+    OpenAlexCache,
+    live_record,
+)
+from rk.live.pipeline import CheckCostCapExceeded, CheckLedger, LiveRanker, live_search
+from rk.live.pool import CandidatePool, Hit
+from rk.retrieval import (
+    BM25Retriever,
+    DenseRetriever,
+    HybridRetriever,
+    build_index,
+    fuse_runs,
+    load_index,
+)
+from rk.text import content_stems, reconstruct_abstract
+
+LIVE = {
+    "cache_path": "openalex.sqlite",
+    "results_per_query": 50,
+    "semantic_search": True,
+    "semantic_results_per_query": 50,
+    "keyword_max_words": 32,
+    "max_pool_size": 500,
+    "top_k": 5,
+    "explain_top_k": 3,
+    "cost_cap_per_check": 0.10,
+    "openalex_timeout_s": 30,
+}
+
+
+def oa_work(record: dict[str, Any], published: str = "2025-03-01", **extra: Any) -> dict[str, Any]:
+    """A bench_data corpus record as OpenAlex returns it (abstract as an inverted index)."""
+    inverted: dict[str, list[int]] = {}
+    for position, word in enumerate(record["abstract"].split()):
+        inverted.setdefault(word, []).append(position)
+    return {
+        "id": f"https://openalex.org/{record['id']}",
+        "doi": None,
+        "title": record["title"],
+        "publication_date": published,
+        "abstract_inverted_index": inverted,
+        "relevance_score": 1.0,
+        "language": "en",
+        "type": "article",
+        **extra,
+    }
+
+
+WORKS = [oa_work(r) for r in corpus_records()]
+
+
+class FakeLiveOpenAlex:
+    """In-memory /works search for httpx.MockTransport.
+
+    Keyword search matches works whose title and abstract contain every content
+    stem of the query (OpenAlex ANDs the words), most stem occurrences first.
+    Semantic search ranks works by FakeEncoder cosine. Both apply has_abstract
+    and to_publication_date, honour per_page and select, report meta.cost_usd,
+    and reject what OpenAlex rejects (semantic per_page over 50) with HTTP 400.
+    `fail_with` status codes are returned first, one per request.
+    """
+
+    def __init__(
+        self,
+        works: Sequence[dict[str, Any]] = WORKS,
+        *,
+        cost: float | None = 0.001,
+        fail_with: Sequence[int] = (),
+    ) -> None:
+        self.works = list(works)
+        self.cost = cost
+        self.fail_with = list(fail_with)
+        self.requests: list[dict[str, str]] = []
+        self.encoder = FakeEncoder()
+
+    @property
+    def transport(self) -> httpx.MockTransport:
+        return httpx.MockTransport(self.handle)
+
+    def handle(self, request: httpx.Request) -> httpx.Response:
+        params = dict(request.url.params)
+        self.requests.append(params)
+        if self.fail_with:
+            return httpx.Response(self.fail_with.pop(0), json={"error": "simulated"})
+        per_page = int(params.get("per_page", "25"))
+        works = [w for w in self.works if self._passes(w, params.get("filter", ""))]
+        if "search.semantic" in params:
+            if per_page > 50:
+                message = f"per_page cannot exceed 50 for semantic search. Received {per_page}."
+                return httpx.Response(400, json={"error": "Invalid", "message": message})
+            ranked = self._semantic(params["search.semantic"], works)
+        elif "search" in params:
+            ranked = self._keyword(params["search"], works)
+        else:
+            return httpx.Response(400, json={"error": "no search parameter"})
+        fields = params["select"].split(",")
+        results = [{k: w.get(k) for k in fields} for w in ranked[:per_page]]
+        meta: dict[str, Any] = {"count": len(ranked), "per_page": per_page}
+        if self.cost is not None:
+            meta["cost_usd"] = self.cost
+        return httpx.Response(200, json={"meta": meta, "results": results})
+
+    @staticmethod
+    def _text(work: dict[str, Any]) -> str:
+        return f"{work['title']}. {reconstruct_abstract(work['abstract_inverted_index'])}"
+
+    @staticmethod
+    def _passes(work: dict[str, Any], filters: str) -> bool:
+        for clause in filter(None, filters.split(",")):
+            key, _, value = clause.partition(":")
+            if key == "has_abstract" and bool(work["abstract_inverted_index"]) != (value == "true"):
+                return False
+            if key == "to_publication_date" and work["publication_date"] > value:
+                return False
+        return True
+
+    def _keyword(self, query: str, works: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        wanted = set(content_stems(query))
+        scored = []
+        for work in works:
+            stems = content_stems(self._text(work))
+            if wanted and wanted <= set(stems):
+                scored.append((-sum(s in wanted for s in stems), work["id"], work))
+        return [w for *_, w in sorted(scored, key=lambda s: s[:2])]
+
+    def _semantic(self, query: str, works: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not works:
+            return []
+        q = self.encoder.encode_queries([query])[0]
+        docs = self.encoder.encode_docs([self._text(w) for w in works])
+        sims = docs @ q
+        order = sorted(range(len(works)), key=lambda i: (-sims[i], works[i]["id"]))
+        return [works[i] for i in order if sims[i] > 0]
+
+
+@pytest.fixture
+def cfg(tmp_path: Path) -> Config:
+    data = corpus_config_dict(tmp_path / "corpus")
+    data["retrieval"]["index_dir"] = str(tmp_path / "index")
+    data["live"] = {**LIVE, "cache_path": str(tmp_path / "openalex.sqlite")}
+    return config_from_dict(data)
+
+
+def _client(
+    cfg: Config, fake: FakeLiveOpenAlex, sleeps: list[float] | None = None
+) -> LiveSearchClient:
+    assert cfg.live is not None
+    sleeps = [] if sleeps is None else sleeps
+    return LiveSearchClient(
+        cfg.live,
+        OpenAlexCache(cfg.live.cache_path),
+        transport=fake.transport,
+        sleep=sleeps.append,
+        clock=lambda: 0.0,
+    )
+
+
+def _search(query: str) -> str:
+    return json.dumps({"action": "search", "query": query})
+
+
+STOP = json.dumps({"action": "stop", "reason": "covered"})
+
+
+# --- config ------------------------------------------------------------------
+
+
+def test_the_project_config_has_a_live_section() -> None:
+    live = load_config(Path("configs/phase1.yaml")).live
+    assert live is not None
+    assert (live.results_per_query, live.semantic_results_per_query, live.top_k) == (50, 50, 20)
+    assert (live.explain_top_k, live.cost_cap_per_check, live.keyword_max_words) == (10, 0.10, 32)
+
+
+def test_the_live_section_is_optional(tmp_path: Path) -> None:
+    assert config_from_dict(corpus_config_dict(tmp_path)).live is None
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "message"),
+    [
+        ("results_per_query", 101, "results_per_query"),
+        ("semantic_results_per_query", 51, "semantic_results_per_query"),
+        ("explain_top_k", 6, "explain_top_k"),
+        ("cost_cap_per_check", 0, "cost_cap_per_check"),
+        ("keyword_max_words", 0, "keyword_max_words"),
+    ],
+)
+def test_live_settings_are_checked(tmp_path: Path, key: str, value: Any, message: str) -> None:
+    data = corpus_config_dict(tmp_path)
+    data["live"] = {**LIVE, key: value}
+    with pytest.raises(ConfigError, match=message):
+        config_from_dict(data)
+
+
+# --- OpenAlex search client --------------------------------------------------
+
+
+def test_keyword_search_sends_the_documented_parameters(cfg: Config) -> None:
+    fake = FakeLiveOpenAlex()
+    response = _client(cfg, fake).search("summarisation clusters memory", KEYWORD)
+    assert fake.requests == [
+        {
+            "search": "summarisation clusters memory",
+            "filter": "has_abstract:true",
+            "per_page": "50",
+            "select": SELECT,
+        }
+    ]
+    assert [r["id"] for r in response.records] == [T1]
+    record = response.records[0]
+    assert (record["title"], record["abstract"], record["origin"]) == (
+        TITLES[T1],
+        ABSTRACTS[T1],
+        "live",
+    )
+    assert (response.kind, response.n_results, response.cost_usd, response.cached) == (
+        KEYWORD,
+        1,
+        0.001,
+        False,
+    )
+
+
+def test_semantic_search_truncates_long_input_and_respects_its_page_limit(cfg: Config) -> None:
+    fake = FakeLiveOpenAlex()
+    text = "memory " * 600  # 4,200 characters
+    response = _client(cfg, fake).search(text, SEMANTIC)
+    (params,) = fake.requests
+    assert params["search.semantic"] == text[:SEMANTIC_MAX_CHARS]
+    assert (params["per_page"], params["filter"]) == ("50", "has_abstract:true")
+    assert response.query == text  # the result keeps the full query
+    assert response.records  # memory appears in several abstracts
+
+
+def test_published_before_filters_on_the_day_before(cfg: Config) -> None:
+    old = oa_work(corpus_records()[0], published="2024-12-31")
+    new = oa_work(corpus_records()[1], published="2025-01-01")
+    fake = FakeLiveOpenAlex([old, new])
+    response = _client(cfg, fake).search("memory", SEMANTIC, before=date(2025, 1, 1))
+    assert fake.requests[0]["filter"] == "has_abstract:true,to_publication_date:2024-12-31"
+    assert [r["id"] for r in response.records] == [T1]
+
+
+def test_every_response_is_cached_on_disk(cfg: Config) -> None:
+    fake = FakeLiveOpenAlex()
+    first = _client(cfg, fake).search("memory", SEMANTIC)
+    again = _client(cfg, fake).search("memory", SEMANTIC)  # a new client on the same file
+    assert len(fake.requests) == 1
+    assert again.records == first.records
+    assert (again.cached, again.cost_usd, again.money_spent) == (True, 0.001, 0.0)
+    assert (first.cached, first.money_spent) == (False, 0.001)
+    _client(cfg, fake).search("memory", KEYWORD)  # another kind is another request
+    assert len(fake.requests) == 2
+
+
+def test_semantic_search_is_throttled_to_one_call_per_second(cfg: Config) -> None:
+    sleeps: list[float] = []
+    client = _client(cfg, FakeLiveOpenAlex(), sleeps)
+    client.search("memory", SEMANTIC)
+    client.search("accuracy", SEMANTIC)
+    client.search("memory", KEYWORD)
+    client.search("accuracy", KEYWORD)
+    assert sleeps == [1.0, pytest.approx(0.1)]
+
+
+def test_rate_limited_calls_are_retried(cfg: Config) -> None:
+    sleeps: list[float] = []
+    fake = FakeLiveOpenAlex(fail_with=[429])
+    response = _client(cfg, fake, sleeps).search("memory", SEMANTIC)
+    assert len(fake.requests) == 2 and response.records
+    assert sleeps == [1.0, 1.0]  # the backoff, then the one-call-per-second throttle
+
+
+def test_cost_falls_back_to_the_documented_price(cfg: Config) -> None:
+    response = _client(cfg, FakeLiveOpenAlex(cost=None)).search("memory", SEMANTIC)
+    assert response.cost_usd == 0.001
+
+
+def test_results_without_an_abstract_or_a_date_are_dropped() -> None:
+    work = oa_work(corpus_records()[0])
+    assert live_record(work) is not None
+    assert live_record({**work, "abstract_inverted_index": None}) is None
+    assert live_record({**work, "publication_date": None}) is None
+
+
+# --- candidate pool ----------------------------------------------------------
+
+
+def test_pool_merges_versions_and_keeps_every_hit() -> None:
+    preprint = live_record(oa_work(corpus_records()[0], published="2024-05-01", doi="10.1/x"))
+    published = live_record(
+        oa_work({**corpus_records()[0], "id": "W900"}, published="2025-02-01", doi="10.1/X")
+    )
+    other = live_record(oa_work(corpus_records()[1]))
+    assert preprint and published and other
+    pool = CandidatePool(FakeEncoder(), max_size=10)
+    pool.add([preprint, other], query_index=0, kind=SEMANTIC)
+    pool.add([published], query_index=1, kind=KEYWORD)
+    assert len(pool) == 2
+    merged = next(r for r in pool.records if r["id"] == T1)  # the earliest version keeps its id
+    assert merged["aliases"] == ["W900"]
+    assert pool.hits(merged) == [Hit(0, SEMANTIC, 1), Hit(1, KEYWORD, 1)]
+    assert pool.titles == {T1: TITLES[T1], T2: TITLES[T2]}
+
+
+def test_pool_keeps_the_first_arrivals_up_to_its_size() -> None:
+    records = [live_record(w) for w in WORKS[:3]]
+    pool = CandidatePool(FakeEncoder(), max_size=2)
+    pool.add([records[2], records[0], records[1]], query_index=0, kind=SEMANTIC)
+    assert ([r["id"] for r in pool.records], pool.dropped) == ([T1, T3], 1)
+
+
+class _CountingEncoder(FakeEncoder):
+    def __init__(self) -> None:
+        super().__init__()
+        self.encoded: list[str] = []
+
+    def encode_queries(self, texts: Sequence[str]) -> np.ndarray:
+        return super().encode_docs(texts)  # FakeEncoder encodes queries as documents
+
+    def encode_docs(self, texts: Sequence[str]) -> np.ndarray:
+        self.encoded.extend(texts)
+        return super().encode_docs(texts)
+
+
+def test_pool_encodes_each_document_once() -> None:
+    encoder = _CountingEncoder()
+    records = [live_record(w) for w in WORKS]
+    pool = CandidatePool(encoder, max_size=50)
+    pool.add(records[:5], query_index=0, kind=SEMANTIC)
+    pool.rank("memory")
+    pool.add(records[3:], query_index=1, kind=KEYWORD)
+    pool.rank("memory")
+    pool.rank("accuracy")
+    assert len(encoder.encoded) == len(WORKS) == len(set(encoder.encoded))
+
+
+@pytest.fixture
+def phase1_hybrid(tmp_path: Path) -> HybridRetriever:
+    """Phase 1's B3 over a frozen corpus of the same documents the pool will hold."""
+    data = corpus_config_dict(tmp_path / "corpus")
+    data["retrieval"]["index_dir"] = str(tmp_path / "index")
+    config = config_from_dict(data)
+    freeze(config.corpus.out_dir, corpus_records(), target_rows(), {})
+    build_index(config, FakeEncoder())
+    index = load_index(config)
+    return HybridRetriever(BM25Retriever(index), DenseRetriever(index, FakeEncoder()))
+
+
+def test_pool_ranks_exactly_as_phase1_b3_and_b5_on_the_same_documents(
+    phase1_hybrid: HybridRetriever,
+) -> None:
+    pool = CandidatePool(FakeEncoder(), max_size=50)
+    pool.add([live_record(w) for w in WORKS], query_index=0, kind=SEMANTIC)
+    queries = [GOOD[T1], "learned clusters attention memory", "reward calibration"]
+    for query in queries:
+        assert pool.rank(query) == phase1_hybrid.rank(query)
+    assert pool.fused(queries) == fuse_runs([phase1_hybrid.rank(q) for q in queries])
+    assert CandidatePool(FakeEncoder(), max_size=5).rank("memory") == []  # an empty pool
+
+
+# --- B5 on the live pool -----------------------------------------------------
+
+
+def _live_search(
+    cfg: Config, fake: FakeLiveOpenAlex, replies: Sequence[str], text: str = GOOD[T1]
+) -> tuple[Any, FakeLLM]:
+    llm = FakeLLM(replies)
+    result = live_search(
+        text, cfg, search=_client(cfg, fake), encoder=FakeEncoder(), agent=llm
+    )
+    return result, llm
+
+
+def test_b5_runs_on_live_search_and_reranks_the_final_pool(cfg: Config) -> None:
+    fake = FakeLiveOpenAlex()
+    q1, q2 = "learned clusters attention memory", "summarisation memory"
+    result, llm = _live_search(cfg, fake, [_search(q1), _search(q2), STOP])
+    assert result.trace.queries == [GOOD[T1], q1, q2]
+    assert result.trace.stop_reason == "agent_stop"
+    # The user's 60-word text gets semantic search only; the agent's queries get both.
+    assert [next(k for k in ("search.semantic", "search") if k in r) for r in fake.requests] == [
+        "search.semantic",
+        "search",
+        "search.semantic",
+        "search",
+        "search.semantic",
+    ]
+    assert [(s.query, s.kind) for s in result.searches][:2] == [
+        (GOOD[T1], SEMANTIC),
+        (q1, KEYWORD),
+    ]
+    # The agent saw titles from the live pool.
+    assert f"- {TITLES[T1]}" in llm.calls[0][0]["content"]
+    assert result.candidates[0].record["id"] == T1
+    assert [c.rank for c in result.candidates] == list(range(1, 6))  # top_k = 5
+    first_hit = result.candidates[0].hits[0]
+    assert (first_hit.query_index, first_hit.kind) == (0, SEMANTIC)
+    # The final ranking is B5's: RRF over every query's ranking of the final pool.
+    pool = CandidatePool(FakeEncoder(), max_size=500)
+    for s in result.searches:
+        pool.add(s.records, query_index=0, kind=s.kind)
+    expected = pool.fused(result.trace.queries)[:5]
+    assert [c.record["id"] for c in result.candidates] == expected
+    assert result.pool_size == len(pool) and result.pool_dropped == 0
+    assert (result.encoder, result.encoder_device) == ("fake-encoder", "cpu")
+
+
+def test_a_check_reports_its_cost_and_replays_its_searches_for_free(cfg: Config) -> None:
+    fake = FakeLiveOpenAlex()
+    replies = [_search("summarisation memory"), STOP]
+    first, llm = _live_search(cfg, fake, replies)
+    ledger = first.ledger
+    assert ledger.openalex_cost == pytest.approx(0.003)  # semantic, then keyword + semantic
+    assert ledger.openalex_spent == pytest.approx(0.003)
+    assert ledger.llm.calls == 2 == len(llm.calls)
+    assert ledger.method_cost == pytest.approx(0.003 + ledger.llm.method_cost)
+    assert ledger.billed_cost == pytest.approx(0.003 + ledger.llm.billed_cost)
+    again, _ = _live_search(cfg, fake, replies)
+    assert len(fake.requests) == 3  # every search came from the cache
+    assert again.ledger.openalex_cost == pytest.approx(0.003)
+    assert again.ledger.openalex_spent == 0.0
+    assert [c.record["id"] for c in again.candidates] == [
+        c.record["id"] for c in first.candidates
+    ]
+    summary = first.to_dict()
+    assert summary["queries"] == [GOOD[T1], "summarisation memory"]
+    assert summary["cost"]["openalex_cost"] == pytest.approx(0.003)
+    assert sorted(summary["candidates"][0]["found_by"][0]) == ["kind", "query_index", "rank"]
+
+
+def test_the_agent_keeps_the_b5_caps(cfg: Config) -> None:
+    fake = FakeLiveOpenAlex()
+    replies = [_search(f"memory query {n}") for n in range(10)]
+    result, llm = _live_search(cfg, fake, replies)
+    assert len(result.trace.queries) == cfg.retrieval.max_queries == 5
+    assert len(llm.calls) == 4 and result.trace.stop_reason == "max_queries"
+
+
+def test_an_agent_call_that_could_cross_the_cost_cap_fails_the_check(tmp_path: Path) -> None:
+    data = corpus_config_dict(tmp_path / "corpus")
+    data["live"] = {
+        **LIVE,
+        "cache_path": str(tmp_path / "openalex.sqlite"),
+        "cost_cap_per_check": 0.0015,
+    }
+    capped = config_from_dict(data)
+    fake = FakeLiveOpenAlex()
+    llm = FakeLLM([_search("memory"), STOP])
+    search = _client(capped, fake)
+    with pytest.raises(CheckCostCapExceeded, match="an agent call"):
+        live_search(GOOD[T1], capped, search=search, encoder=FakeEncoder(), agent=llm)
+    assert len(fake.requests) == 1  # the first search fit; the agent call never ran
+    assert llm.calls == []
+
+
+def test_the_ledger_refuses_a_search_over_the_cap(cfg: Config) -> None:
+    assert cfg.live is not None
+    fake = FakeLiveOpenAlex()
+    pool = CandidatePool(FakeEncoder(), max_size=10)
+    ranker = LiveRanker(_client(cfg, fake), pool, CheckLedger(cap=0.0025), cfg.live)
+    ranker.rank("memory")  # keyword + semantic: $0.002
+    assert len(fake.requests) == 2
+    with pytest.raises(CheckCostCapExceeded, match="a keyword search"):
+        ranker.rank("accuracy")
+    assert len(fake.requests) == 2
+
+
+def test_long_queries_skip_keyword_search(cfg: Config) -> None:
+    assert cfg.live is not None
+    ranker = LiveRanker(
+        _client(cfg, FakeLiveOpenAlex()),
+        CandidatePool(FakeEncoder(), max_size=10),
+        CheckLedger(cap=1.0),
+        cfg.live,
+    )
+    assert ranker.kinds("word " * 32) == [KEYWORD, SEMANTIC]
+    assert ranker.kinds("word " * 33) == [SEMANTIC]
+    no_semantic = LiveConfig(cache_path=cfg.live.cache_path, semantic_search=False)
+    assert LiveRanker(ranker.search, ranker.pool, ranker.ledger, no_semantic).kinds("a b") == [
+        KEYWORD
+    ]
+
+
+# --- the real API --------------------------------------------------------------
+
+
+@pytest.mark.network
+def test_live_openalex_keyword_and_semantic_search(tmp_path: Path) -> None:
+    """One keyword and one semantic search against api.openalex.org ($0.002)."""
+    load_env_file()
+    live = LiveConfig(cache_path=tmp_path / "openalex.sqlite")
+    client = LiveSearchClient(
+        live, OpenAlexCache(live.cache_path), api_key=os.environ.get("OPENALEX_API_KEY") or None
+    )
+    query = "terminology shift in prior art retrieval for research proposals"
+    for kind in (KEYWORD, SEMANTIC):
+        response = client.search(query, kind)
+        assert 1 <= response.n_results <= 50
+        assert response.records and all(r["abstract"] and r["title"] for r in response.records)
+        assert response.cost_usd > 0 and not response.cached
+    assert client.search(query, SEMANTIC).cached
+    client.close()
