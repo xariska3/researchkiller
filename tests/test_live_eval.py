@@ -73,6 +73,17 @@ from rk.retrieval import fuse_runs, rrf
 
 PHASE1_RUN = "20261013-000000"
 AGENT_QUERY = "learned clusters attention memory"  # every content stem is in T1's text
+CHOSEN_L5W_FUSION = live_evaluate.L5W_FUSION  # as committed, before any test patches it
+
+
+@pytest.fixture(autouse=True)
+def _l0_l1_l5_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Runs here have L0, L1 and L5 unless a test gives L5w a fusion itself."""
+    monkeypatch.setattr(live_evaluate, "L5W_FUSION", None)
+
+
+def test_l5w_is_the_fusion_the_dev_set_chose() -> None:
+    assert CHOSEN_L5W_FUSION == PROPOSAL_EQUAL  # docs/phase2_spec.md, runs/live-20261014-122144
 
 
 def _config_dict(tmp_path: Path, **live: Any) -> dict[str, Any]:

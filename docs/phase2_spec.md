@@ -158,6 +158,13 @@ design live, and keeps the Phase 1 benchmark as a regression test.
     with the McNemar test decides, and MRR supports.
   - **Work types**: `software-paper` joins `live.work_types` for the test run.
     One dev-set original was a software paper the filter dropped.
+  - **Selection result (2026-10-14)**, from `python -m rk live-fusion` on the
+    dev set. The replay reproduced all 120 recorded L5 and L1 rankings.
+    - **Hit@5**: L5 0.700, F1 0.750, F2 0.750, F3 0.717, F4 0.667.
+    - **Choice**: F1 and F2 tie on Hit@5, and F1 wins the MRR@20 tie-break
+      (0.617 against 0.594), so **L5w = F1, proposal-equal**.
+    - **Against L5 on the dev set**: +0.050 Hit@5 (7 queries gained, 1 lost,
+      McNemar p = 0.07). This is exploratory; the test set decides.
 - Explainer check: run 10 full checks, export a CSV for hand review (results
   useful? explanations correct?), and report the quote-verification rate.
 - The Phase 1 frozen benchmark stays runnable as a regression test.

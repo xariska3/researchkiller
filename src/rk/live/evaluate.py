@@ -79,6 +79,7 @@ from rk.evaluate import (
     log_to_mlflow,
 )
 from rk.evaluate import connect as _connect_results
+from rk.live.fusion import PROPOSAL_EQUAL
 from rk.live.openalex_search import SEARCH_COST_USD, SEMANTIC, LiveSearchClient, SearchResponse
 from rk.live.pipeline import (
     AGENT_PROMPT,
@@ -98,8 +99,10 @@ RUN_PREFIX = "live-"
 TABLE = "live_query_results"
 LIVE_CONFIGS = ("L0", "L1", "L5", "L5w")
 PHASE1_B5 = "P1-B5"  # Phase 1's B5 on the frozen corpus, compared on the same queries
-# L5w: L5's check with this final fusion, chosen on the dev set (docs/phase2_spec.md).
-L5W_FUSION: str | None = None
+# L5w: L5's check with this final fusion, chosen on the dev set by the pre-declared rule
+# (docs/phase2_spec.md): F1 proposal-equal had the best Hit@5 (0.750, tied with F2 and
+# ahead on MRR@20) on runs/live-20261014-122144, against L5's 0.700.
+L5W_FUSION: str | None = PROPOSAL_EQUAL
 # Pre-declared in docs/phase2_spec.md; (a, b) is a minus b. L5 vs L1 is Step 2's primary
 # comparison; L5w vs L5 and L5w vs L1 are the test set's.
 PRIMARY_PAIRS = (("L5", "L1"), ("L5w", "L5"), ("L5w", "L1"))
