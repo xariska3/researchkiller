@@ -20,7 +20,9 @@ research-proposal reviewer. The full Phase 1 design is in
 ## Code rules
 - Python 3.10+, `src/` layout, package name `rk`. Type hints everywhere.
 - Keep it minimal: no new dependencies beyond the spec without asking.
-- No frameworks for the agent in Phase 1 (plain Python loop). LangGraph comes in Phase 2.
+- No frameworks for the search agent: it stays a plain Python loop (B5), in Phase 2
+  too. LangGraph is optional, and only if it adds value to the end-to-end check
+  workflow later.
 - Tests must never touch the network: mock OpenAlex with `httpx.MockTransport`,
   use the fake LLM and fake encoder from `tests/conftest.py`.
 - Every run must be reproducible: fixed seeds, cached LLM calls, frozen corpus.

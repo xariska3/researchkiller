@@ -162,6 +162,65 @@ class ModelConfig:
         _require(self.max_tokens >= 1, "max_tokens must be >= 1")
 
 
+SEMANTIC_MAX_RESULTS = 50  # OpenAlex search.semantic returns at most 50 works (HTTP 400 above)
+KEYWORD_MAX_PER_PAGE = 100  # OpenAlex per_page maximum
+
+
+@dataclass(frozen=True)
+class LiveConfig:
+    """Phase 2 live retrieval over OpenAlex (docs/phase2_spec.md)."""
+
+    cache_path: Path  # SQLite cache of every OpenAlex response
+    results_per_query: int = 50  # keyword search results per query (one page)
+    semantic_search: bool = True  # also run OpenAlex search.semantic and merge
+    semantic_results_per_query: int = 50
+    # Keyword search ANDs every word, so a longer query (the user's own text) gets
+    # semantic search only.
+    keyword_max_words: int = 32
+    max_pool_size: int = 500  # distinct candidates kept, in order of arrival
+    top_k: int = 20  # kept after the local rerank
+    explain_top_k: int = 10  # papers the overlap explainer covers (Step 3)
+    cost_cap_per_check: float = 0.10  # USD, OpenAlex + LLM method cost; hard cap
+    openalex_timeout_s: float = 30.0  # per HTTP request
+    # OpenAlex work types kept (https://help.openalex.org/data/work-types/); datasets,
+    # errata, peer reviews, paratext and other non-papers are dropped.
+    work_types: tuple[str, ...] = (
+        "article",
+        "preprint",
+        "conference-paper",
+        "book-chapter",
+        "dissertation",
+    )
+    # The live tool refetches cached responses older than this; evaluation runs read
+    # the first response ever cached, so they never expire. None: never refetch.
+    cache_ttl_days: float | None = 7.0
+
+    def __post_init__(self) -> None:
+        _require(len(self.work_types) > 0, "work_types must list at least one OpenAlex type")
+        _require(
+            all(t.strip() and t == t.strip() for t in self.work_types),
+            "work_types must be non-empty type names without spaces around them",
+        )
+        _require(
+            self.cache_ttl_days is None or self.cache_ttl_days > 0,
+            "cache_ttl_days must be > 0 (or null to never refetch)",
+        )
+        _require(
+            1 <= self.results_per_query <= KEYWORD_MAX_PER_PAGE,
+            f"results_per_query must be in [1, {KEYWORD_MAX_PER_PAGE}] (one OpenAlex page)",
+        )
+        _require(
+            1 <= self.semantic_results_per_query <= SEMANTIC_MAX_RESULTS,
+            f"semantic_results_per_query must be in [1, {SEMANTIC_MAX_RESULTS}]",
+        )
+        _require(self.keyword_max_words >= 1, "keyword_max_words must be >= 1")
+        _require(self.max_pool_size >= 1, "max_pool_size must be >= 1")
+        _require(self.top_k >= 1, "top_k must be >= 1")
+        _require(1 <= self.explain_top_k <= self.top_k, "explain_top_k must be in [1, top_k]")
+        _require(self.cost_cap_per_check > 0, "cost_cap_per_check must be > 0")
+        _require(self.openalex_timeout_s > 0, "openalex_timeout_s must be > 0")
+
+
 @dataclass(frozen=True)
 class Config:
     corpus: CorpusConfig
@@ -171,6 +230,7 @@ class Config:
     paraphraser: ModelConfig
     judge: ModelConfig
     agent: ModelConfig
+    live: LiveConfig | None = None  # Phase 2; the Phase 1 commands don't need it
 
     def models(self) -> dict[str, ModelConfig]:
         return {"paraphraser": self.paraphraser, "judge": self.judge, "agent": self.agent}
