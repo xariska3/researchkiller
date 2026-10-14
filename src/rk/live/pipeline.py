@@ -7,7 +7,9 @@ search tool is live. Each query, the user's text first, goes to OpenAlex
 semantic search); the results join the candidate pool, and the agent sees the
 top-10 titles of the pool ranked for that query. When the loop ends, the final
 pool is ranked as B5 ranks the frozen corpus, RRF over every query's hybrid
-ranking, and the top live.top_k are kept.
+ranking, and the top live.top_k are kept. Another final fusion
+(rk.live.fusion) can rank the same pool instead (`fusion=`, or `with_fusion`
+on a finished check).
 
 Every check has its own ledger with a hard cap on its method cost (OpenAlex
 plus LLM, cache hits included, so a replayed check stops where the original
@@ -20,12 +22,13 @@ from __future__ import annotations
 
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date
 from typing import Any
 
 from rk.agent import AgentRetriever
 from rk.config import Config, LiveConfig, ModelConfig
+from rk.live.fusion import B5, L1_L5, final_ranking, l1_ranking
 from rk.live.openalex_search import (
     KEYWORD,
     SEARCH_COST_USD,
@@ -164,11 +167,14 @@ class LiveSearchResult:
     latency_s: float
     encoder: str
     encoder_device: str
+    pool: CandidatePool = field(repr=False, compare=False)  # the final pool
+    fusion: str = B5  # how the final pool was ranked (rk.live.fusion)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "text": self.text,
             "before": self.before.isoformat() if self.before else None,
+            "fusion": self.fusion,
             "queries": self.trace.queries,
             "steps": self.trace.steps,
             "stop_reason": self.trace.stop_reason,
@@ -215,6 +221,49 @@ class LiveSearchResult:
         }
 
 
+def proposal_records(text: str, searches: Sequence[SearchResponse]) -> list[Record]:
+    """The results of the semantic search on the user's text (L1's input), or none."""
+    return next((s.records for s in searches if s.query == text and s.kind == SEMANTIC), [])
+
+
+def final_candidates(
+    pool: CandidatePool,
+    queries: Sequence[str],
+    fusion: str,
+    top_k: int,
+    *,
+    l1: Sequence[str] = (),
+) -> list[Candidate]:
+    """The top_k of the final pool ranked by `fusion`, with their hits and versions."""
+    by_id = {r["id"]: r for r in pool.records}
+    top = final_ranking(pool, queries, fusion, l1=l1)[:top_k]
+    return [
+        Candidate(n, by_id[d], pool.hits(by_id[d]), pool.versions(by_id[d]))
+        for n, d in enumerate(top, start=1)
+    ]
+
+
+def _l1(
+    text: str, searches: Sequence[SearchResponse], encoder: Encoder, live: LiveConfig
+) -> list[str]:
+    records = proposal_records(text, searches)
+    return l1_ranking(records, text, encoder, max_size=live.max_pool_size)
+
+
+def with_fusion(
+    result: LiveSearchResult, fusion: str, encoder: Encoder, live: LiveConfig
+) -> LiveSearchResult:
+    """The same check ranked by another final fusion: same agent loop, searches and pool.
+
+    Its latency is the check's plus the time the new ranking took.
+    """
+    start = time.perf_counter()
+    l1 = _l1(result.text, result.searches, encoder, live) if fusion == L1_L5 else []
+    candidates = final_candidates(result.pool, result.trace.queries, fusion, live.top_k, l1=l1)
+    latency = result.latency_s + time.perf_counter() - start
+    return replace(result, candidates=candidates, fusion=fusion, latency_s=latency)
+
+
 def live_search(
     text: str,
     cfg: Config,
@@ -223,10 +272,12 @@ def live_search(
     encoder: Encoder,
     agent: ChatModel,
     before: date | None = None,
+    fusion: str = B5,
 ) -> LiveSearchResult:
     """Run the B5 loop on live search for `text` and rerank the pool (no explainer yet).
 
-    `before` restricts the search to works published before that date.
+    `before` restricts the search to works published before that date; `fusion`
+    is how the final pool is ranked (rk.live.fusion; B5's by default).
     """
     live = cfg.live
     if live is None:
@@ -245,12 +296,8 @@ def live_search(
         name="B5-live",
     )
     trace = b5.retrieve(text).trace
-    by_id = {r["id"]: r for r in pool.records}
-    top = pool.fused(trace.queries)[: live.top_k]
-    candidates = [
-        Candidate(n, by_id[d], pool.hits(by_id[d]), pool.versions(by_id[d]))
-        for n, d in enumerate(top, start=1)
-    ]
+    l1 = _l1(text, ranker.searches, encoder, live) if fusion == L1_L5 else []
+    candidates = final_candidates(pool, trace.queries, fusion, live.top_k, l1=l1)
     return LiveSearchResult(
         text=text,
         before=before,
@@ -263,4 +310,6 @@ def live_search(
         latency_s=time.perf_counter() - start,
         encoder=encoder.name,
         encoder_device=encoder.device,
+        pool=pool,
+        fusion=fusion,
     )

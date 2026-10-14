@@ -1,4 +1,5 @@
-"""Phase 2 live evaluation (python -m rk live-eval): L0, L1, L5, budget stops, the summary.
+"""Phase 2 live evaluation (python -m rk live-eval): L0, L1, L5, L5w, budget stops, the summary;
+and the offline replay of a run (final-fusion variants, the misses export).
 
 OpenAlex is FakeLiveOpenAlex behind httpx.MockTransport, the agent a FakeLLM,
 the encoder FakeEncoder; the Phase 1 run compared with is written by hand.
@@ -6,6 +7,7 @@ the encoder FakeEncoder; the Phase 1 run compared with is written by hand.
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import sqlite3
@@ -18,14 +20,15 @@ import pytest
 import yaml
 from bench_data import GOOD, T1, T2, T3, TITLES, corpus_records, judge_reply, target_rows
 from conftest import FakeEncoder, FakeLLM, corpus_config_dict
-from live_fakes import FakeLiveOpenAlex
+from live_fakes import WORKS, FakeLiveOpenAlex, oa_work
 
 from rk import cli
 from rk.bench import make_bench
 from rk.config import Config, config_from_dict
-from rk.corpus import freeze
+from rk.corpus import OpenAlexError, freeze
 from rk.evaluate import PER_QUERY_DIR, RUN_FILE, SUMMARY_JSON, SUMMARY_MD, EvalError
 from rk.evaluate import connect as connect_results
+from rk.live import evaluate as live_evaluate
 from rk.live.evaluate import (
     KIND,
     PHASE1_B5,
@@ -35,13 +38,52 @@ from rk.live.evaluate import (
     original_rank,
     run_live_eval,
 )
-from rk.live.openalex_search import KEYWORD, SEMANTIC, LiveSearchClient, OpenAlexCache
+from rk.live.fusion import (
+    B5,
+    FUSIONS,
+    L1_L5,
+    PROPOSAL_2X,
+    PROPOSAL_EQUAL,
+    PROPOSAL_ONLY,
+    final_ranking,
+    l1_ranking,
+    onto_pool,
+    proposal_weights,
+    weighted_rrf,
+)
+from rk.live.openalex_search import (
+    KEYWORD,
+    SEMANTIC,
+    LiveSearchClient,
+    OpenAlexCache,
+    live_record,
+)
 from rk.live.openalex_search import SearchResponse as Response
 from rk.live.pool import CandidatePool
+from rk.live.replay import (
+    FUSION_MD,
+    MISSES_COLUMNS,
+    evaluate_fusions,
+    export_misses,
+    replay_run,
+    select_fusion,
+)
 from rk.llm import LLMError
+from rk.retrieval import fuse_runs, rrf
 
 PHASE1_RUN = "20261013-000000"
 AGENT_QUERY = "learned clusters attention memory"  # every content stem is in T1's text
+CHOSEN_L5W_FUSION = live_evaluate.L5W_FUSION  # as committed, before any test patches it
+
+
+@pytest.fixture(autouse=True)
+def _l0_l1_l5_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Runs here have L0, L1 and L5 unless a test gives L5w a fusion itself."""
+    monkeypatch.setattr(live_evaluate, "L5W_FUSION", None)
+
+
+def test_l5w_is_the_fusion_the_dev_set_chose() -> None:
+    assert CHOSEN_L5W_FUSION == PROPOSAL_EQUAL  # docs/phase2_spec.md, runs/live-20261014-122144
 
 
 def _config_dict(tmp_path: Path, **live: Any) -> dict[str, Any]:
@@ -470,7 +512,7 @@ def test_the_summary_compares_with_phase1_b5_on_the_same_queries(cfg: Config) ->
         "Retrieval quality",
         "Effort per query",
         "Hit@5 by difficulty",
-        "Primary comparison",
+        "Pre-declared comparisons",
         "Secondary comparisons (exploratory)",
         "Which search first returned the original",
         "How the original matched",
@@ -581,3 +623,197 @@ def test_the_resume_hint_keeps_the_selection() -> None:
         f"python -m rk live-eval --config {config} --run-dir {run_dir} "
         '--from-qid A0045 --limit 200 --set "live.top_k=20"'
     )
+
+
+# --- final-fusion variants -------------------------------------------------------
+
+
+def test_weighted_rrf_with_unit_weights_is_rrf() -> None:
+    rankings = [["W1", "W2", "W3"], ["W3", "W2"], ["W2", "W9"]]
+    assert weighted_rrf(rankings, [1.0, 1.0, 1.0]) == rrf(rankings)
+    # A heavier first ranking wins a tie that RRF breaks by id.
+    assert rrf([["W2", "W1"], ["W1", "W2"]]) == ["W1", "W2"]
+    assert weighted_rrf([["W2", "W1"], ["W1", "W2"]], [2.0, 1.0]) == ["W2", "W1"]
+    with pytest.raises(ValueError, match="2 rankings but 1 weights"):
+        weighted_rrf(rankings[:2], [1.0])
+
+
+def test_the_proposal_weights_of_f1_and_f2() -> None:
+    assert proposal_weights(5, PROPOSAL_EQUAL) == [4.0, 1.0, 1.0, 1.0, 1.0]
+    assert proposal_weights(1, PROPOSAL_EQUAL) == [1.0]  # no agent query: weight 1
+    assert proposal_weights(3, PROPOSAL_2X) == [2.0, 1.0, 1.0]
+    with pytest.raises(ValueError):
+        proposal_weights(3, B5)
+
+
+def test_final_ranking_variants_over_one_pool() -> None:
+    pool = CandidatePool(FakeEncoder(), max_size=50)
+    pool.add([live_record(w) for w in WORKS], query_index=0, kind=SEMANTIC)
+    queries = [GOOD[T1], AGENT_QUERY, "reward calibration", "sensor dropout"]
+    runs = [pool.rank(q) for q in queries]
+    assert final_ranking(pool, queries, B5) == pool.fused(queries) == fuse_runs(runs)
+    equal, twice = [3.0, 1.0, 1.0, 1.0], [2.0, 1.0, 1.0, 1.0]
+    assert final_ranking(pool, queries, PROPOSAL_EQUAL) == weighted_rrf(runs, equal)
+    assert final_ranking(pool, queries, PROPOSAL_2X) == weighted_rrf(runs, twice)
+    assert final_ranking(pool, queries, PROPOSAL_ONLY) == runs[0]
+    l1 = ["W203", T1]
+    assert final_ranking(pool, queries, L1_L5, l1=l1) == rrf([l1, fuse_runs(runs)])
+    with pytest.raises(ValueError, match="unknown fusion"):
+        final_ranking(pool, queries, "b6")
+
+
+def test_l1s_ranking_maps_onto_the_final_pools_merged_works() -> None:
+    preprint = live_record(oa_work(corpus_records()[0], published="2024-05-01", doi="10.1/x"))
+    published = live_record(
+        oa_work({**corpus_records()[0], "id": "W900"}, published="2025-02-01", doi="10.1/x")
+    )
+    assert preprint and published
+    pool = CandidatePool(FakeEncoder(), max_size=10)
+    pool.add([published], query_index=0, kind=SEMANTIC)
+    l1 = l1_ranking([published], GOOD[T1], FakeEncoder(), max_size=10)
+    assert l1 == ["W900"]
+    pool.add([preprint], query_index=1, kind=KEYWORD)  # an earlier version arrives later
+    assert onto_pool(l1 + ["W999"], pool) == [T1]  # W900 is now an alias of T1; W999 is gone
+
+
+def test_select_fusion_needs_a_variant_above_l5() -> None:
+    def q(hit5: float, mrr: float) -> dict[str, float]:
+        return {"hit_at_5": hit5, "mrr": mrr}
+
+    quality = {B5: q(0.70, 0.57), PROPOSAL_EQUAL: q(0.72, 0.60), PROPOSAL_2X: q(0.74, 0.58),
+               L1_L5: q(0.74, 0.58), PROPOSAL_ONLY: q(0.74, 0.61)}
+    assert select_fusion(quality) == PROPOSAL_ONLY  # ties on Hit@5 go to MRR
+    quality[PROPOSAL_ONLY] = q(0.74, 0.58)
+    assert select_fusion(quality) == PROPOSAL_2X  # then to the declared order
+    assert select_fusion({**quality, B5: q(0.74, 0.50)}) is None  # none is above L5
+
+
+# --- the offline replay --------------------------------------------------------------
+
+
+def test_the_offline_client_never_sends_a_search(cfg: Config) -> None:
+    assert cfg.live is not None
+    fake = FakeLiveOpenAlex()
+    client = LiveSearchClient(
+        cfg.live, OpenAlexCache(cfg.live.cache_path), offline=True, transport=fake.transport
+    )
+    with pytest.raises(OpenAlexError, match="offline"):
+        client.search("memory", SEMANTIC)
+    assert fake.requests == []
+
+
+def test_a_replay_rebuilds_the_recorded_rankings_without_calls(cfg: Config) -> None:
+    done = _run(cfg, FakeLiveOpenAlex())
+    # The replay's client is offline and has no fake transport: a search it had to
+    # send would hit the network, which conftest refuses.
+    meta, _, replays = replay_run(done.run_dir, FakeEncoder())
+    assert meta["run_id"] == done.run_dir.name and len(replays) == 3
+    for rp in replays:
+        assert final_ranking(rp.pool, rp.queries, B5)[:10] == rp.recorded_l5
+        assert rp.l1[:10] == rp.recorded_l1
+        assert rp.queries == [GOOD[rp.target_id], AGENT_QUERY]
+
+
+def test_evaluate_fusions_on_a_replayed_run(cfg: Config) -> None:
+    done = _run(cfg, FakeLiveOpenAlex(hide_from_semantic={T1}))
+    summary = evaluate_fusions(done.run_dir, FakeEncoder())
+    assert summary["reproduced"] == {"L5": 3, "L1": 3, "L1_rows": 3}
+    assert set(summary["quality"]) == {*FUSIONS, "L1"}
+    recorded = _summary(done.run_dir)["quality"]
+    for fusion, config in ((B5, "L5"), ("L1", "L1")):  # the replay scores what the run did
+        for key in ("hit_at_1", "hit_at_5", "hit_at_10", "mrr"):
+            assert summary["quality"][fusion][key] == pytest.approx(recorded[config][key])
+    assert [(p["a"], p["b"], p["n"]) for p in summary["vs_l5"]] == [
+        (f, B5, 3) for f in FUSIONS[1:]
+    ]
+    assert [p["a"] for p in summary["vs_l1"]] == list(FUSIONS)
+    assert summary["selected"] == select_fusion(summary["quality"])
+    markdown = (done.run_dir / FUSION_MD).read_text(encoding="utf-8")
+    assert "matches the recorded one in 3 of 3 checks" in markdown
+
+
+def test_export_misses_writes_a_seeded_sample_of_l5_misses(cfg: Config, tmp_path: Path) -> None:
+    # T2's and T3's originals never come back, so L5 misses them.
+    done = _run(cfg, FakeLiveOpenAlex(hide_from_semantic={T2, T3}))
+    rows_by = _rows(cfg, done.run_dir)
+    missed = sorted(r["qid"] for (c, _), r in rows_by.items() if c == "L5" and not r["hit_at_5"])
+    qids = _qids(cfg)
+    assert {qids[T2], qids[T3]} <= set(missed)
+    out = tmp_path / "misses.csv"
+    assert export_misses(done.run_dir, FakeEncoder(), n=2, out_path=out) == 2
+    with out.open(encoding="utf-8-sig", newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    assert list(rows[0]) == list(MISSES_COLUMNS)
+    sampled = [r["qid"] for r in rows]
+    assert sampled == sorted(sampled) and set(sampled) <= set(missed)  # in qid order
+    out.unlink()
+    assert export_misses(done.run_dir, FakeEncoder(), n=10, out_path=out) == len(missed)
+    with out.open(encoding="utf-8-sig", newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    row = next(r for r in rows if r["qid"] == qids[T2])
+    assert (row["proposal"], row["original_title"], row["original_rank"]) == (
+        GOOD[T2],
+        TITLES[T2],
+        "none",
+    )
+    l5 = _rows(cfg, done.run_dir)[("L5", T2)]
+    top1 = json.loads(l5["doc_ids"])[0]
+    assert row["top1_title"] == next(w["title"] for w in WORKS if w["id"].endswith(top1))
+    assert row["top1_year"] == "2025" and row["top1_abstract"]
+    assert row["top1_close_prior_art"] == row["note"] == ""
+    with pytest.raises(EvalError, match="refusing to overwrite"):
+        export_misses(done.run_dir, FakeEncoder(), n=10, out_path=out)
+
+
+# --- L5w in live-eval ------------------------------------------------------------------
+
+
+def test_l5w_ranks_l5s_own_check_with_its_fusion(
+    cfg: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with pytest.raises(EvalError, match="L5w has no final fusion"):
+        _run(cfg, FakeLiveOpenAlex(), configs=["L5w"])
+    monkeypatch.setattr(live_evaluate, "L5W_FUSION", PROPOSAL_ONLY)
+    llm = agent()
+    done = _run(cfg, FakeLiveOpenAlex(), llm, configs=["L1", "L5", "L5w"])
+    assert len(llm.calls) == 6  # one agent loop (2 calls) per query serves L5 and L5w
+    rows = _rows(cfg, done.run_dir)
+    for target in (T1, T2, T3):
+        l5, l5w = rows[("L5", target)], rows[("L5w", target)]
+        for key in ("searches", "queries_issued", "openalex_cost", "llm_cost", "pool_size"):
+            assert l5w[key] == l5[key]
+        assert l5w["latency_s"] >= l5["latency_s"]
+        assert json.loads(l5w["trace"])["fusion"] == PROPOSAL_ONLY
+        assert json.loads(l5["trace"])["fusion"] == B5
+    # L5w is the proposal's own ranking of the same final pool.
+    _, _, replays = replay_run(done.run_dir, FakeEncoder())
+    for rp in replays:
+        expected = final_ranking(rp.pool, rp.queries, PROPOSAL_ONLY)[:10]
+        assert json.loads(rows[("L5w", rp.target_id)]["doc_ids"]) == expected
+    summary = _summary(done.run_dir)
+    assert summary["l5w_fusion"] == PROPOSAL_ONLY
+    assert [(p["a"], p["b"]) for p in summary["paired"]] == [
+        ("L5", "L1"),
+        ("L5w", "L5"),
+        ("L5w", "L1"),
+    ]
+    assert f"- L5w: {live_evaluate.CONFIG_LABELS['L5w']} {PROPOSAL_ONLY}" in (
+        done.run_dir / SUMMARY_MD
+    ).read_text(encoding="utf-8")
+
+
+def test_live_fusion_and_live_misses_commands(
+    cfg: Config,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    done = _run(cfg, FakeLiveOpenAlex(hide_from_semantic={T2}))
+    monkeypatch.setattr(cli, "make_encoder", lambda retrieval_cfg: FakeEncoder())
+    assert cli.main(["live-fusion", str(done.run_dir)]) == 0
+    out = capsys.readouterr().out
+    assert "replayed 3 checks offline (L5 reproduced 3/3, L1 3/3)" in out
+    assert (done.run_dir / FUSION_MD).exists()
+    csv_path = tmp_path / "misses.csv"
+    assert cli.main(["live-misses", str(done.run_dir), "--out", str(csv_path)]) == 0
+    assert "L5 misses to" in capsys.readouterr().out and csv_path.exists()

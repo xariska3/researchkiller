@@ -31,7 +31,7 @@ and with six live probes (one Phase 1 proposal and a short query):
   is inclusive, so "published before D" is to_publication_date:D-1.
 - Work types (https://help.openalex.org/data/work-types/, updated 2026-08-17):
   25 values. We keep live.work_types (article, preprint, conference-paper,
-  book-chapter, dissertation, review, book, report) with a type: filter, and
+  book-chapter, dissertation, review, book, report, software-paper) with a type: filter, and
   drop any other type that comes back anyway (dataset, erratum, peer-review,
   paratext, letter, editorial, other, ...). Proceedings papers are
   `conference-paper`, newly added with low coverage (`proceedings-article`
@@ -266,7 +266,9 @@ class LiveSearchClient:
     Every successful response is cached by its request parameters, so a repeated
     search costs nothing and replays offline. `max_age` None (evaluation) reads
     the first response ever cached; otherwise a cached response older than
-    max_age is fetched again. Retries and backoff come from rk.corpus.OpenAlexClient.
+    max_age is fetched again. With `offline`, a search that isn't cached raises
+    OpenAlexError instead of being sent. Retries and backoff come from
+    rk.corpus.OpenAlexClient.
     """
 
     def __init__(
@@ -275,6 +277,7 @@ class LiveSearchClient:
         cache: OpenAlexCache,
         *,
         max_age: timedelta | None = None,
+        offline: bool = False,
         api_key: str | None = None,
         transport: httpx.BaseTransport | None = None,
         sleep: Callable[[float], None] = time.sleep,
@@ -283,6 +286,7 @@ class LiveSearchClient:
         self.live = live
         self.cache = cache
         self.max_age = max_age
+        self.offline = offline
         self.calls = 0  # searches answered, cached or not
 
         def client(rate: float) -> OpenAlexClient:
@@ -344,6 +348,8 @@ class LiveSearchClient:
         """One page of results for `query`, from the cache when possible."""
         params = self.params(query, kind, before)
         hit = self.cache.get(params, max_age=self.max_age)
+        if hit is None and self.offline:
+            raise OpenAlexError(f"offline, and this {kind} search isn't cached: {query[:100]!r}")
         if hit is None:
             data = self._clients[kind].get_works(params)
             cost = _reported_cost(data)

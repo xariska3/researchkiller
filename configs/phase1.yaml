@@ -60,12 +60,12 @@ live:
   explain_top_k: 10               # used by the overlap explainer (Step 3)
   cost_cap_per_check: 0.10        # USD, OpenAlex + LLM; the check fails rather than exceed it
   openalex_timeout_s: 30
-  # OpenAlex work types kept: papers, plus literature reviews, books and reports (a
-  # survey or tech report on the same idea is prior art too). Datasets, errata, peer
-  # reviews, paratext, letters, editorials and other non-papers are dropped
-  # (https://help.openalex.org/data/work-types/).
+  # OpenAlex work types kept: papers, plus literature reviews, books, reports and
+  # software papers (a survey, tech report or software paper on the same idea is prior
+  # art too). Datasets, errata, peer reviews, paratext, letters, editorials and other
+  # non-papers are dropped (https://help.openalex.org/data/work-types/).
   work_types: [article, preprint, conference-paper, book-chapter, dissertation, review, book,
-               report]
+               report, software-paper]
   cache_ttl_days: 7               # live tool only; evaluation runs never expire
   # live-eval compares with this Phase 1 run (the full run: B5, and B1's difficulty buckets)
   phase1_run: "20261013-185712"

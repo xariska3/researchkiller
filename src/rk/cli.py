@@ -25,6 +25,8 @@ from rk.config import ConfigError, load_config
 from rk.corpus import CorpusError, OpenAlexClient, OpenAlexError, build_corpus
 from rk.evaluate import CONFIG_ORDER, SUMMARY_MD, EvalError, report, run_eval
 from rk.live import evaluate as live_eval
+from rk.live import replay as live_replay
+from rk.live.fusion import FUSIONS
 from rk.live.openalex_search import LiveSearchClient, OpenAlexCache
 from rk.llm import BudgetExceeded, Ledger, LLMCache, LLMClient, LLMError
 from rk.retrieval import RetrievalError, build_index, make_encoder
@@ -196,6 +198,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--retry-errors",
         action="store_true",
         help="with --run-dir: redo the rows that ended in an error",
+    )
+
+    fusion = sub.add_parser(
+        "live-fusion",
+        help="compare the final-fusion variants on a live run, replayed offline from the cache",
+    )
+    fusion.add_argument("run_dir", type=Path, help="runs/live-<timestamp>")
+
+    misses = sub.add_parser(
+        "live-misses",
+        help="write a seeded sample of a live run's L5 misses (not in the top 5) to a CSV",
+    )
+    misses.add_argument("run_dir", type=Path, help="runs/live-<timestamp>")
+    misses.add_argument(
+        "--n", type=_positive_int, default=10, help="how many misses to sample (default 10)"
+    )
+    misses.add_argument(
+        "--out",
+        type=Path,
+        default=live_replay.MISSES_FILE,
+        help=f"CSV to write; never overwritten (default {live_replay.MISSES_FILE})",
     )
 
     report_cmd = sub.add_parser("report", help="regenerate a run's summary from the database")
@@ -397,6 +420,28 @@ def live_eval_command(
     return 0
 
 
+def live_fusion_command(run_dir: Path) -> int:
+    _, cfg, _ = live_replay.load_run(run_dir)
+    summary = live_replay.evaluate_fusions(run_dir, make_encoder(cfg.retrieval))
+    rep, n = summary["reproduced"], summary["n_queries"]
+    hit5 = ", ".join(f"{f} {summary['quality'][f]['hit_at_5']:.3f}" for f in FUSIONS)
+    selected = summary["selected"]
+    choice = f"L5w = {selected}" if selected else "no variant beats L5, so there is no L5w"
+    print(
+        f"rk live-fusion: replayed {n} checks offline (L5 reproduced {rep['L5']}/{n}, "
+        f"L1 {rep['L1']}/{rep['L1_rows']}); Hit@5: {hit5}; {choice}; "
+        f"table in {run_dir / live_replay.FUSION_MD}"
+    )
+    return 0
+
+
+def live_misses_command(run_dir: Path, n: int, out: Path) -> int:
+    _, cfg, _ = live_replay.load_run(run_dir)
+    rows = live_replay.export_misses(run_dir, make_encoder(cfg.retrieval), n=n, out_path=out)
+    print(f"rk live-misses: wrote {rows} of {run_dir}'s L5 misses to {out}")
+    return 0
+
+
 def report_command(run_dir: Path) -> int:
     if live_eval.is_live_run(run_dir):
         summary = live_eval.report(run_dir)
@@ -448,6 +493,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.retry_errors,
                 args.overrides,
             )
+        if args.command == "live-fusion":
+            return live_fusion_command(args.run_dir)
+        if args.command == "live-misses":
+            return live_misses_command(args.run_dir, args.n, args.out)
         return report_command(args.run_dir)
     except (
         ConfigError,

@@ -8,6 +8,8 @@ Three pre-declared configurations run on each Phase 1 benchmark proposal:
   by the pool's hybrid ranker (Phase 1's B3 with the results as the corpus).
 - L5: the full live pipeline (rk.live.pipeline.live_search): B5's agent loop
   on live search, the candidate pool and the final RRF rerank.
+- L5w: the same check as L5 (one agent loop serves both), with its final pool
+  ranked by the fusion chosen on the dev set (L5W_FUSION, rk.live.fusion).
 
 A result is the original paper if one of its versions matches it
 (rk.live.pool.match_original: OpenAlex id, alias, DOI or exact normalised
@@ -29,9 +31,10 @@ found nothing: a miss (stop_reason "cost_cap"), counted apart in the summary.
 Other OpenAlex errors and LLM errors are error rows.
 
 The comparisons were pre-declared in docs/phase2_spec.md (Evaluation): L5 vs
-L1 is primary, decided by Hit@5 with the exact McNemar test, with MRR
-supporting; L1 vs L0, L5 vs L0 and L5 vs Phase 1's B5 on the frozen corpus
-(live.phase1_run, on the same queries) are secondary. All use Phase 1's
+L1 is Step 2's primary comparison, and L5w vs L5 and L5w vs L1 the test set's,
+each decided by Hit@5 with the exact McNemar test, with MRR supporting; L1 vs
+L0, L5 vs L0 and L5 vs Phase 1's B5 on the frozen corpus (live.phase1_run, on
+the same queries) are secondary. All use Phase 1's
 statistics (paired bootstrap CIs, exact McNemar on Hit@5). The summary also
 breaks Hit@5 down by Phase 1's difficulty buckets (the target's rank in that
 run's B1). Runs are logged to MLflow like Phase 1 runs, in
@@ -76,8 +79,16 @@ from rk.evaluate import (
     log_to_mlflow,
 )
 from rk.evaluate import connect as _connect_results
+from rk.live.fusion import PROPOSAL_EQUAL
 from rk.live.openalex_search import SEARCH_COST_USD, SEMANTIC, LiveSearchClient, SearchResponse
-from rk.live.pipeline import AGENT_PROMPT, CheckCostCapExceeded, CheckLedger, live_search
+from rk.live.pipeline import (
+    AGENT_PROMPT,
+    CheckCostCapExceeded,
+    CheckLedger,
+    LiveSearchResult,
+    live_search,
+    with_fusion,
+)
 from rk.live.pool import CandidatePool, match_original
 from rk.llm import ChatModel, LLMError, load_prompt
 from rk.retrieval import ENCODER_SETTINGS, Encoder, encoder_settings
@@ -86,16 +97,22 @@ from rk.targets import Record
 KIND = "live-eval"  # run.json "kind" of a live evaluation run
 RUN_PREFIX = "live-"
 TABLE = "live_query_results"
-LIVE_CONFIGS = ("L0", "L1", "L5")
+LIVE_CONFIGS = ("L0", "L1", "L5", "L5w")
 PHASE1_B5 = "P1-B5"  # Phase 1's B5 on the frozen corpus, compared on the same queries
-# Pre-declared in docs/phase2_spec.md; (a, b) is a minus b.
-PRIMARY_PAIRS = (("L5", "L1"),)
+# L5w: L5's check with this final fusion, chosen on the dev set by the pre-declared rule
+# (docs/phase2_spec.md): F1 proposal-equal had the best Hit@5 (0.750, tied with F2 and
+# ahead on MRR@20) on runs/live-20261014-122144, against L5's 0.700.
+L5W_FUSION: str | None = PROPOSAL_EQUAL
+# Pre-declared in docs/phase2_spec.md; (a, b) is a minus b. L5 vs L1 is Step 2's primary
+# comparison; L5w vs L5 and L5w vs L1 are the test set's.
+PRIMARY_PAIRS = (("L5", "L1"), ("L5w", "L5"), ("L5w", "L1"))
 SECONDARY_PAIRS = (("L1", "L0"), ("L5", "L0"), ("L5", PHASE1_B5))
 COST_CAP = "cost_cap"  # stop_reason of a check over its cost cap: a miss
 CONFIG_LABELS = {
     "L0": "OpenAlex semantic search on the proposal, in OpenAlex's order (1 call, no LLM)",
     "L1": "the L0 results reranked locally (BM25 + dense, RRF)",
     "L5": "the full live pipeline (B5's agent loop on live search, pool, final rerank)",
+    "L5w": "L5's check (same agent loop and pool), its final pool ranked by the fusion",
     PHASE1_B5: "Phase 1's B5 on the frozen corpus, on the same queries",
 }
 EFFORT = (
@@ -267,11 +284,8 @@ def run_l1(proposal: str, search: LiveSearchClient, live: LiveConfig, encoder: E
     )
 
 
-def run_l5(
-    proposal: str, cfg: Config, search: LiveSearchClient, encoder: Encoder, agent: ChatModel
-) -> Outcome:
-    """L5: the full live pipeline."""
-    result = live_search(proposal, cfg, search=search, encoder=encoder, agent=agent)
+def check_outcome(result: LiveSearchResult) -> Outcome:
+    """L5 (the full live pipeline) or L5w (the same check with another final fusion)."""
     queries = result.trace.queries
     return Outcome(
         doc_ids=[c.record["id"] for c in result.candidates],
@@ -445,6 +459,7 @@ def _fingerprint(meta: dict[str, Any]) -> dict[str, Any]:
         "agent": config["agent"],
         "live": {k: v for k, v in config["live"].items() if k != "cache_ttl_days"},
         "prompts": meta["prompt_hashes"],
+        "l5w_fusion": meta.get("l5w_fusion"),
     }
 
 
@@ -494,7 +509,10 @@ def run_live_eval(
     unknown = [c for c in configs or () if c not in LIVE_CONFIGS]
     if unknown:
         raise EvalError(f"unknown live configs {unknown}; choose from {list(LIVE_CONFIGS)}")
-    selected = [c for c in LIVE_CONFIGS if not configs or c in configs]
+    available = [c for c in LIVE_CONFIGS if c != "L5w" or L5W_FUSION is not None]
+    if configs and "L5w" in configs and L5W_FUSION is None:
+        raise EvalError("L5w has no final fusion yet (rk.live.evaluate.L5W_FUSION)")
+    selected = [c for c in available if not configs or c in configs]
 
     corpus, _, corpus_manifest = load_frozen_corpus(cfg.corpus.out_dir)
     corpus_sha = corpus_manifest["files"][CORPUS_FILE]["sha256"]
@@ -516,6 +534,7 @@ def run_live_eval(
         "corpus_sha256": corpus_sha,
         "bench_sha256": bench_sha,
         "phase1_run": live.phase1_run,
+        "l5w_fusion": L5W_FUSION,
         "prompt_hashes": {"retrieval": {AGENT_PROMPT: load_prompt(AGENT_PROMPT).sha256}},
         "models": {"agent": cfg.agent.name, **encoder_settings(encoder)},
         "encoder_device": encoder.device,
@@ -523,10 +542,32 @@ def run_live_eval(
         "seed": cfg.run.seed,
         "results_db": str(cfg.run.results_db.resolve()),
     }
+    last: dict[str, Any] = {}  # the last proposal's live check, shared by L5 and L5w
+
+    def check(proposal: str) -> LiveSearchResult:
+        if last.get("proposal") != proposal:
+            last.clear()
+            last["proposal"] = proposal
+            try:
+                last["result"] = live_search(
+                    proposal, cfg, search=search, encoder=encoder, agent=agent
+                )
+            except CheckCostCapExceeded as exc:  # the same miss for both
+                last["capped"] = exc
+        if "capped" in last:
+            raise last["capped"]
+        return last["result"]
+
+    def l5w(proposal: str) -> Outcome:
+        if L5W_FUSION is None or live is None:
+            raise EvalError("L5w has no final fusion yet (rk.live.evaluate.L5W_FUSION)")
+        return check_outcome(with_fusion(check(proposal), L5W_FUSION, encoder, live))
+
     runners: dict[str, Callable[[str], Outcome]] = {
         "L0": lambda proposal: run_l0(proposal, search, live),
         "L1": lambda proposal: run_l1(proposal, search, live, encoder),
-        "L5": lambda proposal: run_l5(proposal, cfg, search, encoder, agent),
+        "L5": lambda proposal: check_outcome(check(proposal)),
+        "L5w": l5w,
     }
     if run_dir is not None and (run_dir / RUN_FILE).exists() and not is_live_run(run_dir):
         raise EvalError(f"{run_dir} is not a live-eval run")
@@ -732,6 +773,7 @@ def summarize(db_path: Path, meta: dict[str, Any], *, seed: int) -> dict[str, An
         "corpus_sha256": meta["corpus_sha256"],
         "bench_sha256": meta["bench_sha256"],
         "phase1_run": phase1,
+        "l5w_fusion": meta.get("l5w_fusion"),
         "top_k": top_k,
         "configs": configs,
         "compared": compared,
@@ -784,7 +826,11 @@ def render_markdown(summary: dict[str, Any]) -> str:
         lines += ["", f"Stopped when OpenAlex's daily budget was spent: {when}."]
     lines += [
         "",
-        *(f"- {c}: {CONFIG_LABELS[c]}" for c in summary["compared"]),
+        *(
+            f"- {c}: {CONFIG_LABELS[c]}"
+            + (f" {summary['l5w_fusion']} (rk.live.fusion)" if c == "L5w" else "")
+            for c in summary["compared"]
+        ),
         "",
         (
             f"Ranks count within the top {k} (the list the tool shows), so MRR is MRR@{k} for "
@@ -847,13 +893,14 @@ def render_markdown(summary: dict[str, Any]) -> str:
 
     lines += [
         "",
-        "## Primary comparison (queries that succeeded in both configs)",
+        "## Pre-declared comparisons (queries that succeeded in both configs)",
         "",
         *_paired_table(summary["paired"]),
         "",
         (
-            "Pre-declared in docs/phase2_spec.md: L5 vs L1, decided by Hit@5 with the exact "
-            "McNemar test; MRR supports."
+            "Pre-declared in docs/phase2_spec.md: L5 vs L1 (Step 2's primary comparison), and "
+            "on the test set L5w vs L5 and L5w vs L1. Hit@5 with the exact McNemar test "
+            "decides; MRR supports."
         ),
         "",
         "## Secondary comparisons (exploratory)",
