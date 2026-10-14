@@ -20,7 +20,7 @@ import math
 import sqlite3
 import subprocess
 from collections import Counter
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
@@ -891,14 +891,20 @@ def _open_run(
     run_dir: Path | None,
     *,
     retry_errors: bool,
+    fingerprint: Callable[[dict[str, Any]], dict[str, Any]] = _fingerprint,
+    prefix: str = "",
 ) -> tuple[Path, dict[str, Any]]:
-    """Create a new run directory and `runs` row, or check and reopen an existing run."""
+    """Create a new run directory and `runs` row, or check and reopen an existing run.
+
+    A resumed run must have the same `fingerprint`; a new run's id is `prefix`
+    plus the UTC time.
+    """
     if run_dir is not None:
         meta_path = run_dir / RUN_FILE
         if not meta_path.exists():
             raise EvalError(f"{run_dir} is not a run directory (no {RUN_FILE})")
         run_meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        before, now = _fingerprint(run_meta), _fingerprint(meta)
+        before, now = fingerprint(run_meta), fingerprint(meta)
         changed = [key for key in before if before[key] != now[key]]
         if changed:
             raise EvalError(f"can't resume {run_dir}: {', '.join(changed)} changed since it started")
@@ -914,7 +920,7 @@ def _open_run(
         return run_dir, run_meta
     if retry_errors:
         raise EvalError("--retry-errors needs the run directory to retry (--run-dir)")
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    stamp = prefix + datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     run_id, n = stamp, 1
     while (cfg.run.out_dir / run_id).exists():
         n += 1
@@ -941,10 +947,12 @@ def _open_run(
     return run_dir, run_meta
 
 
-def export_jsonl(conn: sqlite3.Connection, run_id: str, run_dir: Path) -> list[Path]:
-    """Write per_query/<config>.jsonl, a portable copy of the run's rows."""
+def export_jsonl(
+    conn: sqlite3.Connection, run_id: str, run_dir: Path, *, table: str = "query_results"
+) -> list[Path]:
+    """Write per_query/<config>.jsonl, a portable copy of the run's rows in `table`."""
     rows = conn.execute(
-        "SELECT * FROM query_results WHERE run_id = ? ORDER BY config, qid", (run_id,)
+        f"SELECT * FROM {table} WHERE run_id = ? ORDER BY config, qid", (run_id,)
     ).fetchall()
     by_config: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
@@ -1010,11 +1018,17 @@ def _params(meta: dict[str, Any]) -> dict[str, str]:
     return {k: str(v) for k, v in params.items()}
 
 
-def log_to_mlflow(run_dir: Path, meta: dict[str, Any], run_cfg: RunConfig) -> dict[str, Any]:
+def log_to_mlflow(
+    run_dir: Path,
+    meta: dict[str, Any],
+    run_cfg: RunConfig,
+    *,
+    extra_params: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """One parent MLflow run per benchmark run, one child per config; returns their ids.
 
-    Params are set when a run is created; a resumed run reuses its MLflow runs
-    and updates their metrics and artifacts.
+    Params (with any `extra_params`) are set when a run is created; a resumed
+    run reuses its MLflow runs and updates their metrics and artifacts.
     """
     from mlflow import MlflowClient
     from mlflow.entities import Metric, Param
@@ -1031,7 +1045,8 @@ def log_to_mlflow(run_dir: Path, meta: dict[str, Any], run_cfg: RunConfig) -> di
     summary = json.loads((run_dir / SUMMARY_JSON).read_text(encoding="utf-8"))
     ids = dict(meta.get("mlflow") or {})
     children = dict(ids.get("children") or {})
-    params = [Param(k, v) for k, v in _params(meta).items()]
+    extra = {k: str(v) for k, v in (extra_params or {}).items()}
+    params = [Param(k, v) for k, v in {**_params(meta), **extra}.items()]
     stamp = int(datetime.now(timezone.utc).timestamp() * 1000)
 
     parent = ids.get("parent")

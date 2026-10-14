@@ -183,19 +183,31 @@ class LiveConfig:
     cost_cap_per_check: float = 0.10  # USD, OpenAlex + LLM method cost; hard cap
     openalex_timeout_s: float = 30.0  # per HTTP request
     # OpenAlex work types kept (https://help.openalex.org/data/work-types/); datasets,
-    # errata, peer reviews, paratext and other non-papers are dropped.
+    # errata, peer reviews, paratext, letters, editorials and other non-papers are dropped.
     work_types: tuple[str, ...] = (
         "article",
         "preprint",
         "conference-paper",
         "book-chapter",
         "dissertation",
+        "review",
+        "book",
+        "report",
     )
     # The live tool refetches cached responses older than this; evaluation runs read
     # the first response ever cached, so they never expire. None: never refetch.
     cache_ttl_days: float | None = 7.0
+    # live-eval: the Phase 1 run (in run.results_db) whose B5, and whose B1 difficulty
+    # buckets, the live configs are compared with on the same queries. None: no comparison.
+    phase1_run: str | None = None
+    mlflow_experiment: str = "researchkiller-phase2-live"  # where live-eval runs are logged
 
     def __post_init__(self) -> None:
+        _require(
+            self.phase1_run is None or bool(self.phase1_run.strip()),
+            "phase1_run must not be empty (leave it out for no Phase 1 comparison)",
+        )
+        _require(bool(self.mlflow_experiment.strip()), "mlflow_experiment must not be empty")
         _require(len(self.work_types) > 0, "work_types must list at least one OpenAlex type")
         _require(
             all(t.strip() and t == t.strip() for t in self.work_types),

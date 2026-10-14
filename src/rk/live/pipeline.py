@@ -44,6 +44,10 @@ AGENT_PROMPT = "agent_step"  # Phase 1's B5 prompt
 class CheckCostCapExceeded(RuntimeError):
     """A call could take one check's cost over live.cost_cap_per_check."""
 
+    def __init__(self, message: str, ledger: CheckLedger | None = None) -> None:
+        super().__init__(message)
+        self.ledger = ledger  # what the check had cost when it stopped
+
 
 @dataclass
 class CheckLedger:
@@ -53,6 +57,8 @@ class CheckLedger:
     openalex_cost: float = 0.0  # every search, cache hits included
     openalex_spent: float = 0.0  # searches actually sent
     llm: Usage = field(default_factory=Usage)
+    searches: int = 0
+    searches_sent: int = 0
 
     @property
     def method_cost(self) -> float:
@@ -67,12 +73,15 @@ class CheckLedger:
         if self.method_cost + amount > self.cap:
             raise CheckCostCapExceeded(
                 f"{what} could cost ${amount:.4f}, and the check has already cost "
-                f"${self.method_cost:.4f} of its ${self.cap:.2f} cap"
+                f"${self.method_cost:.4f} of its ${self.cap:.2f} cap",
+                self,
             )
 
     def add_search(self, response: SearchResponse) -> None:
         self.openalex_cost += response.cost_usd
         self.openalex_spent += response.money_spent
+        self.searches += 1
+        self.searches_sent += not response.cached
 
 
 class CappedChatModel:
@@ -137,6 +146,7 @@ class Candidate:
     rank: int  # from 1, in the final reranked list
     record: Record
     hits: list[Hit]  # where the live searches found it
+    versions: list[Record]  # the search results merged into it, one per OpenAlex id
 
 
 @dataclass(frozen=True)
@@ -172,6 +182,7 @@ class LiveSearchResult:
                     "n_usable": len(s.records),
                     "cost_usd": s.cost_usd,
                     "cached": s.cached,
+                    "fetched_at": s.fetched_at.isoformat(),
                 }
                 for s in self.searches
             ],
@@ -236,7 +247,10 @@ def live_search(
     trace = b5.retrieve(text).trace
     by_id = {r["id"]: r for r in pool.records}
     top = pool.fused(trace.queries)[: live.top_k]
-    candidates = [Candidate(n, by_id[d], pool.hits(by_id[d])) for n, d in enumerate(top, start=1)]
+    candidates = [
+        Candidate(n, by_id[d], pool.hits(by_id[d]), pool.versions(by_id[d]))
+        for n, d in enumerate(top, start=1)
+    ]
     return LiveSearchResult(
         text=text,
         before=before,

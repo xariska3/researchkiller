@@ -28,6 +28,16 @@ and with small live probes:
 - Errors (https://help.openalex.org/api/errors/): retry 429, 5xx and timeouts
   with exponential backoff (1 s, 2 s, 4 s, ...) and don't retry other 4xx. No
   Retry-After header is documented; one is honoured if sent.
+- Daily budget (https://help.openalex.org/how-to-use-the-api/rate-limits-and-authentication,
+  checked 2026-10-14): a spent daily budget and a per-second overrun both
+  return HTTP 429, with no documented difference in the body. Every response
+  has X-RateLimit-Remaining (credits left today; 1 credit = $0.0001, as
+  /rate-limit reports: credits_limit 10,000 for daily_budget_usd 1) and
+  X-RateLimit-Reset (seconds until midnight UTC). So a 429 whose remaining
+  credits can't pay for the call is a spent budget (OpenAlexBudgetExhausted,
+  not retried); any other 429 is retried. GET /rate-limit is free (a probe
+  cost 0 credits) and reports daily_remaining_usd, prepaid_remaining_usd and
+  resets_in_seconds.
 - Data: newest-first results start with bogus future dates (a probe returned
   2031-01-01 and 2030-01-01 first), so sweep and citer queries add
   to_publication_date:<build date>.
@@ -58,6 +68,8 @@ from rk.text import content_tokens, normalize_title, reconstruct_abstract
 OPENALEX_URL = "https://api.openalex.org"
 PER_PAGE = 100  # documented maximum
 MAX_REQUESTS_PER_SECOND = 100.0  # documented limit
+CREDIT_USD = 0.0001  # one OpenAlex credit
+LIST_CALL_USD = 0.0001  # documented price of one list+filter call
 IDS_PER_CALL = 50
 SELECT = (
     "id,doi,title,publication_date,abstract_inverted_index,referenced_works,"
@@ -77,12 +89,32 @@ class OpenAlexError(RuntimeError):
     """An OpenAlex request failed: rejected, malformed, or retries exhausted."""
 
 
+class OpenAlexBudgetExhausted(OpenAlexError):
+    """HTTP 429 because today's budget can't pay for the call; it resets at midnight UTC."""
+
+    def __init__(self, message: str, *, resets_in_s: float | None = None) -> None:
+        super().__init__(message)
+        self.resets_in_s = resets_in_s
+
+
 class CorpusError(RuntimeError):
     """The corpus can't be built or frozen as asked."""
 
 
+def _header_number(response: httpx.Response, name: str) -> float | None:
+    try:
+        return float(response.headers[name])
+    except (KeyError, ValueError):
+        return None
+
+
 class OpenAlexClient:
-    """Throttled, retrying client for OpenAlex /works list requests."""
+    """Throttled, retrying client for OpenAlex /works list requests.
+
+    `call_cost_usd` is what one call costs: a 429 whose X-RateLimit-Remaining
+    can't pay for it means today's budget is spent, so it raises
+    OpenAlexBudgetExhausted at once instead of being retried.
+    """
 
     def __init__(
         self,
@@ -96,12 +128,14 @@ class OpenAlexClient:
         backoff_base: float = 1.0,
         backoff_max: float = 60.0,
         timeout: float = 60.0,
+        call_cost_usd: float = LIST_CALL_USD,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
         self.authenticated = bool(api_key)
         self.calls = 0  # HTTP requests sent, retries included
+        self.call_credits = round(call_cost_usd / CREDIT_USD)
         self.max_retries = max_retries
         self.backoff_base = backoff_base
         self.backoff_max = backoff_max
@@ -135,6 +169,13 @@ class OpenAlexClient:
                 problem = f"{type(exc).__name__}: {exc}"
             else:
                 status = response.status_code
+                if status == 429 and self._budget_spent(response):
+                    raise OpenAlexBudgetExhausted(
+                        f"OpenAlex's daily budget is spent: "
+                        f"{response.headers['x-ratelimit-remaining']} credits left, and a call "
+                        f"costs {self.call_credits}",
+                        resets_in_s=_header_number(response, "x-ratelimit-reset"),
+                    )
                 if status == 429 or status >= 500:
                     problem = f"HTTP {status}: {response.text[:300]}"
                     retry_after = retry_after_seconds(response)
@@ -184,8 +225,31 @@ class OpenAlexClient:
                 return
             cursor = (page.get("meta") or {}).get("next_cursor")
 
+    def rate_limit(self) -> dict[str, Any]:
+        """Today's budget for the API key, from GET /rate-limit (free; not retried)."""
+        self._throttle()
+        self.calls += 1
+        try:
+            response = self._http.get("/rate-limit")
+        except httpx.TransportError as exc:
+            raise OpenAlexError(f"/rate-limit: {type(exc).__name__}: {exc}") from exc
+        if response.is_error:
+            raise OpenAlexError(f"/rate-limit: HTTP {response.status_code}: {response.text[:300]}")
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise OpenAlexError("/rate-limit: response is not JSON") from exc
+        budget = data.get("rate_limit") if isinstance(data, dict) else None
+        if not isinstance(budget, dict):
+            raise OpenAlexError(f"/rate-limit: unexpected response: {str(data)[:300]}")
+        return budget
+
     def close(self) -> None:
         self._http.close()
+
+    def _budget_spent(self, response: httpx.Response) -> bool:
+        remaining = _header_number(response, "x-ratelimit-remaining")
+        return remaining is not None and remaining < self.call_credits
 
     def _throttle(self) -> None:
         now = self._clock()

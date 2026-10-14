@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import re
 import sys
 from collections.abc import Sequence
 from contextlib import ExitStack, closing
@@ -23,6 +24,8 @@ from rk.bench import (
 from rk.config import ConfigError, load_config
 from rk.corpus import CorpusError, OpenAlexClient, OpenAlexError, build_corpus
 from rk.evaluate import CONFIG_ORDER, SUMMARY_MD, EvalError, report, run_eval
+from rk.live import evaluate as live_eval
+from rk.live.openalex_search import LiveSearchClient, OpenAlexCache
 from rk.llm import BudgetExceeded, Ledger, LLMCache, LLMClient, LLMError
 from rk.retrieval import RetrievalError, build_index, make_encoder
 from rk.targets import TargetSelectionError
@@ -57,6 +60,22 @@ def _config_list(text: str) -> list[str]:
             f"unknown configs {unknown}; choose from {','.join(CONFIG_ORDER)}"
         )
     return names
+
+
+def _live_config_list(text: str) -> list[str]:
+    names = [name.strip() for name in text.split(",") if name.strip()]
+    unknown = [name for name in names if name not in live_eval.LIVE_CONFIGS]
+    if unknown or not names:
+        raise argparse.ArgumentTypeError(
+            f"unknown live configs {unknown}; choose from {','.join(live_eval.LIVE_CONFIGS)}"
+        )
+    return names
+
+
+def _qid_start(text: str) -> str:
+    if re.fullmatch(r"A\d{4,}", text) is None:
+        raise argparse.ArgumentTypeError(f"expected a qid prefix like A0045, got {text!r}")
+    return text
 
 
 def _add_config_arguments(parser: argparse.ArgumentParser) -> None:
@@ -151,8 +170,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="with --run-dir: redo the rows that ended in an LLM error",
     )
 
+    live = sub.add_parser(
+        "live-eval", help="evaluate live retrieval over OpenAlex (L0, L1, L5) on the benchmark"
+    )
+    _add_config_arguments(live)
+    live.add_argument(
+        "--configs",
+        type=_live_config_list,
+        help=f"comma-separated configs (default: all of {','.join(live_eval.LIVE_CONFIGS)})",
+    )
+    live.add_argument(
+        "--from-qid",
+        type=_qid_start,
+        help="start at this qid in seeded order, e.g. A0045 to leave out Phase 1's tuning targets",
+    )
+    live.add_argument(
+        "--limit", type=_positive_int, help="evaluate only the first N queries (from --from-qid)"
+    )
+    live.add_argument(
+        "--run-dir",
+        type=Path,
+        help="resume this run directory, e.g. after OpenAlex's daily budget ran out",
+    )
+    live.add_argument(
+        "--retry-errors",
+        action="store_true",
+        help="with --run-dir: redo the rows that ended in an error",
+    )
+
     report_cmd = sub.add_parser("report", help="regenerate a run's summary from the database")
-    report_cmd.add_argument("run_dir", type=Path, help="runs/<timestamp>")
+    report_cmd.add_argument("run_dir", type=Path, help="runs/<timestamp> or runs/live-<timestamp>")
     return parser
 
 
@@ -282,8 +329,79 @@ def run_command(
     return 0
 
 
+def resume_hint(
+    config_path: Path,
+    run_dir: Path,
+    configs: Sequence[str] | None,
+    from_qid: str | None,
+    limit: int | None,
+    overrides: Sequence[str],
+) -> str:
+    """The live-eval command that resumes `run_dir` with the same selection."""
+    parts = ["python -m rk live-eval", f"--config {config_path}", f"--run-dir {run_dir}"]
+    if configs:
+        parts.append(f"--configs {','.join(configs)}")
+    if from_qid:
+        parts.append(f"--from-qid {from_qid}")
+    if limit:
+        parts.append(f"--limit {limit}")
+    parts += [f'--set "{o}"' for o in overrides]
+    return " ".join(parts)
+
+
+def live_eval_command(
+    config_path: Path,
+    configs: list[str] | None,
+    from_qid: str | None,
+    limit: int | None,
+    run_dir: Path | None,
+    retry_errors: bool,
+    overrides: Sequence[str] = (),
+) -> int:
+    cfg = load_config(config_path, overrides)
+    if cfg.live is None:
+        raise ConfigError(f"{config_path} has no live: section")
+    with ExitStack() as stack:
+        cache = stack.enter_context(LLMCache(cfg.run.cache_path))
+        ledger = stack.enter_context(
+            Ledger(cfg.run.cache_path, cfg.run.budget_cap, command="live-eval")
+        )
+        agent = stack.enter_context(closing(LLMClient(cfg.agent, cache, ledger)))
+        responses = stack.enter_context(closing(OpenAlexCache(cfg.live.cache_path)))
+        search = stack.enter_context(
+            closing(LiveSearchClient.from_config(cfg, responses, evaluation=True))
+        )
+        print(f"rk live-eval: {live_eval.describe_budget(search)}", flush=True)
+        done = live_eval.run_live_eval(
+            cfg,
+            agent,
+            make_encoder(cfg.retrieval),
+            search,
+            configs=configs,
+            from_qid=from_qid,
+            limit=limit,
+            retry_errors=retry_errors,
+            run_dir=run_dir,
+        )
+    progress = f"{done.n_done} of {done.n_queries} queries done"
+    summary = done.run_dir / SUMMARY_MD
+    if done.budget_stop is None:
+        print(f"rk live-eval: {progress}; results in {cfg.run.results_db}; summary in {summary}")
+        return 0
+    hint = resume_hint(config_path, done.run_dir, configs, from_qid, limit, overrides)
+    print(
+        f"rk live-eval: stopped: {done.budget_stop}. {progress}; the unfinished query has no "
+        f"row. The budget resets in {live_eval.duration(done.budget_stop.resets_in_s)} "
+        f"(midnight UTC). Summary so far in {summary}. Resume with:\n  {hint}"
+    )
+    return 0
+
+
 def report_command(run_dir: Path) -> int:
-    summary = report(run_dir)
+    if live_eval.is_live_run(run_dir):
+        summary = live_eval.report(run_dir)
+    else:
+        summary = report(run_dir)
     errors = sum(summary["errors"].values())
     print(
         f"rk report: rewrote {run_dir / SUMMARY_MD} and summary.json "
@@ -295,7 +413,8 @@ def report_command(run_dir: Path) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.command == "run" and args.retry_errors and args.run_dir is None:
+    retry = args.command in ("run", "live-eval") and args.retry_errors
+    if retry and args.run_dir is None:
         parser.error("--retry-errors needs --run-dir (the run whose errors to retry)")
     try:
         if args.command == "build-corpus":
@@ -314,6 +433,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             return run_command(
                 args.config,
                 args.configs,
+                args.limit,
+                args.run_dir,
+                args.retry_errors,
+                args.overrides,
+            )
+        if args.command == "live-eval":
+            return live_eval_command(
+                args.config,
+                args.configs,
+                args.from_qid,
                 args.limit,
                 args.run_dir,
                 args.retry_errors,
