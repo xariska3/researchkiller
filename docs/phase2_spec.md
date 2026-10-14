@@ -25,7 +25,10 @@ design live, and keeps the Phase 1 benchmark as a regression test.
   the top results and overlap explanations were useful.
 - **Cost and speed:** median under $0.03 and under 60 s per check; hard cap of
   $0.10 per check.
-- A web page + API that runs locally with one command (Docker Compose).
+- **Competitive check:** on the same queries, compared with ChatGPT and Claude
+  with web search, Perplexity and Semantic Scholar on recall, fabricated
+  references, cost and speed (see "Competitive evaluation").
+- A web page + API that runs locally with one command.
 
 ## Pipeline (per check)
 1. **Input:** idea text, 40–500 words. Optional: a "published before" date, so
@@ -38,11 +41,6 @@ design live, and keeps the Phase 1 benchmark as a regression test.
    docs for a semantic or vector search option; if one exists, also use it and
    merge. Dedupe by id/DOI/title into a candidate pool (typically 100–250).
    Cache every OpenAlex response on disk.
-   *Step 1 finding:* OpenAlex has semantic search (`search.semantic`: at most
-   50 results, 1 request/s, $0.001 per call, the same price as keyword search).
-   Keyword search ANDs every word, so queries longer than
-   `live.keyword_max_words` (32; in practice the user's text) get semantic
-   search only. Details in `src/rk/live/openalex_search.py`.
 4. **Rerank locally:** BM25 + the Qwen3-Embedding dense score over the
    candidate pool, fused with the same RRF function as Phase 1 (hybrid,
    because Phase 1 showed rewrites do worse on a dense-only base). Keep the top 20.
@@ -79,9 +77,7 @@ design live, and keeps the Phase 1 benchmark as a regression test.
   JSON, quote, verified flag). Same database as the LLM cache/spend file is fine.
 - **Schemas:** Pydantic models for the API and for the explainer output.
 - **Config:** a `live:` section in the YAML (results per query, pool size,
-  top-k to explain, per-check cost cap, timeouts). *Step 1:* the section is in
-  `configs/phase1.yaml`. The cap is on a check's method cost (OpenAlex plus
-  LLM), and a call that could cross it fails the check.
+  top-k to explain, per-check cost cap, timeouts).
 - **Embeddings:** GPU if available, CPU fallback; record which one in the check.
 
 ## Evaluation
@@ -93,18 +89,59 @@ design live, and keeps the Phase 1 benchmark as a regression test.
   useful? explanations correct?), and report the quote-verification rate.
 - The Phase 1 frozen benchmark stays runnable as a regression test.
 
+## Competitive evaluation: is it better than what researchers already use?
+The question a researcher asks is "why not just ask ChatGPT?". We answer it
+with numbers.
+
+**Automated head-to-head** (100 Phase 1 queries, stratified by the Phase 1
+difficulty buckets, same prompt for every system: "Find the existing papers
+most closely related to this research proposal. List up to 10, each with
+title, year and link."):
+- ResearchKiller (live tool)
+- an OpenAI model with its web search tool
+- a Claude model with its web search tool
+- Perplexity Sonar (API)
+- Semantic Scholar search API (plain academic search baseline, free)
+
+Check current APIs and prices first (via OpenRouter where possible, otherwise
+direct). Metrics per system:
+- **Recall:** is the original paper in the list (match by DOI/OpenAlex id, else
+  normalised title)? Report Hit@1/5/10.
+- **Fabricated references:** share of listed papers that don't exist (each
+  title/DOI looked up in OpenAlex). Ours is 0 by construction; measure the others.
+- **Cost and latency** per query.
+Same paired statistics as Phase 1. Report every system, whatever the outcome.
+
+**Manual spot check** (2–3 of the same queries, by hand, as qualitative
+examples): the ChatGPT and Claude apps in deep-research mode (fresh temporary
+chat, memory off, web search on), plus Undermind/Elicit/Consensus where a free
+tier allows. Record whether the original paper appears, time taken, and what
+each tool offers that ours doesn't. No scraping or automation of these tools.
+Before the automated run, check current prices and set a per-system cost cap.
+
+**Landscape doc** (docs/landscape.md): what each existing tool does (Elicit,
+Consensus, Undermind, Semantic Scholar, Google Scholar Labs, ChatGPT/Claude deep
+research, Perplexity; research systems: Idea Novelty Checker, OpenScholar,
+PaperQA2, AI Scientist's novelty check), price, speed, and where ResearchKiller
+is different. Candidate differentiators to confirm or reject with the numbers:
+prior art found under different terminology, facet-level overlap with verified
+quotes, vocabulary map, measured recall, ~1 cent and under a minute per check,
+no fabricated citations.
+
 ## Steps (one Claude Code session each, each on its own branch + PR)
 1. Live retrieval: OpenAlex search client (checked against current docs),
    candidate pool, local rerank, B5 loop on the live pool. Mocked tests.
 2. Live eval: pilot on 30 queries, then all 500. Report.
-3. Overlap explainer + quote verification + vocabulary map + report schema.
+3. Competitive evaluation: landscape doc, automated head-to-head on 100
+   queries, manual comparison sheet for the author.
+4. Overlap explainer + quote verification + vocabulary map + report schema.
    Tests with FakeLLM. Hand check on 10 checks.
-4. FastAPI + SQLite + background worker + web page. Tests with TestClient.
-5. Docker Compose (app + MLflow UI), README for users ("how to run, what it
-   does, what it doesn't"), screenshots, demo.
+5. FastAPI + SQLite + background worker + web page. Tests with TestClient.
+6. User README ("how to run, what it does, what it doesn't"), screenshots,
+   demo. Optional: Dockerfile built and tested in GitHub Actions.
 
 ## Out of scope for Phase 2
-User accounts, scoop alerts, `.bib` missing-citation check, the MCP server,
+Docker as a requirement, user accounts, scoop alerts, `.bib` missing-citation check, the MCP server,
 full-text PDFs, hosting on the public internet. These are candidates for Phase 3.
 
 ## Known limitations to state
