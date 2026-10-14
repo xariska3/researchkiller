@@ -71,6 +71,74 @@ live:
   phase1_run: "20261013-185712"
   mlflow_experiment: researchkiller-phase2-live
 
+# Phase 2 Step 3: the automated head-to-head (python -m rk compete; prices and API facts
+# checked 2026-10-14, docs/reports/phase2-step3-plan.md). A system's cost_cap is its
+# cumulative spend over every compete run (table compete_spend in cache_path), and
+# reserve_per_query is held back before each real call, so a call that could cross the
+# cap is refused. Prices are USD per million tokens, per search and per request.
+compete:
+  runs: [runs/live-20261014-122144]   # the dev set; the test run is added when it finishes
+  cache_path: data/cache/compete.sqlite
+  n_queries: 100
+  crossref_mailto_env: CROSSREF_MAILTO
+  systems:
+    - name: claude
+      kind: anthropic
+      model: claude-sonnet-5-5
+      base_url: https://api.anthropic.com/v1
+      api_key_env: ANTHROPIC_API_KEY
+      web_search_tool: web_search_20260318   # dynamic filtering, the current default
+      max_searches: 5
+      max_tokens: 8192
+      price_in_per_m: 2.0
+      price_out_per_m: 10.0
+      price_per_search: 0.01
+      reserve_per_query: 1.0
+      cost_cap: 40.0                # of the $100 promotional credit (expires 2026-10-18)
+      requests_per_second: 0.5
+      timeout_s: 600
+    - name: openai
+      kind: openrouter
+      model: openai/gpt-6.1-sol
+      base_url: https://openrouter.ai/api/v1
+      api_key_env: OPENROUTER_API_KEY
+      web_search_tool: "openrouter:web_search"   # engine native: OpenAI's own search
+      max_searches: 5
+      max_tokens: 16384             # reasoning tokens count here too
+      price_in_per_m: 2.0
+      price_out_per_m: 10.0
+      price_per_search: 0.01
+      reserve_per_query: 0.5
+      cost_cap: 4.5                 # OpenRouter balance $6.69 on 2026-10-14, shared
+      requests_per_second: 0.5
+      timeout_s: 600
+    - name: perplexity
+      kind: openrouter
+      model: perplexity/sonar
+      base_url: https://openrouter.ai/api/v1
+      api_key_env: OPENROUTER_API_KEY
+      search_context_size: low      # Perplexity's default
+      max_tokens: 4096
+      price_in_per_m: 1.0
+      price_out_per_m: 1.0
+      price_per_request: 0.005
+      reserve_per_query: 0.03
+      cost_cap: 1.0
+      requests_per_second: 0.5
+      timeout_s: 300
+    - name: s2-search
+      kind: s2-search
+      base_url: https://api.semanticscholar.org/graph/v1
+      api_key_env: SEMANTIC_SCHOLAR_API_KEY   # optional
+      requests_per_second: 1.0
+      timeout_s: 60
+    - name: s2-snippets
+      kind: s2-snippets
+      base_url: https://api.semanticscholar.org/graph/v1
+      api_key_env: SEMANTIC_SCHOLAR_API_KEY   # optional
+      requests_per_second: 1.0
+      timeout_s: 60
+
 run:
   out_dir: runs
   cache_path: data/cache/llm.sqlite   # LLM cache + cumulative spend table
