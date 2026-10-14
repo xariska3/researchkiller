@@ -8,6 +8,7 @@ fixture benchmark (FakeLiveOpenAlex, FakeLLM agent, FakeEncoder), as in test_liv
 
 from __future__ import annotations
 
+import csv
 import json
 import urllib.parse
 from collections.abc import Iterator
@@ -28,8 +29,10 @@ from rk.compete import evaluate as compete_eval
 from rk.compete.evaluate import (
     OURS,
     RESULTS_FILE,
+    SAMPLE_COLUMNS,
     Query,
     holm,
+    make_ledger,
     make_plan,
     match_item,
     quotas_for,
@@ -94,8 +97,29 @@ def claude_dict(**overrides: Any) -> dict[str, Any]:
 
 
 def openai_dict(**overrides: Any) -> dict[str, Any]:
+    """An OpenAI model with OpenAI's web search, directly through the Responses API."""
     return {
         "name": "openai",
+        "kind": "openai",
+        "label": "OpenAI smaller model (test); flagship not tested",
+        "model": "gpt-test",
+        "base_url": "https://api.openai.com/v1",
+        "api_key_env": "TEST_OPENAI_KEY",
+        "web_search_tool": "web_search",
+        "max_searches": 5,
+        "price_in_per_m": 0.1,
+        "price_out_per_m": 0.5,
+        "price_per_search": 0.01,
+        "reserve_per_query": 0.08,
+        "cost_cap": 4.5,
+        **overrides,
+    }
+
+
+def openrouter_search_dict(**overrides: Any) -> dict[str, Any]:
+    """A model with its provider's own search through OpenRouter's server tool."""
+    return {
+        "name": "openrouter-search",
         "kind": "openrouter",
         "model": "openai/test",
         "base_url": "https://openrouter.ai/api/v1",
@@ -145,6 +169,7 @@ def system_config(data: dict[str, Any]) -> CompeteSystemConfig:
 @pytest.fixture(autouse=True)
 def _keys(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TEST_ANTHROPIC_KEY", "anthropic-key")
+    monkeypatch.setenv("TEST_OPENAI_KEY", "openai-key")
     monkeypatch.setenv("TEST_OPENROUTER_KEY", "openrouter-key")
     monkeypatch.delenv("TEST_S2_KEY", raising=False)
 
@@ -152,14 +177,37 @@ def _keys(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_the_committed_config_has_the_compete_section() -> None:
     cfg = load_config(Path(__file__).resolve().parents[1] / "configs" / "phase1.yaml")
     assert cfg.compete is not None
-    assert [s.name for s in cfg.compete.systems] == [
-        "claude",
-        "openai",
+    systems = {s.name: s for s in cfg.compete.systems}
+    assert list(systems) == [
+        "claude-sonnet",
+        "claude-opus",
+        "openai-luna",
         "perplexity",
         "s2-search",
         "s2-snippets",
     ]
-    assert all(s.cost_cap > 0 for s in cfg.compete.systems if s.kind in ("anthropic", "openrouter"))
+    # Sonnet first, then Opus on the same queries; together under $90 of the credit.
+    assert [(g.name, g.cost_cap) for g in cfg.compete.spend_groups] == [("anthropic", 89.0)]
+    assert [s.name for s in systems.values() if s.spend_group == "anthropic"] == [
+        "claude-sonnet",
+        "claude-opus",
+    ]
+    assert (systems["claude-opus"].model, systems["claude-opus"].cost_cap) == (
+        "claude-opus-5-5",
+        55.0,
+    )
+    luna = systems["openai-luna"]
+    assert (luna.kind, luna.model, luna.max_searches, luna.cost_cap) == (
+        "openai",
+        "gpt-6-luna",
+        5,
+        4.5,
+    )
+    assert luna.label == (
+        "OpenAI smaller model (gpt-6-luna); flagship not tested for budget reasons"
+    )
+    assert systems["perplexity"].cost_cap == 1.0
+    assert systems["claude-sonnet"].max_searches == 5
 
 
 @pytest.mark.parametrize(
@@ -196,7 +244,13 @@ def test_compete_config_checks_names_and_free_systems(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="free systems have no cost_cap"):
         load([s2_dict(cost_cap=1.0)])
     with pytest.raises(ConfigError, match="the web_search_tool of openrouter systems"):
-        load([openai_dict(web_search_tool="web_search_20260318")])
+        load([openrouter_search_dict(web_search_tool="web_search_20260318")])
+    with pytest.raises(ConfigError, match="the web_search_tool of openai systems is web_search"):
+        load([openai_dict(web_search_tool="web_search_preview")])
+    with pytest.raises(ConfigError, match="only paid systems have a spend_group"):
+        load([s2_dict(spend_group="anthropic")])
+    with pytest.raises(ConfigError, match=r"spend_group\(s\) \['anthropic'\] not declared"):
+        load([claude_dict(spend_group="anthropic")])
 
 
 # --- parsing answers -----------------------------------------------------------------------
@@ -265,6 +319,26 @@ def anthropic_reply(text: str, *, stop: str = "end_turn", searches: int = 2) -> 
     }
 
 
+def responses_reply(text: str, *, searches: int = 3) -> dict[str, Any]:
+    """An OpenAI Responses API reply: web searches (one opens a page), reasoning, a message."""
+    calls = [
+        {"type": "web_search_call", "id": f"ws_{i}", "status": "completed",
+         "action": {"type": "open_page" if i == 1 else "search"}}
+        for i in range(searches)
+    ]
+    return {
+        "status": "completed",
+        "output": [
+            {"type": "reasoning", "id": "rs_0", "summary": []},
+            *calls,
+            {"type": "message", "role": "assistant", "content": [
+                {"type": "output_text", "text": text, "annotations": []},
+            ]},
+        ],
+        "usage": {"input_tokens": 20_000, "output_tokens": 3_000, "total_tokens": 23_000},
+    }
+
+
 def chat_reply(text: str, *, cost: float | None = 0.006, searches: int | None = None) -> dict:
     usage: dict[str, Any] = {"prompt_tokens": 300, "completion_tokens": 700}
     if cost is not None:
@@ -281,9 +355,10 @@ def chat_reply(text: str, *, cost: float | None = 0.006, searches: int | None = 
 class FakeWorld:
     """Every API the competitive evaluation talks to, for httpx.MockTransport.
 
-    Claude lists a real neighbour and the original (by title); OpenAI lists the
-    original's title under the neighbour's DOI; Perplexity lists a paper that doesn't
-    exist (or, for T3's proposal, answers without JSON); Semantic Scholar finds nothing.
+    Claude lists a real neighbour and the original (by title); OpenAI (directly, or
+    through OpenRouter's server tool) lists the original's title under the neighbour's
+    DOI; Perplexity lists a paper that doesn't exist (or, for T3's proposal, answers
+    without JSON); Semantic Scholar finds nothing.
     OpenAlex knows the neighbour's DOI and each original under its Crossref DOI;
     Crossref knows the originals' titles. `fail_with` status codes are returned first,
     one per request.
@@ -323,6 +398,10 @@ class FakeWorld:
         if host == "api.anthropic.com":
             prompt = json.loads(request.content)["messages"][0]["content"]
             return httpx.Response(200, json=anthropic_reply(_papers_text(_target(prompt))))
+        if host == "api.openai.com":
+            target = _target(json.loads(request.content)["input"])
+            paper = {"title": TITLES[target], "doi": NEIGHBOUR["doi"]}  # the wrong DOI
+            return httpx.Response(200, json=responses_reply(json.dumps({"papers": [paper]})))
         if host == "openrouter.ai":
             body = json.loads(request.content)
             target = _target(body["messages"][0]["content"])
@@ -406,12 +485,47 @@ def test_anthropic_request_continuation_usage_and_answer(
     assert answer.money_spent == answer.cost and not answer.cached  # Anthropic reports no cost
 
 
-def test_openrouter_requests_for_openai_and_perplexity(
+def test_openai_responses_request_and_answer(store: tuple[ResponseCache, SpendLedger]) -> None:
+    world = FakeWorld()
+    cache, ledger = store
+    openai = client(openai_dict(), world)
+    answer = ask(openai, GOOD[T1], qid="A1", cache=cache, ledger=ledger)
+    request = world.requests[-1]
+    assert str(request.url) == "https://api.openai.com/v1/responses"
+    assert request.headers["authorization"] == "Bearer openai-key"
+    body = json.loads(request.content)
+    assert body == {
+        "model": "gpt-test",
+        "input": body["input"],
+        "tools": [{"type": "web_search"}],
+        "max_output_tokens": 4096,
+        "max_tool_calls": 5,  # as Claude's max_uses
+    }
+    assert body["input"].startswith("Find the existing papers") and GOOD[T1] in body["input"]
+    reading = answer.reading
+    assert reading.items == [Item(TITLES[T1], None, NEIGHBOUR["doi"], None)]
+    # Every web_search_call counts at the per-search price, the page it opened included.
+    assert (reading.input_tokens, reading.output_tokens, reading.searches) == (20_000, 3000, 3)
+    assert answer.cost == pytest.approx(20_000 * 0.1e-6 + 3000 * 0.5e-6 + 3 * 0.01)
+    assert answer.money_spent == answer.cost  # OpenAI reports no cost
+
+    settings = openai_dict(search_context_size="low", reasoning_effort="low", max_searches=None)
+    body = client(settings, world).request(GOOD[T1])["json"]
+    assert body["tools"] == [{"type": "web_search", "search_context_size": "low"}]
+    assert body["reasoning"] == {"effort": "low"} and "max_tool_calls" not in body
+    no_message = {"output": [{"type": "web_search_call"}], "usage": {"input_tokens": 5}}
+    reading = openai.read([no_message])
+    assert (reading.items, reading.searches) == ([], 1) and reading.parse_error is not None
+    with pytest.raises(CompeteError, match="malformed response"):
+        openai.read([{"error": {"message": "x"}}])
+
+
+def test_openrouter_requests_with_the_server_tool_and_for_perplexity(
     store: tuple[ResponseCache, SpendLedger],
 ) -> None:
     world = FakeWorld()
     cache, ledger = store
-    openai = client(openai_dict(reasoning_effort="low"), world)
+    openai = client(openrouter_search_dict(reasoning_effort="low"), world)
     answer = ask(openai, GOOD[T1], qid="A1", cache=cache, ledger=ledger)
     request = world.requests[-1]
     assert request.headers["authorization"] == "Bearer openrouter-key"
@@ -527,6 +641,32 @@ def test_the_cost_cap_refuses_a_call_that_could_cross_it(
     conn = connect_store(tmp_path / "compete.sqlite")
     with pytest.raises(SystemCapReached):
         SpendLedger(conn).charge("claude", 0.04, 0.07)
+    conn.close()
+
+
+def test_a_spend_group_caps_its_systems_together(tmp_path: Path) -> None:
+    world = FakeWorld()
+    conn = connect_store(tmp_path / "compete.sqlite")
+    cache = ResponseCache(conn)
+    ledger = SpendLedger(conn, groups={"anthropic": (0.10, ("sonnet", "opus"))})
+    sonnet = client(claude_dict(name="sonnet", reserve_per_query=0.05), world)
+    opus = client(claude_dict(name="opus", model="claude-big", reserve_per_query=0.05), world)
+    ask(sonnet, GOOD[T1], qid="A1", cache=cache, ledger=ledger)  # $0.045 each
+    ask(sonnet, GOOD[T2], qid="A2", cache=cache, ledger=ledger)  # 0.045 + 0.05 fits $0.10
+    assert ledger.group_spent("anthropic") == pytest.approx(0.09)
+    # Opus's own cap ($10) has room, but the group's doesn't.
+    with pytest.raises(SystemCapReached, match=r"\$0\.0900 of the anthropic group's \$0\.10"):
+        ask(opus, GOOD[T1], qid="A1", cache=cache, ledger=ledger)
+    assert world.hosts() == {"api.anthropic.com": 2}
+    conn.close()
+
+
+def test_the_committed_spend_group_holds_sonnet_and_opus() -> None:
+    cfg = load_config(Path(__file__).resolve().parents[1] / "configs" / "phase1.yaml")
+    assert cfg.compete is not None
+    conn = connect_store(":memory:")
+    ledger = make_ledger(cfg.compete, conn)
+    assert ledger.groups == {"anthropic": (89.0, ("claude-sonnet", "claude-opus"))}
     conn.close()
 
 
@@ -677,19 +817,30 @@ def live_run(tmp_path: Path) -> tuple[dict[str, Any], Path]:
     return data, done.run_dir
 
 
-def compete_config(
-    data: dict[str, Any], run_dir: Path, tmp_path: Path, systems: list[dict[str, Any]]
-) -> Config:
-    data = {
-        **data,
-        "compete": {
-            "runs": [str(run_dir)],
-            "cache_path": str(tmp_path / "compete.sqlite"),
-            "n_queries": 3,
-            "systems": systems,
-        },
+def compete_dict(
+    run_dir: Path,
+    tmp_path: Path,
+    systems: list[dict[str, Any]],
+    spend_groups: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    return {
+        "runs": [str(run_dir)],
+        "cache_path": str(tmp_path / "compete.sqlite"),
+        "n_queries": 3,
+        "systems": systems,
+        "spend_groups": spend_groups or [],
     }
-    return config_from_dict(data)
+
+
+def compete_config(
+    data: dict[str, Any],
+    run_dir: Path,
+    tmp_path: Path,
+    systems: list[dict[str, Any]],
+    spend_groups: list[dict[str, Any]] | None = None,
+) -> Config:
+    compete = compete_dict(run_dir, tmp_path, systems, spend_groups)
+    return config_from_dict({**data, "compete": compete})
 
 
 def run(
@@ -726,8 +877,9 @@ def test_a_whole_run_scores_every_system(
     live_run: tuple[dict[str, Any], Path], tmp_path: Path
 ) -> None:
     data, live_dir = live_run
-    systems = [claude_dict(), openai_dict(), perplexity_dict(), s2_dict()]
-    cfg = compete_config(data, live_dir, tmp_path, systems)
+    systems = [claude_dict(spend_group="anthropic"), openai_dict(), perplexity_dict(), s2_dict()]
+    groups = [{"name": "anthropic", "cost_cap": 50.0}]
+    cfg = compete_config(data, live_dir, tmp_path, systems, groups)
     world = FakeWorld()
     done = run(cfg, world)
     rows = _results(done.run_dir)
@@ -760,6 +912,14 @@ def test_a_whole_run_scores_every_system(
     assert all("p_holm" in p["mcnemar"] for p in summary["paired"])
     assert summary["spend"]["claude"]["total"] == pytest.approx(3 * 0.045)
     assert summary["spend"]["perplexity"]["total"] == pytest.approx(2 * 0.006 + 0.006)
+    assert summary["spend"]["openai"]["total"] == pytest.approx(3 * (0.002 + 0.0015 + 0.03))
+    group = summary["spend_groups"]["anthropic"]
+    assert (group["total"], group["cap"], group["systems"]) == (
+        pytest.approx(3 * 0.045),
+        50.0,
+        ["claude"],
+    )
+    assert summary["system_labels"]["openai"] == "OpenAI smaller model (test); flagship not tested"
     assert summary["ours_replay"] == {"recorded_l5w": 3, "reproduced": 3, "capped_checks": 0}
     meta = json.loads((done.run_dir / RUN_FILE).read_text(encoding="utf-8"))
     assert meta["kind"] == "compete" and len(meta["sample"]) == 3
@@ -767,6 +927,8 @@ def test_a_whole_run_scores_every_system(
     markdown = (done.run_dir / SUMMARY_MD).read_text(encoding="utf-8")
     assert "## Listed papers that don't resolve (possibly fabricated)" in markdown
     assert "| ours vs claude | 3 |" in markdown
+    assert "- openai: OpenAI smaller model (test); flagship not tested\n" in markdown
+    assert "Spend group anthropic (claude): $0.1350 of its $50.00 combined cap" in markdown
 
     # A second run asks nothing that was asked before: no API calls, nothing spent.
     sent = len(world.requests)
@@ -813,14 +975,11 @@ def test_compete_cli_dry_run_and_run(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     data, live_dir = live_run
-    cfg = compete_config(data, live_dir, tmp_path, [claude_dict(), s2_dict()])
+    systems = [claude_dict(spend_group="anthropic"), s2_dict()]
+    groups = [{"name": "anthropic", "cost_cap": 50.0}]
+    cfg = compete_config(data, live_dir, tmp_path, systems, groups)
     config_path = tmp_path / "config.yaml"
-    raw = {**data, "compete": {
-        "runs": [str(live_dir)],
-        "cache_path": str(tmp_path / "compete.sqlite"),
-        "n_queries": 3,
-        "systems": [claude_dict(), s2_dict()],
-    }}
+    raw = {**data, "compete": compete_dict(live_dir, tmp_path, systems, groups)}
     config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
     world = FakeWorld()
 
@@ -836,12 +995,26 @@ def test_compete_cli_dry_run_and_run(
     monkeypatch.setattr(cli, "Resolver", FakeResolver)
     monkeypatch.setattr(cli, "make_encoder", lambda retrieval_cfg: FakeEncoder())
 
-    assert cli.main(["compete", "--config", str(config_path), "--dry-run"]) == 0
+    sample_csv = tmp_path / "sample.csv"
+    dry = ["compete", "--config", str(config_path), "--dry-run", "--save-sample", str(sample_csv)]
+    assert cli.main(dry) == 0
     out = capsys.readouterr().out
+    assert f"wrote the 3 sampled queries to {sample_csv}" in out
     assert "3 queries from the 3 the runs checked" in out
     assert "claude: 3 of 3 calls not cached, at most $1.50" in out
     assert "s2-search: 3 of 3 calls not cached; free" in out
+    assert "spend group anthropic (claude): spent so far $0.0000 of its $50.00 combined cap" in out
     assert world.requests == []
+    with sample_csv.open(encoding="utf-8", newline="") as fh:
+        saved = list(csv.DictReader(fh))
+    assert list(saved[0]) == list(SAMPLE_COLUMNS)
+    assert [r["order"] for r in saved] == ["1", "2", "3"]
+    assert {r["target_id"] for r in saved} == {T1, T2, T3}
+    assert {r["run"] for r in saved} == {live_dir.as_posix()}
+    plan = make_plan(cfg)
+    assert [r["qid"] for r in saved] == [q.qid for q in plan.sample]  # in the seeded order
+    assert cli.main(dry) == 1  # never overwritten
+    assert "refusing to overwrite" in capsys.readouterr().err
 
     args = ["compete", "--config", str(config_path), "--limit", "2", "--systems", "ours,claude"]
     assert cli.main(args) == 0

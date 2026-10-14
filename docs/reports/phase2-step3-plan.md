@@ -10,7 +10,72 @@ are for your go.
 - **Branch**: `phase2-step3-competitive`, from `main` at eb6dc36. `main` and tonight's
   00:07 UTC test run are untouched.
 - **Command**: `python -m rk compete --config configs/phase1.yaml [--limit N]
-  [--systems ours,claude,...] [--dry-run]` (`src/rk/compete/`).
+  [--systems ours,claude-sonnet,...] [--dry-run] [--save-sample CSV]`
+  (`src/rk/compete/`).
+
+## Update after your answers (2026-10-14)
+
+This section supersedes the Summary and Decisions below where they differ.
+
+**Systems, in run order**:
+
+| System | What it is | Cap |
+|---|---|---|
+| `claude-sonnet` | Sonnet 5.5, all 100 queries first | $40 |
+| `claude-opus` | Opus 5.5, on the same 100 queries | $55 |
+| `openai-luna` | "OpenAI smaller model (gpt-6-luna); flagship not tested for budget reasons". Called directly through the OpenAI Responses API with `{"type": "web_search"}` and `max_tool_calls: 5`, to match Claude's 5 searches. | $4.50 |
+| `perplexity` | Sonar on OpenRouter | $1 |
+| `s2-search`, `s2-snippets` | Semantic Scholar, with the key, at 0.5 requests/s | free |
+
+- **Combined Anthropic cap**: both Claude systems belong to the spend group `anthropic`,
+  capped in code at $89. A call that could take their combined spend past it is refused,
+  so Opus gets at most min($55, $89 − Sonnet's spend). The workspace's $95 spend limit
+  is a second guard.
+
+**Free key checks** (no tokens):
+- **Anthropic**: the workspace-scoped key is accepted (Models API HTTP 200). It reports
+  web search and code execution as supported for `claude-sonnet-5-5` and
+  `claude-opus-5-5`.
+- **OpenAI**: the key is accepted and `gpt-6-luna` is available. OpenAI has no balance
+  endpoint for API keys; the balance is $5.33 as you reported.
+- **OpenRouter**: $6.64 left.
+- **Semantic Scholar**:
+  - The key works (HTTP 200 after a pause). Keyless requests are still refused with 429,
+    and the first keyed request got one too, so the client's backoff on 429 matters.
+  - Snippet search on the A0049 proposal returned 50 passages from 40 distinct, on-topic
+    papers.
+
+**OpenAI web search, direct**
+([guide](https://developers.openai.com/api/docs/guides/tools-web-search),
+[pricing](https://developers.openai.com/api/docs/pricing),
+[gpt-6-luna](https://developers.openai.com/api/docs/models/gpt-6-luna)):
+- **Calling it**: Responses API only for `gpt-6-luna`, which reasons at medium effort by
+  default. `max_tool_calls` caps the built-in tool calls in one response.
+- **Billing**: each `web_search_call` (search, open page or find in page) is a tool
+  call. "Search actions incur a tool call cost": $10 per 1,000 calls plus the search
+  content tokens at model rates ($0.10/$0.50 per million).
+- **Our counting**: the docs don't say whether opening a page is billed like a search, so
+  every `web_search_call` is counted at $0.01.
+
+**Re-estimate**:
+
+| System | Per query: low / central / high | 100 queries, central (range) | Cap | Pilot stop (over 2x central) |
+|---|---|---|---|---|
+| claude-sonnet | $0.11 / $0.22 / $0.35 | $22 ($11–35) | $40 | $0.44 per query |
+| claude-opus | $0.19 / $0.40 / $0.65 | $40 ($19–65) | $55, and the group's $89 | $0.80 per query |
+| openai-luna | $0.022 / $0.035 / $0.059 | $3.50 ($2.20–5.90) | $4.50 | $0.07 per query |
+| perplexity | $0.006 / $0.0065 / $0.008 | $0.65 ($0.60–0.80) | $1 | $0.013 per query |
+
+- **gpt-6-luna**: 2–5 tool calls, 10k–50k input tokens and 2k–8k output tokens per
+  query. Above about $0.044 a query (4 or more calls every time), its cap stops it before
+  100 queries.
+- **The pilot** costs about $2. Sonnet and Opus together are about $62 at the central
+  estimates.
+- **OpenRouter** keeps at least $5.60 for our own agent calls.
+
+**Sample**: `--save-sample docs/evaluation/compete_sample.csv` writes the sample in its
+seeded order. The step-1 dry run will use it once tonight's test run is in
+`compete.runs`.
 
 ## Summary
 

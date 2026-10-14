@@ -249,6 +249,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="show the sample and what the uncached calls could cost; send nothing",
     )
+    compete.add_argument(
+        "--save-sample",
+        type=Path,
+        metavar="CSV",
+        help=(
+            f"also save the sample as a CSV, never overwritten (e.g. {compete_eval.SAMPLE_FILE})"
+        ),
+    )
 
     report_cmd = sub.add_parser("report", help="regenerate a run's summary from the database")
     report_cmd.add_argument("run_dir", type=Path, help="runs/<timestamp> or runs/live-<timestamp>")
@@ -476,12 +484,16 @@ def compete_command(
     limit: int | None,
     systems: list[str] | None,
     dry_run: bool,
+    save_sample: Path | None = None,
     overrides: Sequence[str] = (),
 ) -> int:
     cfg = load_config(config_path, overrides)
     if cfg.compete is None:
         raise ConfigError(f"{config_path} has no compete: section")
     plan = compete_eval.make_plan(cfg, systems=systems, limit=limit)
+    if save_sample is not None:
+        compete_eval.save_sample(plan, save_sample)
+        print(f"rk compete: wrote the {len(plan.sample)} sampled queries to {save_sample}")
     by_name = {s.name: s for s in cfg.compete.systems}
     with ExitStack() as stack:
         conn = stack.enter_context(closing(connect_store(cfg.compete.cache_path)))
@@ -491,7 +503,8 @@ def compete_command(
             if name != compete_eval.OURS
         }
         if dry_run:
-            print(compete_eval.describe_plan(plan, clients, conn))
+            ledger = compete_eval.make_ledger(cfg.compete, conn)
+            print(compete_eval.describe_plan(plan, clients, conn, ledger))
             return 0
         resolver = stack.enter_context(closing(Resolver.from_config(cfg, conn)))
         ours = compete_eval.OURS in plan.systems
@@ -569,7 +582,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             return live_misses_command(args.run_dir, args.n, args.out)
         if args.command == "compete":
             return compete_command(
-                args.config, args.limit, args.systems, args.dry_run, args.overrides
+                args.config,
+                args.limit,
+                args.systems,
+                args.dry_run,
+                args.save_sample,
+                args.overrides,
             )
         return report_command(args.run_dir)
     except (

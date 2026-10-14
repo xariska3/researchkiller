@@ -234,10 +234,11 @@ class LiveConfig:
         _require(self.openalex_timeout_s > 0, "openalex_timeout_s must be > 0")
 
 
-COMPETE_KINDS = ("anthropic", "openrouter", "s2-search", "s2-snippets")
-PAID_COMPETE_KINDS = ("anthropic", "openrouter")
+COMPETE_KINDS = ("anthropic", "openai", "openrouter", "s2-search", "s2-snippets")
+PAID_COMPETE_KINDS = ("anthropic", "openai", "openrouter")
 SEARCH_CONTEXT_SIZES = ("low", "medium", "high")
 OPENROUTER_WEB_SEARCH = "openrouter:web_search"  # OpenRouter's server tool
+OPENAI_WEB_SEARCH = "web_search"  # the Responses API's built-in tool
 
 
 @dataclass(frozen=True)
@@ -245,23 +246,25 @@ class CompeteSystemConfig:
     """One system in the competitive evaluation (rk.compete).
 
     `kind` picks the client: "anthropic" (Messages API with Anthropic's web search
-    tool), "openrouter" (chat completions; with web_search_tool the OpenRouter
-    server tool runs the model's own search, otherwise Perplexity-style models
-    search by themselves), "s2-search" and "s2-snippets" (Semantic Scholar's paper
-    and snippet search, free).
+    tool), "openai" (Responses API with OpenAI's web search tool), "openrouter"
+    (chat completions; with web_search_tool the OpenRouter server tool runs the
+    model's own search, otherwise Perplexity-style models search by themselves),
+    "s2-search" and "s2-snippets" (Semantic Scholar's paper and snippet search, free).
     """
 
-    name: str  # label in reports and for --systems
+    name: str  # in tables and for --systems
     kind: str
     base_url: str
+    label: str | None = None  # how reports describe the system; None: from its settings
     model: str | None = None
     api_key_env: str | None = None  # required for paid kinds; optional for Semantic Scholar
-    provider: str | None = None  # OpenRouter endpoint to pin (fallbacks off)
-    web_search_tool: str | None = None  # anthropic: the tool type; openrouter: the server tool
-    max_searches: int | None = None  # the search tool's max_uses
+    # anthropic: the tool type; openai: web_search; openrouter: the server tool
+    web_search_tool: str | None = None
+    max_searches: int | None = None  # anthropic and openrouter max_uses; openai max_tool_calls
+    spend_group: str | None = None  # a CompeteConfig.spend_groups entry whose cap it shares
     search_context_size: str | None = None  # low / medium / high
-    reasoning_effort: str | None = None  # OpenRouter `reasoning.effort`; None: model default
-    max_tokens: int = 4096
+    reasoning_effort: str | None = None  # openai/openrouter `reasoning.effort`; None: default
+    max_tokens: int = 4096  # output tokens (openai: max_output_tokens, reasoning included)
     price_in_per_m: float = 0.0  # USD per million input tokens (search results included)
     price_out_per_m: float = 0.0  # USD per million output tokens (reasoning included)
     price_per_search: float = 0.0  # USD per web search the model runs
@@ -291,6 +294,11 @@ class CompeteSystemConfig:
                 (self.web_search_tool or "").startswith("web_search_"),
                 "anthropic systems need web_search_tool, e.g. web_search_20260318",
             )
+        elif self.kind == "openai":
+            _require(
+                self.web_search_tool == OPENAI_WEB_SEARCH,
+                f"the web_search_tool of openai systems is {OPENAI_WEB_SEARCH}",
+            )
         elif self.kind == "openrouter":
             _require(
                 self.web_search_tool in (None, OPENROUTER_WEB_SEARCH),
@@ -309,6 +317,22 @@ class CompeteSystemConfig:
         _require(self.reserve_per_query >= 0 and self.cost_cap >= 0, "costs must be >= 0")
         _require(self.requests_per_second > 0, "requests_per_second must be > 0")
         _require(self.timeout_s > 0, "timeout_s must be > 0")
+        _require(
+            self.spend_group is None or self.kind in PAID_COMPETE_KINDS,
+            "only paid systems have a spend_group",
+        )
+
+
+@dataclass(frozen=True)
+class SpendGroupConfig:
+    """A cap on the combined spend of the systems that name it (e.g. one API account)."""
+
+    name: str
+    cost_cap: float  # USD, cumulative over every compete run of its systems
+
+    def __post_init__(self) -> None:
+        _require(bool(self.name.strip()), "name must not be empty")
+        _require(self.cost_cap > 0, "cost_cap must be > 0")
 
 
 @dataclass(frozen=True)
@@ -321,6 +345,7 @@ class CompeteConfig:
     systems: tuple[CompeteSystemConfig, ...]
     n_queries: int = 100
     crossref_mailto_env: str | None = None  # an email for Crossref's polite pool (optional)
+    spend_groups: tuple[SpendGroupConfig, ...] = ()
 
     def __post_init__(self) -> None:
         _require(len(self.runs) > 0, "runs must list at least one live-eval run directory")
@@ -328,6 +353,10 @@ class CompeteConfig:
         names = [s.name for s in self.systems]
         _require(len(set(names)) == len(names), f"system names must be unique: {names}")
         _require("ours" not in names, "'ours' is the live tool's name; pick another")
+        groups = [g.name for g in self.spend_groups]
+        _require(len(set(groups)) == len(groups), f"spend group names must be unique: {groups}")
+        unknown = sorted({s.spend_group for s in self.systems if s.spend_group} - set(groups))
+        _require(not unknown, f"spend_group(s) {unknown} not declared in spend_groups")
 
 
 @dataclass(frozen=True)

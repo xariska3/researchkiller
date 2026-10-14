@@ -7,7 +7,9 @@ the compete cache (SQLite, compete.cache_path) under the sha256 of the request, 
 the latency of the call that fetched it, so a repeated run replays it for free.
 Before a real call, the system's reserve_per_query is charged to its spend in the
 same file, and the call is refused (SystemCapReached) if that could take the system's
-total over its cost_cap; afterwards the call's cost replaces the reservation. As in
+total, or the combined total of its spend group (compete.spend_groups, e.g. every
+system on one API account), over its cap; afterwards the call's cost replaces the
+reservation. As in
 rk.llm.Ledger, a call that fails after a request went out without a 4xx coming back
 is booked at its reservation, since it may have been billed.
 
@@ -25,6 +27,16 @@ API facts, checked on 2026-10-14 against the docs:
   turn can stop with stop_reason "pause_turn"; sending the assistant content back
   continues it. Per million input/output tokens: Opus 5.5 $4/$20, Sonnet 5.5 $2/$10,
   Haiku 5.5 $0.10/$0.50.
+- OpenAI web search (https://developers.openai.com/api/docs/guides/tools-web-search,
+  .../docs/pricing, .../docs/models/gpt-6-luna): the Responses API's built-in tool
+  {"type": "web_search"}, with search_context_size low, medium (the default) or high;
+  `max_tool_calls` caps the built-in tool calls in one response. Each search action
+  is a `web_search_call` output item (action search, open_page or find_in_page), and
+  "search actions incur a tool call cost": $10 per 1,000 calls plus the search content
+  tokens at model rates. The docs don't say whether opening a page is billed like a
+  search, so every web_search_call is counted at the per-search price. gpt-6-luna:
+  $0.10/$0.50 per million tokens, web search through the Responses API only,
+  reasoning effort medium by default.
 - OpenRouter (https://openrouter.ai/docs/guides/features/server-tools/web-search.md,
   .../guides/usage-accounting): the `openrouter:web_search` server tool (the `web`
   plugin and `:online` are deprecated) with engine "native" runs the provider's own
@@ -283,11 +295,19 @@ class SpendLedger:
 
     A row's spend is its billed_cost when the API reported one, else its cost. The
     totals are read from the table on every check, so they add up across runs.
+    `groups` maps a spend group's name to its cap and its member systems; a call is
+    also refused if it could take its group's combined spend over the group's cap.
     """
 
-    def __init__(self, conn: sqlite3.Connection) -> None:
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        groups: Mapping[str, tuple[float, Sequence[str]]] | None = None,
+    ) -> None:
         self._conn = conn
         self._reserved: dict[str, float] = {}
+        self.groups = dict(groups or {})
         conn.execute(_SPEND_SCHEMA)
         conn.commit()
 
@@ -303,6 +323,11 @@ class SpendLedger:
         """Recorded spend plus reservations for calls in flight."""
         return self.recorded(system) + self._reserved.get(system, 0.0)
 
+    def group_spent(self, group: str) -> float:
+        """A spend group's combined spend, reservations included."""
+        _, members = self.groups[group]
+        return sum(self.spent(m) for m in members)
+
     def charge(self, system: str, amount: float, cap: float) -> None:
         """Reserve `amount` for a real call, or raise SystemCapReached if it might not fit."""
         spent = self.spent(system)
@@ -311,6 +336,15 @@ class SpendLedger:
                 f"{system}: a call could cost up to ${amount:.4f}, but ${spent:.4f} of its "
                 f"${cap:.2f} cost cap is spent"
             )
+        for group, (group_cap, members) in self.groups.items():
+            if system not in members:
+                continue
+            total = self.group_spent(group)
+            if total + amount > group_cap:
+                raise SystemCapReached(
+                    f"{system}: a call could cost up to ${amount:.4f}, but ${total:.4f} of the "
+                    f"{group} group's ${group_cap:.2f} cost cap is spent"
+                )
         self._reserved[system] = self._reserved.get(system, 0.0) + amount
 
     def record(
@@ -569,6 +603,69 @@ class AnthropicWebSearch(_Client):
         return Reading(items, text, error, input_tokens, output_tokens, searches)
 
 
+class OpenAIWebSearch(_Client):
+    """An OpenAI model with OpenAI's web search tool (Responses API)."""
+
+    def request(self, proposal: str) -> dict[str, Any]:
+        cfg = self.config
+        tool: dict[str, Any] = {"type": cfg.web_search_tool}
+        if cfg.search_context_size is not None:
+            tool["search_context_size"] = cfg.search_context_size
+        body: dict[str, Any] = {
+            "model": cfg.model,
+            "input": render_prompt(proposal),
+            "tools": [tool],
+            "max_output_tokens": cfg.max_tokens,
+        }
+        if cfg.max_searches is not None:
+            body["max_tool_calls"] = cfg.max_searches
+        if cfg.reasoning_effort is not None:
+            body["reasoning"] = {"effort": cfg.reasoning_effort}
+        return {"method": "POST", "url": f"{self.url}/responses", "json": body}
+
+    def send(
+        self, request: Mapping[str, Any], billing: Billing
+    ) -> tuple[list[dict[str, Any]], float]:
+        api_key = self.api_key()
+        if api_key is None:
+            raise CompeteError(f"environment variable {self.config.api_key_env} is not set")
+        data, seconds = self.http.call(
+            "POST",
+            request["url"],
+            headers={"Authorization": f"Bearer {api_key}"},
+            json_body=request["json"],
+            billing=billing,
+        )
+        if not isinstance(data, dict):
+            raise CompeteError(f"{self.config.name}: unexpected response {str(data)[:300]}")
+        return [data], seconds
+
+    def read(self, responses: Sequence[Mapping[str, Any]]) -> Reading:
+        """The answer is the last message's output text; every web_search_call counts."""
+        (data,) = responses
+        output, usage = data.get("output"), data.get("usage")
+        if not isinstance(output, list) or not isinstance(usage, dict):
+            raise CompeteError(f"{self.config.name}: malformed response: {str(data)[:300]}")
+        parts = [i for i in output if isinstance(i, dict)]
+        messages = [i for i in parts if i.get("type") == "message"]
+        content = (messages[-1].get("content") or []) if messages else []
+        text = "".join(
+            c.get("text") or ""
+            for c in content
+            if isinstance(c, dict) and c.get("type") == "output_text"
+        )
+        searches = sum(i.get("type") == "web_search_call" for i in parts)
+        items, error = parse_items(text)
+        return Reading(
+            items,
+            text,
+            error,
+            _count(usage.get("input_tokens")),
+            _count(usage.get("output_tokens")),
+            searches,
+        )
+
+
 class OpenRouterChat(_Client):
     """A model behind OpenRouter's chat completions, with the web search server tool or not."""
 
@@ -699,6 +796,7 @@ class SemanticScholarSnippets(_SemanticScholar):
 
 CLIENTS: dict[str, type[_Client]] = {
     "anthropic": AnthropicWebSearch,
+    "openai": OpenAIWebSearch,
     "openrouter": OpenRouterChat,
     "s2-search": SemanticScholarSearch,
     "s2-snippets": SemanticScholarSnippets,

@@ -75,14 +75,21 @@ live:
 # checked 2026-10-14, docs/reports/phase2-step3-plan.md). A system's cost_cap is its
 # cumulative spend over every compete run (table compete_spend in cache_path), and
 # reserve_per_query is held back before each real call, so a call that could cross the
-# cap is refused. Prices are USD per million tokens, per search and per request.
+# cap is refused; so is a call that could take its spend group's combined spend over
+# the group's cap. Systems run in this order. Prices are USD per million tokens, per
+# search and per request.
 compete:
   runs: [runs/live-20261014-122144]   # the dev set; the test run is added when it finishes
   cache_path: data/cache/compete.sqlite
   n_queries: 100
   crossref_mailto_env: CROSSREF_MAILTO
+  # The $100 Anthropic promotional credit (expires 2026-10-18 UTC; workspace spend limit
+  # $95): Sonnet and Opus together stay under $90.
+  spend_groups:
+    - name: anthropic
+      cost_cap: 89.0
   systems:
-    - name: claude
+    - name: claude-sonnet
       kind: anthropic
       model: claude-sonnet-5-5
       base_url: https://api.anthropic.com/v1
@@ -94,22 +101,40 @@ compete:
       price_out_per_m: 10.0
       price_per_search: 0.01
       reserve_per_query: 1.0
-      cost_cap: 40.0                # of the $100 promotional credit (expires 2026-10-18)
+      cost_cap: 40.0
+      spend_group: anthropic
       requests_per_second: 0.5
       timeout_s: 600
-    - name: openai
-      kind: openrouter
-      model: openai/gpt-6.1-sol
-      base_url: https://openrouter.ai/api/v1
-      api_key_env: OPENROUTER_API_KEY
-      web_search_tool: "openrouter:web_search"   # engine native: OpenAI's own search
+    - name: claude-opus                      # on the same queries, after Sonnet
+      kind: anthropic
+      model: claude-opus-5-5
+      base_url: https://api.anthropic.com/v1
+      api_key_env: ANTHROPIC_API_KEY
+      web_search_tool: web_search_20260318
       max_searches: 5
-      max_tokens: 16384             # reasoning tokens count here too
-      price_in_per_m: 2.0
-      price_out_per_m: 10.0
+      max_tokens: 8192
+      price_in_per_m: 4.0
+      price_out_per_m: 20.0
       price_per_search: 0.01
-      reserve_per_query: 0.5
-      cost_cap: 4.5                 # OpenRouter balance $6.69 on 2026-10-14, shared
+      reserve_per_query: 1.5
+      cost_cap: 55.0
+      spend_group: anthropic
+      requests_per_second: 0.5
+      timeout_s: 600
+    - name: openai-luna
+      kind: openai
+      label: "OpenAI smaller model (gpt-6-luna); flagship not tested for budget reasons"
+      model: gpt-6-luna
+      base_url: https://api.openai.com/v1
+      api_key_env: OPENAI_API_KEY
+      web_search_tool: web_search            # search context medium, the default
+      max_searches: 5                        # max_tool_calls, to match Claude's max_uses
+      max_tokens: 16384                      # max_output_tokens, reasoning included
+      price_in_per_m: 0.10
+      price_out_per_m: 0.50
+      price_per_search: 0.01
+      reserve_per_query: 0.08
+      cost_cap: 4.5                          # OpenAI balance $5.33 on 2026-10-14
       requests_per_second: 0.5
       timeout_s: 600
     - name: perplexity
@@ -117,26 +142,26 @@ compete:
       model: perplexity/sonar
       base_url: https://openrouter.ai/api/v1
       api_key_env: OPENROUTER_API_KEY
-      search_context_size: low      # Perplexity's default
+      search_context_size: low               # Perplexity's default
       max_tokens: 4096
       price_in_per_m: 1.0
       price_out_per_m: 1.0
       price_per_request: 0.005
       reserve_per_query: 0.03
-      cost_cap: 1.0
+      cost_cap: 1.0                          # the rest of the OpenRouter balance is ours
       requests_per_second: 0.5
       timeout_s: 300
     - name: s2-search
       kind: s2-search
       base_url: https://api.semanticscholar.org/graph/v1
-      api_key_env: SEMANTIC_SCHOLAR_API_KEY   # optional
-      requests_per_second: 1.0
+      api_key_env: SEMANTIC_SCHOLAR_API_KEY   # a key gives 1 request/s
+      requests_per_second: 0.5
       timeout_s: 60
     - name: s2-snippets
       kind: s2-snippets
       base_url: https://api.semanticscholar.org/graph/v1
-      api_key_env: SEMANTIC_SCHOLAR_API_KEY   # optional
-      requests_per_second: 1.0
+      api_key_env: SEMANTIC_SCHOLAR_API_KEY
+      requests_per_second: 0.5
       timeout_s: 60
 
 run:

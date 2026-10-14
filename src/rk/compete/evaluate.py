@@ -41,6 +41,7 @@ already asked.
 
 from __future__ import annotations
 
+import csv
 import dataclasses
 import json
 import random
@@ -66,7 +67,7 @@ from rk.compete.systems import (
     ask,
     request_key,
 )
-from rk.config import Config
+from rk.config import CompeteConfig, Config
 from rk.corpus import CORPUS_FILE, load_frozen_corpus
 from rk.evaluate import (
     BUCKETS,
@@ -96,6 +97,8 @@ KIND = "compete"
 RUN_PREFIX = "compete-"
 OURS = "ours"
 RESULTS_FILE = "results.jsonl"
+SAMPLE_FILE = Path("docs/evaluation/compete_sample.csv")
+SAMPLE_COLUMNS = ("order", "qid", "target_id", "bucket", "run")
 EFFORT = ("cost", "latency_s", "searches")
 
 
@@ -461,7 +464,9 @@ def run_compete(
     progress: Callable[[str], None] = lambda line: None,
 ) -> CompeteRun:
     """Ask every selected system about every sampled query and write the run directory."""
-    cache, ledger = ResponseCache(conn), SpendLedger(conn)
+    if cfg.compete is None:
+        raise EvalError("the config has no compete: section")
+    cache, ledger = ResponseCache(conn), make_ledger(cfg.compete, conn)
     missing = missing_keys(plan, clients, cache)
     if missing:
         needs = "; ".join(f"{s} needs {env}" for s, env in missing.items())
@@ -507,7 +512,13 @@ def run_compete(
             for name in plan.systems
             if name != OURS
         }
-        summary = summarize(rows, meta=meta, systems=plan.systems, seed=cfg.run.seed, spend=spend)
+        groups = {
+            group: {"total": ledger.group_spent(group), "cap": cap, "systems": list(members)}
+            for group, (cap, members) in ledger.groups.items()
+        }
+        summary = summarize(
+            rows, meta=meta, systems=plan.systems, seed=cfg.run.seed, spend=spend, groups=groups
+        )
         (run_dir / SUMMARY_JSON).write_text(
             json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
         )
@@ -536,6 +547,7 @@ def summarize(
     systems: Sequence[str],
     seed: int,
     spend: Mapping[str, Mapping[str, float]],
+    groups: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     by_system = {s: [r for r in rows if r["system"] == s] for s in systems}
     ok = {s: {r["qid"]: r for r in by_system[s] if r["status"] == "ok"} for s in systems}
@@ -601,6 +613,7 @@ def summarize(
         "quality": {s: quality(s) for s in systems},
         "effort": {s: effort(s) for s in systems},
         "spend": dict(spend),
+        "spend_groups": dict(groups or {}),
         "difficulty": difficulty,
         "paired": paired,
         "ours_replay": {
@@ -618,9 +631,13 @@ def summarize(
 def _label(name: str, system: Any) -> str:
     if name == OURS:
         return "the live tool (L5w), replayed from the live-eval caches"
+    if system.get("label"):
+        return str(system["label"])
     kind, model = system["kind"], system.get("model")
     if kind == "anthropic":
         return f"{model} with {system['web_search_tool']} (max {system['max_searches']} searches)"
+    if kind == "openai":
+        return f"{model}, Responses API web search (max {system['max_searches']} tool calls)"
     if kind == "openrouter" and system.get("web_search_tool"):
         return f"{model} on OpenRouter, native web search (max {system['max_searches']} searches)"
     if kind == "openrouter":
@@ -714,6 +731,14 @@ def render_markdown(summary: Mapping[str, Any]) -> str:
         cells.append(_f(q[s]["money_spent"], 4))
         cells.append(f"{spend['total']:.4f} of {spend['cap']:.2f}" if spend else "–")
         lines.append(f"| {s} | " + " | ".join(cells) + " |")
+    groups = summary.get("spend_groups") or {}
+    if groups:
+        lines.append("")
+    for group, g in groups.items():
+        lines.append(
+            f"Spend group {group} ({', '.join(g['systems'])}): ${g['total']:.4f} of its "
+            f"${g['cap']:.2f} combined cap spent in total."
+        )
     lines += [
         "",
         "## Hit@5 by difficulty (the target's rank in Phase 1's B1)",
@@ -769,9 +794,32 @@ def _ci(ci: Sequence[float] | None) -> str:
 # --- the plan, before anything is sent ---------------------------------------------------
 
 
-def describe_plan(plan: Plan, clients: Mapping[str, System], conn: sqlite3.Connection) -> str:
+def make_ledger(compete: CompeteConfig, conn: sqlite3.Connection) -> SpendLedger:
+    """The spend ledger, with each spend group's cap and member systems."""
+    groups = {
+        g.name: (g.cost_cap, tuple(s.name for s in compete.systems if s.spend_group == g.name))
+        for g in compete.spend_groups
+    }
+    return SpendLedger(conn, groups=groups)
+
+
+def save_sample(plan: Plan, path: Path) -> None:
+    """Write the sample, in its seeded order, to a CSV; an existing file is never overwritten."""
+    if path.exists():
+        raise EvalError(f"refusing to overwrite {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(SAMPLE_COLUMNS)
+        for order, q in enumerate(plan.sample, start=1):
+            writer.writerow([order, q.qid, q.target_id, q.bucket, q.run_dir.as_posix()])
+
+
+def describe_plan(
+    plan: Plan, clients: Mapping[str, System], conn: sqlite3.Connection, ledger: SpendLedger
+) -> str:
     """The sample and, per system, what its uncached calls could cost at most (no calls)."""
-    cache, ledger = ResponseCache(conn), SpendLedger(conn)
+    cache = ResponseCache(conn)
     sizes = {b: sum(q.bucket == b for q in plan.frame) for b in BUCKETS}
     drawn = {b: sum(q.bucket == b for q in plan.sample) for b in BUCKETS}
     lines = [
@@ -795,5 +843,10 @@ def describe_plan(plan: Plan, clients: Mapping[str, System], conn: sqlite3.Conne
             f"  {name}: {uncached} of {len(plan.sample)} calls not cached, at most "
             f"${uncached * cfg.reserve_per_query:.2f} (${cfg.reserve_per_query:.2f} reserved per "
             f"call); spent so far ${spent:.4f} of its ${cfg.cost_cap:.2f} cap"
+        )
+    for group, (cap, members) in ledger.groups.items():
+        lines.append(
+            f"  spend group {group} ({', '.join(members)}): spent so far "
+            f"${ledger.group_spent(group):.4f} of its ${cap:.2f} combined cap"
         )
     return "\n".join(lines)
