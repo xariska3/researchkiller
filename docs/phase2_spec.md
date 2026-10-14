@@ -112,6 +112,24 @@ design live, and keeps the Phase 1 benchmark as a regression test.
   *Step 1 decision (matching the original):* a result is the original paper if
   any of its merged versions has the original's OpenAlex id or one of its
   aliases, its DOI, or its exact normalised title (`rk.live.pool.match_original`).
+  *Step 2 decisions, pre-declared on 2026-10-14 before the full run:*
+  - **Configs**: L0 is OpenAlex semantic search on the proposal alone, in
+    OpenAlex's own order (1 call, no LLM). L1 is the same results reranked
+    locally (hybrid BM25 + dense, RRF). L5 is the full live pipeline (steps
+    2–4). Ranks count within the top `live.top_k` (20), so MRR is MRR@20.
+  - **Primary comparison**: L5 vs L1. Hit@5 with the exact McNemar test
+    decides; MRR supports (paired bootstrap 95% CIs, as in Phase 1).
+  - **Secondary comparisons (exploratory)**: L1 vs L0, L5 vs L0, and L5 vs
+    Phase 1's B5 on the frozen corpus, on the same queries (`live.phase1_run`).
+  - **Queries**: the full run uses the first N queries in seeded order from
+    A0045 onward, which leaves out Phase 1's pilot and tuning targets. N is what
+    fits in the day's OpenAlex budget (about $0.0061 per query, keeping a
+    $0.05 margin), up to 200. A resume with `--run-dir` continues toward 200
+    when the budget is topped up or resets.
+  - **Pilot**: the 30-query pilot (A0000–A0038, all Phase 1 tuning targets) is
+    reported separately from the full run.
+  - **Cost cap**: a check over its cost cap counts as a miss for live recall,
+    and the number of such checks is reported separately.
 - Explainer check: run 10 full checks, export a CSV for hand review (results
   useful? explanations correct?), and report the quote-verification rate.
 - The Phase 1 frozen benchmark stays runnable as a regression test.
@@ -158,7 +176,9 @@ no fabricated citations.
 ## Steps (one Claude Code session each, each on its own branch + PR)
 1. Live retrieval: OpenAlex search client (checked against current docs),
    candidate pool, local rerank, B5 loop on the live pool. Mocked tests.
-2. Live eval: pilot on 30 queries, then all 500. Report.
+2. Live eval: pilot on 30 queries, then all 500. Report. *(Decided in Step 2:
+   after the pilot, up to 200 queries from A0045 onward, as the OpenAlex
+   budget allows; see Evaluation.)*
 3. Competitive evaluation: landscape doc, automated head-to-head on 100
    queries, manual comparison sheet for the author.
 4. Overlap explainer + quote verification + vocabulary map + report schema.
@@ -166,6 +186,12 @@ no fabricated citations.
 5. FastAPI + SQLite + background worker + web page. Tests with TestClient.
 6. User README ("how to run, what it does, what it doesn't"), screenshots,
    demo. Optional: Dockerfile built and tested in GitHub Actions.
+
+## Product ideas (not built yet)
+- **Quick check vs thorough check** (from the Step 2 pilot): a "quick check"
+  mode is L1: one OpenAlex semantic call and the local rerank, with no LLM, in
+  about 1–2 s. It would sit next to the "thorough check", L5, the full
+  pipeline. In the pilot, L1 had Hit@5 0.700 against L5's 0.833.
 
 ## Out of scope for Phase 2
 Docker as a requirement, user accounts, scoop alerts, `.bib` missing-citation check, the MCP server,
