@@ -8,11 +8,29 @@ rewrites recent target papers as terminology-shifted research proposals, and
 compares BM25, dense, hybrid, one-shot LLM query rewriting and an agent loop at
 the same query budget. The design is in [docs/phase1_spec.md](docs/phase1_spec.md).
 
-## Status and setup
+## Status
 
-The pipeline (corpus, benchmark, indexes, evaluation) is implemented and tested
-on fixtures; there are no results yet (pilot in Step 6, full run and write-up
-in Step 7). To set up, create a Python 3.10+ virtualenv, run
+Phase 1 is complete. Results on the 500-query benchmark (latency and cost are
+per-query means; cost is at the models' listed prices):
+
+| Config | Method | Hit@5 | Hit@10 | Latency (s) | Cost ($) |
+|---|---|---|---|---|---|
+| B1 | BM25 | 0.562 | 0.620 | 0.007 | 0.00000 |
+| B2 | dense | 0.782 | 0.842 | 0.087 | 0.00000 |
+| B4 | one-shot LLM query rewriting | 0.832 | 0.894 | 2.935 | 0.00007 |
+| B5 | agent loop | 0.858 | 0.902 | 8.593 | 0.00048 |
+| B5-U | agent loop, larger budget | 0.850 | 0.890 | 16.150 | 0.00151 |
+
+B4, B5 and B5-U each beat B2 on Hit@5 (significant). The differences between B5
+and B4 and between B5-U and B5 are not significant. The full analysis is in
+[docs/reports/full-run.md](docs/reports/full-run.md), and the benchmark is
+described in [docs/reports/full-bench.md](docs/reports/full-bench.md).
+
+Phase 2 turns the best configuration into a live tool for researchers.
+
+## Setup
+
+To set up, create a Python 3.10+ virtualenv, run
 `pip install -e ".[dev,dense]"`, then `ruff check .` and `pytest`. For GPU
 encoding on Windows, first install a CUDA build of torch
 (`pip install torch --index-url https://download.pytorch.org/whl/cu128`), since
