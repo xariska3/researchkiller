@@ -53,3 +53,22 @@ python -m mlflow ui --backend-store-uri sqlite:///mlflow.db
 ```
 
 and browse to http://127.0.0.1:5000.
+
+## Limitations
+
+- **Exhaustion lean (not significant).** Targets whose four paraphrase attempts
+  were all rejected (86 of 586) are not in the bench. In the pre-registered
+  exhaustion check ([docs/analysis_plan.md](docs/analysis_plan.md)), their
+  abstracts have a slightly higher share of sentences with a number than the
+  accepted targets' abstracts: +0.034 [−0.007, +0.074], p = 0.095. The
+  difference is **not significant**: the 95% CI includes zero, so the plan's
+  bias condition isn't met. Its direction is the one a judge that rejects
+  proposals for stating aims rather than findings would produce, so the bench
+  may slightly under-represent papers with number-heavy abstracts. Two things
+  weigh against that:
+  - the share of sentences with a results cue doesn't differ (+0.009 [−0.024,
+    +0.043]);
+  - the leak filter, not the judge, rejected most of the exhausted targets'
+    attempts (275 of 344).
+
+  Details are in [docs/reports/full-run.md](docs/reports/full-run.md).
