@@ -193,6 +193,7 @@ class LiveConfig:
         "review",
         "book",
         "report",
+        "software-paper",
     )
     # The live tool refetches cached responses older than this; evaluation runs read
     # the first response ever cached, so they never expire. None: never refetch.

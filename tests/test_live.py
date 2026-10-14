@@ -85,7 +85,10 @@ def _search(query: str) -> str:
 
 
 STOP = json.dumps({"action": "stop", "reason": "covered"})
-TYPES = "type:article|preprint|conference-paper|book-chapter|dissertation|review|book|report"
+TYPES = (
+    "type:article|preprint|conference-paper|book-chapter|dissertation|review|book|report"
+    "|software-paper"
+)
 
 
 # --- config ------------------------------------------------------------------
@@ -105,6 +108,7 @@ def test_the_project_config_has_a_live_section() -> None:
         "review",
         "book",
         "report",
+        "software-paper",
     )
     assert live.work_types == LiveConfig(cache_path=Path("x")).work_types  # the default
     assert live.cache_ttl_days == 7
@@ -335,8 +339,8 @@ def test_only_papers_are_searched_and_kept(cfg: Config) -> None:
     for work in (A0004_PAPER, BB25_PAPER, BB25_THESIS):
         record = live_record(work, types)
         assert record is not None and record["type"] == work["type"]
-    # Literature reviews, books and reports are prior art too.
-    for kept in ("review", "book", "report"):
+    # Literature reviews, books, reports and software papers are prior art too.
+    for kept in ("review", "book", "report", "software-paper"):
         record = live_record({**A0004_PAPER, "type": kept}, types)
         assert record is not None and record["type"] == kept
     for dropped in ("erratum", "peer-review", "paratext", "letter", "editorial", "other"):
