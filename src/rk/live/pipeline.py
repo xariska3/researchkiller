@@ -137,6 +137,7 @@ class Candidate:
     rank: int  # from 1, in the final reranked list
     record: Record
     hits: list[Hit]  # where the live searches found it
+    versions: list[Record]  # the search results merged into it, one per OpenAlex id
 
 
 @dataclass(frozen=True)
@@ -172,6 +173,7 @@ class LiveSearchResult:
                     "n_usable": len(s.records),
                     "cost_usd": s.cost_usd,
                     "cached": s.cached,
+                    "fetched_at": s.fetched_at.isoformat(),
                 }
                 for s in self.searches
             ],
@@ -236,7 +238,10 @@ def live_search(
     trace = b5.retrieve(text).trace
     by_id = {r["id"]: r for r in pool.records}
     top = pool.fused(trace.queries)[: live.top_k]
-    candidates = [Candidate(n, by_id[d], pool.hits(by_id[d])) for n, d in enumerate(top, start=1)]
+    candidates = [
+        Candidate(n, by_id[d], pool.hits(by_id[d]), pool.versions(by_id[d]))
+        for n, d in enumerate(top, start=1)
+    ]
     return LiveSearchResult(
         text=text,
         before=before,

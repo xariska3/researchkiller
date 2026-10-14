@@ -18,15 +18,17 @@ import numpy as np
 import pytest
 from bench_data import ABSTRACTS, GOOD, T1, T2, T3, TITLES, corpus_records, target_rows
 from conftest import FakeEncoder, FakeLLM, corpus_config_dict
+from live_fakes import WORKS, FakeLiveOpenAlex, oa_work
 
 from rk.cli import load_env_file
 from rk.config import Config, ConfigError, LiveConfig, config_from_dict, load_config
-from rk.corpus import freeze
+from rk.corpus import OpenAlexBudgetExhausted, freeze
 from rk.live.openalex_search import (
     KEYWORD,
     SELECT,
     SEMANTIC,
     SEMANTIC_MAX_CHARS,
+    Budget,
     LiveSearchClient,
     OpenAlexCache,
     live_record,
@@ -41,7 +43,6 @@ from rk.retrieval import (
     fuse_runs,
     load_index,
 )
-from rk.text import content_stems, reconstruct_abstract
 
 LIVE = {
     "cache_path": "openalex.sqlite",
@@ -55,116 +56,6 @@ LIVE = {
     "cost_cap_per_check": 0.10,
     "openalex_timeout_s": 30,
 }
-
-
-def oa_work(record: dict[str, Any], published: str = "2025-03-01", **extra: Any) -> dict[str, Any]:
-    """A bench_data corpus record as OpenAlex returns it (abstract as an inverted index)."""
-    inverted: dict[str, list[int]] = {}
-    for position, word in enumerate(record["abstract"].split()):
-        inverted.setdefault(word, []).append(position)
-    return {
-        "id": f"https://openalex.org/{record['id']}",
-        "doi": None,
-        "title": record["title"],
-        "publication_date": published,
-        "abstract_inverted_index": inverted,
-        "relevance_score": 1.0,
-        "language": "en",
-        "type": "article",
-        "authorships": [],
-        **extra,
-    }
-
-
-WORKS = [oa_work(r) for r in corpus_records()]
-
-
-class FakeLiveOpenAlex:
-    """In-memory /works search for httpx.MockTransport.
-
-    Keyword search matches works whose title and abstract contain every content
-    stem of the query (OpenAlex ANDs the words), most stem occurrences first.
-    Semantic search ranks works by FakeEncoder cosine. Both apply has_abstract,
-    type (unless `honour_types` is off) and to_publication_date, honour per_page
-    and select, report meta.cost_usd, and reject what OpenAlex rejects (semantic
-    per_page over 50) with HTTP 400. `fail_with` status codes are returned
-    first, one per request.
-    """
-
-    def __init__(
-        self,
-        works: Sequence[dict[str, Any]] = WORKS,
-        *,
-        cost: float | None = 0.001,
-        fail_with: Sequence[int] = (),
-        honour_types: bool = True,
-    ) -> None:
-        self.works = list(works)
-        self.cost = cost
-        self.fail_with = list(fail_with)
-        self.honour_types = honour_types
-        self.requests: list[dict[str, str]] = []
-        self.encoder = FakeEncoder()
-
-    @property
-    def transport(self) -> httpx.MockTransport:
-        return httpx.MockTransport(self.handle)
-
-    def handle(self, request: httpx.Request) -> httpx.Response:
-        params = dict(request.url.params)
-        self.requests.append(params)
-        if self.fail_with:
-            return httpx.Response(self.fail_with.pop(0), json={"error": "simulated"})
-        per_page = int(params.get("per_page", "25"))
-        works = [w for w in self.works if self._passes(w, params.get("filter", ""))]
-        if "search.semantic" in params:
-            if per_page > 50:
-                message = f"per_page cannot exceed 50 for semantic search. Received {per_page}."
-                return httpx.Response(400, json={"error": "Invalid", "message": message})
-            ranked = self._semantic(params["search.semantic"], works)
-        elif "search" in params:
-            ranked = self._keyword(params["search"], works)
-        else:
-            return httpx.Response(400, json={"error": "no search parameter"})
-        fields = params["select"].split(",")
-        results = [{k: w.get(k) for k in fields} for w in ranked[:per_page]]
-        meta: dict[str, Any] = {"count": len(ranked), "per_page": per_page}
-        if self.cost is not None:
-            meta["cost_usd"] = self.cost
-        return httpx.Response(200, json={"meta": meta, "results": results})
-
-    @staticmethod
-    def _text(work: dict[str, Any]) -> str:
-        return f"{work['title']}. {reconstruct_abstract(work['abstract_inverted_index'])}"
-
-    def _passes(self, work: dict[str, Any], filters: str) -> bool:
-        for clause in filter(None, filters.split(",")):
-            key, _, value = clause.partition(":")
-            if key == "has_abstract" and bool(work["abstract_inverted_index"]) != (value == "true"):
-                return False
-            if key == "type" and self.honour_types and work["type"] not in value.split("|"):
-                return False
-            if key == "to_publication_date" and work["publication_date"] > value:
-                return False
-        return True
-
-    def _keyword(self, query: str, works: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        wanted = set(content_stems(query))
-        scored = []
-        for work in works:
-            stems = content_stems(self._text(work))
-            if wanted and wanted <= set(stems):
-                scored.append((-sum(s in wanted for s in stems), work["id"], work))
-        return [w for *_, w in sorted(scored, key=lambda s: s[:2])]
-
-    def _semantic(self, query: str, works: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        if not works:
-            return []
-        q = self.encoder.encode_queries([query])[0]
-        docs = self.encoder.encode_docs([self._text(w) for w in works])
-        sims = docs @ q
-        order = sorted(range(len(works)), key=lambda i: (-sims[i], works[i]["id"]))
-        return [works[i] for i in order if sims[i] > 0]
 
 
 @pytest.fixture
@@ -323,6 +214,42 @@ def test_rate_limited_calls_are_retried(cfg: Config) -> None:
     response = _client(cfg, fake, sleeps).search("memory", SEMANTIC)
     assert len(fake.requests) == 2 and response.records
     assert sleeps == [1.0, 1.0]  # the backoff, then the one-call-per-second throttle
+
+
+def test_a_429_the_budget_cant_pay_for_stops_at_once(cfg: Config) -> None:
+    fake = FakeLiveOpenAlex(budget_credits=5)  # a search costs 10 credits
+    with pytest.raises(OpenAlexBudgetExhausted, match="5 credits left") as caught:
+        _client(cfg, fake).search("memory", SEMANTIC)
+    assert caught.value.resets_in_s == 3600
+    assert len(fake.requests) == 1  # not retried
+
+
+def test_a_429_with_budget_left_is_a_per_second_limit_and_is_retried(cfg: Config) -> None:
+    assert cfg.live is not None
+    fake = FakeLiveOpenAlex(budget_credits=1000)
+    limited: list[httpx.Request] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if not limited:
+            limited.append(request)
+            return httpx.Response(429, headers={"x-ratelimit-remaining": "1000"})
+        return fake.handle(request)
+
+    client = LiveSearchClient(
+        cfg.live,
+        OpenAlexCache(cfg.live.cache_path),
+        transport=httpx.MockTransport(handle),
+        sleep=lambda seconds: None,
+        clock=lambda: 0.0,
+    )
+    assert client.search("memory", SEMANTIC).records
+    assert len(limited) == 1 and len(fake.requests) == 1
+
+
+def test_the_budget_comes_from_the_free_rate_limit_endpoint(cfg: Config) -> None:
+    fake = FakeLiveOpenAlex(budget_credits=250)
+    assert _client(cfg, fake).budget() == Budget(0.025, 1.0, 3600.0)
+    assert (fake.rate_limit_calls, fake.requests) == (1, [])
 
 
 def test_cost_falls_back_to_the_documented_price(cfg: Config) -> None:

@@ -61,7 +61,9 @@ and with six live probes (one Phase 1 proposal and a short query):
   OpenAlexClient). The key goes in an api_key parameter or an
   "Authorization: Bearer" header (we use the header). Headers
   X-RateLimit-Limit/-Remaining/-Credits-Used/-Reset report the budget, and
-  /rate-limit returns it for a key.
+  /rate-limit returns it for a key. A 429 whose X-RateLimit-Remaining can't
+  pay for one search raises rk.corpus.OpenAlexBudgetExhausted (not retried);
+  `budget()` reads /rate-limit, which is free.
 
 The cache keeps every response it ever fetched. The live tool reads the newest
 one if it is younger than live.cache_ttl_days and fetches again otherwise;
@@ -85,7 +87,7 @@ from typing import Any
 import httpx
 
 from rk.config import SEMANTIC_MAX_RESULTS, Config, LiveConfig
-from rk.corpus import OpenAlexClient, short_id, to_record
+from rk.corpus import OpenAlexClient, OpenAlexError, short_id, to_record
 from rk.targets import Record
 
 KEYWORD, SEMANTIC = "keyword", "semantic"
@@ -205,6 +207,22 @@ class SearchResponse:
         return 0.0 if self.cached else self.cost_usd
 
 
+@dataclass(frozen=True)
+class Budget:
+    """The API key's OpenAlex budget, from /rate-limit (USD)."""
+
+    remaining_usd: float  # what is left today, plus any prepaid balance
+    daily_usd: float | None  # the daily budget
+    resets_in_s: float | None  # seconds until midnight UTC
+
+
+def _number(data: dict[str, Any], key: str) -> float | None:
+    value = data.get(key)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    return None
+
+
 def authors(work: dict[str, Any]) -> list[dict[str, str | None]]:
     """The work's authors in order: OpenAlex author id (may be None) and display name."""
     found = []
@@ -273,6 +291,7 @@ class LiveSearchClient:
                 transport=transport,
                 max_requests_per_second=rate,
                 timeout=live.openalex_timeout_s,
+                call_cost_usd=SEARCH_COST_USD,
                 sleep=sleep,
                 clock=clock,
             )
@@ -336,6 +355,18 @@ class LiveSearchClient:
         records = [r for w in works if (r := live_record(w, self.live.work_types)) is not None]
         return SearchResponse(
             query, kind, records, len(works), cost, hit is not None, fetched_at, params
+        )
+
+    def budget(self) -> Budget:
+        """Today's OpenAlex budget for the API key (a free /rate-limit call)."""
+        data = self._clients[KEYWORD].rate_limit()
+        remaining = _number(data, "daily_remaining_usd")
+        if remaining is None:
+            raise OpenAlexError(f"/rate-limit has no daily_remaining_usd: {str(data)[:300]}")
+        return Budget(
+            remaining_usd=remaining + (_number(data, "prepaid_remaining_usd") or 0.0),
+            daily_usd=_number(data, "daily_budget_usd"),
+            resets_in_s=_number(data, "resets_in_seconds"),
         )
 
     def close(self) -> None:

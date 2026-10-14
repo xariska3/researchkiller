@@ -1,1 +1,4 @@
-"""Phase 2: ResearchKiller as a live tool over the whole OpenAlex literature (docs/phase2_spec.md)."""
+"""Phase 2: ResearchKiller as a live tool over the whole OpenAlex literature.
+
+See docs/phase2_spec.md.
+"""

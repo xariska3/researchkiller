@@ -67,6 +67,9 @@ live:
   work_types: [article, preprint, conference-paper, book-chapter, dissertation, review, book,
                report]
   cache_ttl_days: 7               # live tool only; evaluation runs never expire
+  # live-eval compares with this Phase 1 run (the full run: B5, and B1's difficulty buckets)
+  phase1_run: "20261013-185712"
+  mlflow_experiment: researchkiller-phase2-live
 
 run:
   out_dir: runs
