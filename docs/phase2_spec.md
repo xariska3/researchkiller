@@ -46,6 +46,23 @@ design live, and keeps the Phase 1 benchmark as a regression test.
    Keyword search ANDs every word, so queries longer than
    `live.keyword_max_words` (32; in practice the user's text) get semantic
    search only. Details in `src/rk/live/openalex_search.py`.
+   *Step 1 decisions:*
+   - **Work types:** keep `article`, `preprint`, `conference-paper`,
+     `book-chapter`, `dissertation`, `review`, `book` and `report`
+     (`live.work_types`; a survey or tech report on the same idea is prior art
+     too). Drop `dataset`, `erratum`, `peer-review`, `paratext`, `letter`,
+     `editorial` and other non-papers. Searches send a `type:` filter, and any
+     other type that comes back is dropped locally.
+   - **Near-duplicates:** besides Phase 1's dedupe (shared id or DOI, or the
+     same long title at most 2 years apart), two records merge only if all
+     three hold: title Jaccard >= 0.8 on content stems, at least one shared
+     author, and publication years at most 1 apart. Authors are the same if
+     they share an OpenAlex author id, or if every token of the shorter name
+     (2 tokens or more) is in the other name, since an author id can be
+     missing. The earliest version keeps its id; the others become aliases.
+   - **Cache:** every OpenAlex response is kept. The live tool refetches a
+     response older than `live.cache_ttl_days` (7). Evaluation runs read the
+     first response ever cached and never expire, so they are reproducible.
 4. **Rerank locally:** BM25 + the Qwen3-Embedding dense score over the
    candidate pool, fused with the same RRF function as Phase 1 (hybrid,
    because Phase 1 showed rewrites do worse on a dense-only base). Keep the top 20.
@@ -92,6 +109,9 @@ design live, and keeps the Phase 1 benchmark as a regression test.
   queries, live, and reports Hit@1/5/10 and MRR of the original paper in the
   whole literature, plus cost and latency per check. Writes to the results database and
   MLflow like Phase 1 runs.
+  *Step 1 decision (matching the original):* a result is the original paper if
+  any of its merged versions has the original's OpenAlex id or one of its
+  aliases, its DOI, or its exact normalised title (`rk.live.pool.match_original`).
 - Explainer check: run 10 full checks, export a CSV for hand review (results
   useful? explanations correct?), and report the quote-verification rate.
 - The Phase 1 frozen benchmark stays runnable as a regression test.

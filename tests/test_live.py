@@ -194,7 +194,7 @@ def _search(query: str) -> str:
 
 
 STOP = json.dumps({"action": "stop", "reason": "covered"})
-TYPES = "type:article|preprint|conference-paper|book-chapter|dissertation"
+TYPES = "type:article|preprint|conference-paper|book-chapter|dissertation|review|book|report"
 
 
 # --- config ------------------------------------------------------------------
@@ -211,7 +211,11 @@ def test_the_project_config_has_a_live_section() -> None:
         "conference-paper",
         "book-chapter",
         "dissertation",
+        "review",
+        "book",
+        "report",
     )
+    assert live.work_types == LiveConfig(cache_path=Path("x")).work_types  # the default
     assert live.cache_ttl_days == 7
 
 
@@ -404,7 +408,11 @@ def test_only_papers_are_searched_and_kept(cfg: Config) -> None:
     for work in (A0004_PAPER, BB25_PAPER, BB25_THESIS):
         record = live_record(work, types)
         assert record is not None and record["type"] == work["type"]
-    for dropped in ("erratum", "peer-review", "paratext", "review", "other"):
+    # Literature reviews, books and reports are prior art too.
+    for kept in ("review", "book", "report"):
+        record = live_record({**A0004_PAPER, "type": kept}, types)
+        assert record is not None and record["type"] == kept
+    for dropped in ("erratum", "peer-review", "paratext", "letter", "editorial", "other"):
         assert live_record({**A0004_PAPER, "type": dropped}, types) is None
     # The type: filter asks OpenAlex for papers only; anything else that comes back
     # is dropped as well, but still counted among the results.

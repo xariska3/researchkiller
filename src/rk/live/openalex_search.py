@@ -31,12 +31,14 @@ and with six live probes (one Phase 1 proposal and a short query):
   is inclusive, so "published before D" is to_publication_date:D-1.
 - Work types (https://help.openalex.org/data/work-types/, updated 2026-08-17):
   25 values. We keep live.work_types (article, preprint, conference-paper,
-  book-chapter, dissertation) with a type: filter, and drop any other type
-  that comes back anyway. Proceedings papers are `conference-paper`, newly
-  added with low coverage (`proceedings-article` matched 0 works); `review`
-  (a literature review) is not `peer-review` (a referee report). Probe: the
-  type: filter works with keyword and semantic search; semantic search
-  filters after retrieval, so it can return fewer than 50 (43 in the probe).
+  book-chapter, dissertation, review, book, report) with a type: filter, and
+  drop any other type that comes back anyway (dataset, erratum, peer-review,
+  paratext, letter, editorial, other, ...). Proceedings papers are
+  `conference-paper`, newly added with low coverage (`proceedings-article`
+  matched 0 works); `review` (a literature review) is not `peer-review` (a
+  referee report). Probe: the type: filter works with keyword and semantic
+  search; semantic search filters after retrieval, so it can return fewer
+  than 50 (43 in the probe).
 - Authors: `authorships[].author` has an id and a display_name; the id can be
   null (a dissertation's only author in the A0002 smoke case had none).
 - Paging (https://help.openalex.org/api/paging/): per_page 1-100 (default 25);

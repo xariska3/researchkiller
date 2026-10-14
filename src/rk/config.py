@@ -183,13 +183,16 @@ class LiveConfig:
     cost_cap_per_check: float = 0.10  # USD, OpenAlex + LLM method cost; hard cap
     openalex_timeout_s: float = 30.0  # per HTTP request
     # OpenAlex work types kept (https://help.openalex.org/data/work-types/); datasets,
-    # errata, peer reviews, paratext and other non-papers are dropped.
+    # errata, peer reviews, paratext, letters, editorials and other non-papers are dropped.
     work_types: tuple[str, ...] = (
         "article",
         "preprint",
         "conference-paper",
         "book-chapter",
         "dissertation",
+        "review",
+        "book",
+        "report",
     )
     # The live tool refetches cached responses older than this; evaluation runs read
     # the first response ever cached, so they never expire. None: never refetch.
