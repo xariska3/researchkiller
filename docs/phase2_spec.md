@@ -41,6 +41,11 @@ design live, and keeps the Phase 1 benchmark as a regression test.
    docs for a semantic or vector search option; if one exists, also use it and
    merge. Dedupe by id/DOI/title into a candidate pool (typically 100–250).
    Cache every OpenAlex response on disk.
+   *Step 1 finding:* OpenAlex has semantic search (`search.semantic`: at most
+   50 results, 1 request/s, $0.001 per call, the same price as keyword search).
+   Keyword search ANDs every word, so queries longer than
+   `live.keyword_max_words` (32; in practice the user's text) get semantic
+   search only. Details in `src/rk/live/openalex_search.py`.
 4. **Rerank locally:** BM25 + the Qwen3-Embedding dense score over the
    candidate pool, fused with the same RRF function as Phase 1 (hybrid,
    because Phase 1 showed rewrites do worse on a dense-only base). Keep the top 20.
@@ -77,7 +82,9 @@ design live, and keeps the Phase 1 benchmark as a regression test.
   JSON, quote, verified flag). Same database as the LLM cache/spend file is fine.
 - **Schemas:** Pydantic models for the API and for the explainer output.
 - **Config:** a `live:` section in the YAML (results per query, pool size,
-  top-k to explain, per-check cost cap, timeouts).
+  top-k to explain, per-check cost cap, timeouts). *Step 1:* the section is in
+  `configs/phase1.yaml`. The cap is on a check's method cost (OpenAlex plus
+  LLM), and a call that could cross it fails the check.
 - **Embeddings:** GPU if available, CPU fallback; record which one in the check.
 
 ## Evaluation
