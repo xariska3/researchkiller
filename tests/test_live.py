@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Sequence
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -32,7 +32,7 @@ from rk.live.openalex_search import (
     live_record,
 )
 from rk.live.pipeline import CheckCostCapExceeded, CheckLedger, LiveRanker, live_search
-from rk.live.pool import CandidatePool, Hit
+from rk.live.pool import CandidatePool, Hit, match_original, same_author, title_jaccard
 from rk.retrieval import (
     BM25Retriever,
     DenseRetriever,
@@ -71,6 +71,7 @@ def oa_work(record: dict[str, Any], published: str = "2025-03-01", **extra: Any)
         "relevance_score": 1.0,
         "language": "en",
         "type": "article",
+        "authorships": [],
         **extra,
     }
 
@@ -83,10 +84,11 @@ class FakeLiveOpenAlex:
 
     Keyword search matches works whose title and abstract contain every content
     stem of the query (OpenAlex ANDs the words), most stem occurrences first.
-    Semantic search ranks works by FakeEncoder cosine. Both apply has_abstract
-    and to_publication_date, honour per_page and select, report meta.cost_usd,
-    and reject what OpenAlex rejects (semantic per_page over 50) with HTTP 400.
-    `fail_with` status codes are returned first, one per request.
+    Semantic search ranks works by FakeEncoder cosine. Both apply has_abstract,
+    type (unless `honour_types` is off) and to_publication_date, honour per_page
+    and select, report meta.cost_usd, and reject what OpenAlex rejects (semantic
+    per_page over 50) with HTTP 400. `fail_with` status codes are returned
+    first, one per request.
     """
 
     def __init__(
@@ -95,10 +97,12 @@ class FakeLiveOpenAlex:
         *,
         cost: float | None = 0.001,
         fail_with: Sequence[int] = (),
+        honour_types: bool = True,
     ) -> None:
         self.works = list(works)
         self.cost = cost
         self.fail_with = list(fail_with)
+        self.honour_types = honour_types
         self.requests: list[dict[str, str]] = []
         self.encoder = FakeEncoder()
 
@@ -133,11 +137,12 @@ class FakeLiveOpenAlex:
     def _text(work: dict[str, Any]) -> str:
         return f"{work['title']}. {reconstruct_abstract(work['abstract_inverted_index'])}"
 
-    @staticmethod
-    def _passes(work: dict[str, Any], filters: str) -> bool:
+    def _passes(self, work: dict[str, Any], filters: str) -> bool:
         for clause in filter(None, filters.split(",")):
             key, _, value = clause.partition(":")
             if key == "has_abstract" and bool(work["abstract_inverted_index"]) != (value == "true"):
+                return False
+            if key == "type" and self.honour_types and work["type"] not in value.split("|"):
                 return False
             if key == "to_publication_date" and work["publication_date"] > value:
                 return False
@@ -189,6 +194,7 @@ def _search(query: str) -> str:
 
 
 STOP = json.dumps({"action": "stop", "reason": "covered"})
+TYPES = "type:article|preprint|conference-paper|book-chapter|dissertation"
 
 
 # --- config ------------------------------------------------------------------
@@ -199,6 +205,14 @@ def test_the_project_config_has_a_live_section() -> None:
     assert live is not None
     assert (live.results_per_query, live.semantic_results_per_query, live.top_k) == (50, 50, 20)
     assert (live.explain_top_k, live.cost_cap_per_check, live.keyword_max_words) == (10, 0.10, 32)
+    assert live.work_types == (
+        "article",
+        "preprint",
+        "conference-paper",
+        "book-chapter",
+        "dissertation",
+    )
+    assert live.cache_ttl_days == 7
 
 
 def test_the_live_section_is_optional(tmp_path: Path) -> None:
@@ -213,6 +227,9 @@ def test_the_live_section_is_optional(tmp_path: Path) -> None:
         ("explain_top_k", 6, "explain_top_k"),
         ("cost_cap_per_check", 0, "cost_cap_per_check"),
         ("keyword_max_words", 0, "keyword_max_words"),
+        ("work_types", [], "work_types"),
+        ("work_types", ["article", " dataset"], "work_types"),
+        ("cache_ttl_days", 0, "cache_ttl_days"),
     ],
 )
 def test_live_settings_are_checked(tmp_path: Path, key: str, value: Any, message: str) -> None:
@@ -231,11 +248,12 @@ def test_keyword_search_sends_the_documented_parameters(cfg: Config) -> None:
     assert fake.requests == [
         {
             "search": "summarisation clusters memory",
-            "filter": "has_abstract:true",
+            "filter": f"has_abstract:true,{TYPES}",
             "per_page": "50",
             "select": SELECT,
         }
     ]
+    assert "authorships" in SELECT.split(",") and "type" in SELECT.split(",")
     assert [r["id"] for r in response.records] == [T1]
     record = response.records[0]
     assert (record["title"], record["abstract"], record["origin"]) == (
@@ -257,7 +275,7 @@ def test_semantic_search_truncates_long_input_and_respects_its_page_limit(cfg: C
     response = _client(cfg, fake).search(text, SEMANTIC)
     (params,) = fake.requests
     assert params["search.semantic"] == text[:SEMANTIC_MAX_CHARS]
-    assert (params["per_page"], params["filter"]) == ("50", "has_abstract:true")
+    assert (params["per_page"], params["filter"]) == ("50", f"has_abstract:true,{TYPES}")
     assert response.query == text  # the result keeps the full query
     assert response.records  # memory appears in several abstracts
 
@@ -267,7 +285,9 @@ def test_published_before_filters_on_the_day_before(cfg: Config) -> None:
     new = oa_work(corpus_records()[1], published="2025-01-01")
     fake = FakeLiveOpenAlex([old, new])
     response = _client(cfg, fake).search("memory", SEMANTIC, before=date(2025, 1, 1))
-    assert fake.requests[0]["filter"] == "has_abstract:true,to_publication_date:2024-12-31"
+    assert fake.requests[0]["filter"] == (
+        f"has_abstract:true,{TYPES},to_publication_date:2024-12-31"
+    )
     assert [r["id"] for r in response.records] == [T1]
 
 
@@ -313,6 +333,144 @@ def test_results_without_an_abstract_or_a_date_are_dropped() -> None:
     assert live_record({**work, "publication_date": None}) is None
 
 
+def _work(
+    num: str,
+    title: str,
+    published: str,
+    *,
+    work_type: str = "article",
+    doi: str | None = None,
+    authors: Sequence[tuple[str | None, str]] = (),
+) -> dict[str, Any]:
+    """A real OpenAlex work's metadata (as looked up on 2026-10-13), with a stand-in abstract."""
+    return oa_work(
+        {"id": num, "title": title, "abstract": ABSTRACTS[T2]},
+        published=published,
+        type=work_type,
+        doi=f"https://doi.org/{doi}" if doi else None,
+        authorships=[
+            {"author": {"id": f"https://openalex.org/{a}" if a else None, "display_name": n}}
+            for a, n in authors
+        ],
+    )
+
+
+# The A0002 smoke-test pair: a conference paper and its author's dissertation. The
+# dissertation's only author has no OpenAlex id and is written "Last, First".
+BB25_PAPER = _work(
+    "W4388676224",
+    "BB25HLegalSum: Leveraging BM25 and BERT-based clustering for the summarization of legal "
+    "documents",
+    "2023-01-01",
+    work_type="conference-paper",
+    doi="10.26615/978-954-452-092-2_029",
+    authors=[("A5093262736", "Leonardo Bonalume"), ("A5074093456", "Karin E. Becker")],
+)
+BB25_THESIS = _work(
+    "W7045572899",
+    "BB25HLegalSum : a method for legal document summarization that leverages BM25 and "
+    "BERT-based clustering",
+    "2024-01-01",
+    work_type="dissertation",
+    authors=[(None, "Andrade, Leonardo Bonalume de")],
+)
+# The A0004 smoke-test pair: the paper, and a Zenodo dataset of its replication data.
+TEXTUAL_OVERLAP = (
+    "Textual overlap rather than domain alignment: A comparative study of fine-tuning "
+    "strategies for specialised machine translation with large language models"
+)
+A0004_PAPER = _work(
+    "W7169768705",
+    TEXTUAL_OVERLAP,
+    "2026-07-20",
+    doi="10.1371/journal.pone.0352256",
+    authors=[(None, "Lixue Yang"), ("A5101518774", "Jiaxin Zhu"), ("A5049423308", "Z Zhang")],
+)
+REPLICATION_DATASET = _work(
+    "W7165207049",
+    f'Minimal replication dataset for "{TEXTUAL_OVERLAP}"',
+    "2026-06-18",
+    work_type="dataset",
+    doi="10.5281/zenodo.20743017",
+    authors=[("A5102360992", "Lixue Yang"), ("A5101518774", "Jiaxin Zhu")],
+)
+
+
+def test_only_papers_are_searched_and_kept(cfg: Config) -> None:
+    assert cfg.live is not None
+    types = cfg.live.work_types
+    assert live_record(REPLICATION_DATASET, types) is None
+    assert live_record(REPLICATION_DATASET) is not None  # without a type list, kept
+    for work in (A0004_PAPER, BB25_PAPER, BB25_THESIS):
+        record = live_record(work, types)
+        assert record is not None and record["type"] == work["type"]
+    for dropped in ("erratum", "peer-review", "paratext", "review", "other"):
+        assert live_record({**A0004_PAPER, "type": dropped}, types) is None
+    # The type: filter asks OpenAlex for papers only; anything else that comes back
+    # is dropped as well, but still counted among the results.
+    fake = FakeLiveOpenAlex([A0004_PAPER, REPLICATION_DATASET], honour_types=False)
+    response = _client(cfg, fake).search("textual overlap domain alignment", SEMANTIC)
+    assert TYPES in fake.requests[0]["filter"]
+    assert ([r["id"] for r in response.records], response.n_results) == (["W7169768705"], 2)
+
+
+def test_records_keep_their_authors() -> None:
+    record = live_record(BB25_THESIS)
+    assert record is not None
+    assert record["authors"] == [{"id": None, "name": "Andrade, Leonardo Bonalume de"}]
+    paper = live_record(BB25_PAPER)
+    assert paper is not None and paper["authors"][0] == {
+        "id": "A5093262736",
+        "name": "Leonardo Bonalume",
+    }
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+
+    def __call__(self) -> datetime:
+        return self.now
+
+
+def test_live_cache_expires_after_its_ttl_but_evaluation_never_expires(cfg: Config) -> None:
+    assert cfg.live is not None
+    clock = _Clock()
+    cache = OpenAlexCache(cfg.live.cache_path, now=clock)
+    same_text = [oa_work({**corpus_records()[0], "id": f"W{n}"}) for n in (901, 902, 903)]
+    fake = FakeLiveOpenAlex(same_text[:2])
+    ttl = timedelta(days=7)
+
+    def search(max_age: timedelta | None) -> Any:
+        client = LiveSearchClient(
+            cfg.live, cache, max_age=max_age, transport=fake.transport, sleep=lambda s: None
+        )
+        return client.search("memory", SEMANTIC)
+
+    first = search(ttl)
+    clock.now += timedelta(days=6)
+    assert search(ttl).cached and len(fake.requests) == 1  # 6 days old: still fresh
+    fake.works = same_text  # OpenAlex has changed since
+    clock.now += timedelta(days=2)
+    fresh = search(ttl)  # 8 days old: fetched again, and both responses are kept
+    assert (fresh.cached, len(fake.requests), len(cache)) == (False, 2, 2)
+    assert fresh.fetched_at == clock.now
+    assert len(fresh.records) == 3 and len(first.records) == 2
+    replay = search(None)  # an evaluation run reads the first response ever cached
+    assert replay.cached and replay.records == first.records
+    assert replay.fetched_at == first.fetched_at
+    assert len(fake.requests) == 2
+    clock.now += timedelta(days=365)
+    assert search(None).records == first.records  # and it never expires
+
+
+def test_from_config_sets_the_ttl_for_the_live_tool_only(cfg: Config) -> None:
+    assert cfg.live is not None
+    cache = OpenAlexCache(cfg.live.cache_path)
+    assert LiveSearchClient.from_config(cfg, cache).max_age == timedelta(days=7)
+    assert LiveSearchClient.from_config(cfg, cache, evaluation=True).max_age is None
+
+
 # --- candidate pool ----------------------------------------------------------
 
 
@@ -331,6 +489,103 @@ def test_pool_merges_versions_and_keeps_every_hit() -> None:
     assert merged["aliases"] == ["W900"]
     assert pool.hits(merged) == [Hit(0, SEMANTIC, 1), Hit(1, KEYWORD, 1)]
     assert pool.titles == {T1: TITLES[T1], T2: TITLES[T2]}
+
+
+def _pool_of(*works: dict[str, Any]) -> CandidatePool:
+    pool = CandidatePool(FakeEncoder(), max_size=50)
+    records = [r for w in works if (r := live_record(w)) is not None]
+    assert len(records) == len(works)
+    pool.add(records, query_index=0, kind=SEMANTIC)
+    return pool
+
+
+def test_near_duplicates_with_different_titles_merge_under_all_three_rules() -> None:
+    # BB25HLegalSum: title Jaccard 0.9 on content stems, one year apart, and the
+    # same author, matched by name since the dissertation's author has no id.
+    assert title_jaccard(BB25_PAPER["title"], BB25_THESIS["title"]) == pytest.approx(0.9)
+    pool = _pool_of(BB25_PAPER, BB25_THESIS)
+    (merged,) = pool.records
+    assert (merged["id"], merged["aliases"]) == ("W4388676224", ["W7045572899"])
+    assert merged["type"] == "conference-paper"  # the earlier version's fields
+    assert [a["name"] for a in pool.authors(merged)] == [
+        "Leonardo Bonalume",
+        "Karin E. Becker",
+        "Andrade, Leonardo Bonalume de",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("change", "why"),
+    [
+        ({"publication_date": "2025-01-01"}, "two years apart"),
+        ({"authorships": [{"author": {"id": None, "display_name": "Maria Rossi"}}]}, "no author"),
+        ({"title": "BB25HLegalSum: legal summarization with BM25"}, "Jaccard 0.44"),
+    ],
+)
+def test_near_duplicates_need_all_three_rules(change: dict[str, Any], why: str) -> None:
+    pool = _pool_of(BB25_PAPER, {**BB25_THESIS, **change})
+    assert len(pool) == 2, why
+
+
+def test_same_author_by_id_or_by_every_token_of_the_shorter_name() -> None:
+    def author(name: str, author_id: str | None = None) -> dict[str, str | None]:
+        return {"id": author_id, "name": name}
+
+    assert same_author(author("L. Bonalume", "A1"), author("Someone else", "A1"))
+    assert same_author(author("Leonardo Bonalume"), author("Andrade, Leonardo Bonalume de"))
+    assert same_author(author("José García"), author("Garcia, Jose"))
+    assert same_author(author("Z Zhang"), author("Z H Zhang"))
+    assert not same_author(author("Zhang"), author("Z Zhang"))  # one token isn't enough
+    assert not same_author(author("Leonardo Bonalume"), author("Leonardo Rossi"))
+    assert not same_author(author("A", None), author("B", None))
+
+
+def test_the_replication_dataset_is_dropped_before_it_could_merge() -> None:
+    # Its title is the paper's plus three stems (Jaccard 0.84), and it shares an
+    # author and a year with the paper: only its type keeps it out of the pool.
+    assert title_jaccard(A0004_PAPER["title"], REPLICATION_DATASET["title"]) == pytest.approx(
+        0.842, abs=0.001
+    )
+    types = LiveConfig(cache_path=Path("x")).work_types
+    assert live_record(REPLICATION_DATASET, types) is None
+    pool = CandidatePool(FakeEncoder(), max_size=50)
+    pool.add(
+        [r for w in (A0004_PAPER, REPLICATION_DATASET) if (r := live_record(w, types))],
+        query_index=0,
+        kind=SEMANTIC,
+    )
+    assert [(r["id"], r["aliases"]) for r in pool.records] == [("W7169768705", [])]
+
+
+def test_versions_with_the_same_title_still_merge_as_in_phase1() -> None:
+    preprint = _work("W7128640141", "From Search to GenAI Queries", "2026-02-10",
+                     work_type="preprint", authors=[("A5011311687", "Noah D. Finkelstein")])
+    article = _work("W7166562055", "From search to GenAI queries", "2026-06-29",
+                    authors=[("A5139544687", "Anonymous")])
+    assert len(_pool_of(preprint, article)) == 2  # 3 content words: too short for Phase 1
+    long_title = "From search to GenAI queries: Global trends in physics information-seeking"
+    pool = _pool_of({**preprint, "title": long_title}, {**article, "title": long_title})
+    assert [(r["id"], r["aliases"]) for r in pool.records] == [("W7128640141", ["W7166562055"])]
+
+
+def test_the_original_paper_matches_by_id_alias_doi_or_exact_normalised_title() -> None:
+    original = {
+        "id": "W7166562055",
+        "aliases": ["W1"],
+        "doi": "10.1103/g1vh-fl9s",
+        "title": "From search to GenAI queries: Global trends",
+    }
+    live = live_record(_work("W7166562055", "Another title", "2026-06-29"))
+    assert live is not None
+    assert match_original([live], original) == "id"
+    assert match_original([{**live, "id": "W2", "aliases": ["W7166562055"]}], original) == "alias"
+    assert match_original([{**live, "id": "W1"}], original) == "alias"  # the original's alias
+    assert match_original([{**live, "id": "W2", "doi": "10.1103/g1vh-fl9s"}], original) == "doi"
+    retitled = {**live, "id": "W2", "title": "From Search to GenAI Queries - Global Trends"}
+    assert match_original([retitled], original) == "title"
+    other = {**live, "id": "W2", "title": "From search to GenAI queries"}
+    assert match_original([other], original) is None
+    assert match_original([other, retitled], original) == "title"  # any version counts
 
 
 def test_pool_keeps_the_first_arrivals_up_to_its_size() -> None:

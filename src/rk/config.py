@@ -182,8 +182,29 @@ class LiveConfig:
     explain_top_k: int = 10  # papers the overlap explainer covers (Step 3)
     cost_cap_per_check: float = 0.10  # USD, OpenAlex + LLM method cost; hard cap
     openalex_timeout_s: float = 30.0  # per HTTP request
+    # OpenAlex work types kept (https://help.openalex.org/data/work-types/); datasets,
+    # errata, peer reviews, paratext and other non-papers are dropped.
+    work_types: tuple[str, ...] = (
+        "article",
+        "preprint",
+        "conference-paper",
+        "book-chapter",
+        "dissertation",
+    )
+    # The live tool refetches cached responses older than this; evaluation runs read
+    # the first response ever cached, so they never expire. None: never refetch.
+    cache_ttl_days: float | None = 7.0
 
     def __post_init__(self) -> None:
+        _require(len(self.work_types) > 0, "work_types must list at least one OpenAlex type")
+        _require(
+            all(t.strip() and t == t.strip() for t in self.work_types),
+            "work_types must be non-empty type names without spaces around them",
+        )
+        _require(
+            self.cache_ttl_days is None or self.cache_ttl_days > 0,
+            "cache_ttl_days must be > 0 (or null to never refetch)",
+        )
         _require(
             1 <= self.results_per_query <= KEYWORD_MAX_PER_PAGE,
             f"results_per_query must be in [1, {KEYWORD_MAX_PER_PAGE}] (one OpenAlex page)",

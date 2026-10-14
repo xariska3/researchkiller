@@ -77,6 +77,8 @@ use it, since the spec reranks locally.
 | `explain_top_k` | 10 |
 | `cost_cap_per_check` | 0.10 |
 | `openalex_timeout_s` | 30 |
+| `work_types` | article, preprint, conference-paper, book-chapter, dissertation (added after review) |
+| `cache_ttl_days` | 7 (added after review) |
 
   The section is optional, so the Phase 1 commands don't need it.
 
@@ -194,3 +196,59 @@ What the smoke test shows:
 | OpenAlex, smoke test | 19 searches | 0.019 | OpenAlex's free daily budget, not our ledger |
 | OpenAlex, probes | 5 paid (1 rejected, free) | 0.005 | same |
 | OpenAlex, network test | 2 | 0.002 | same |
+
+## After review: answers 1–4
+
+These changes are on the same branch; the smoke test above ran before them and
+was not run again.
+
+1. **LangGraph.** The search agent stays the plain B5 loop. `CLAUDE.md` now
+   says LangGraph is optional, and only if it adds value to the end-to-end
+   check workflow later.
+2. **Pool filtering.**
+   - **Work types.** Searches ask OpenAlex only for the types in
+     `live.work_types` (a `type:` filter), and any other type that comes back
+     is dropped as well. The types follow
+     [OpenAlex's vocabulary](https://help.openalex.org/data/work-types/):
+     proceedings papers are `conference-paper`, and `proceedings-article`
+     matched no works. A probe ($0.002) confirmed that the filter works with
+     both kinds of search.
+     - **Dropped:** datasets, errata, peer reviews and paratext, as asked, and
+       with them `review` (literature reviews), `book`, `report`, `letter`,
+       `editorial` and the other non-papers.
+     - **The A0004 replication dataset** is now dropped. Its title Jaccard
+       with the paper is 0.84, and it shares an author and a year, so without
+       the type rule it would have merged into the paper as the earlier
+       version.
+   - **Near-duplicates.** Records with different titles merge only if all
+     three hold:
+     - title Jaccard ≥ 0.8, on content stems (the tokenisation BM25 and the
+       leak filter use);
+     - at least one shared author;
+     - publication years at most 1 apart.
+
+     Two authors are the same if they share an OpenAlex author id, or if
+     every token of the shorter name (2 tokens or more) is in the other name.
+     The name rule is needed for the A0002 case, BB25HLegalSum: a 2023
+     conference paper and the author's 2024 dissertation. Their title Jaccard
+     is 0.9, but the dissertation's only author has no OpenAlex id and is
+     written "Andrade, Leonardo Bonalume de". The pair now merges, and the
+     2023 paper keeps its id.
+   - **Phase 1's merges are unchanged:** shared id or DOI, or the same long
+     title at most 2 years apart.
+   - The tests use the real metadata of these records, from free singleton
+     lookups.
+3. **Cache TTL.** The cache now keeps every response it fetches.
+   - The live tool reads the newest one if it is younger than
+     `live.cache_ttl_days` (7), and fetches again otherwise.
+   - Evaluation runs (`LiveSearchClient.from_config(..., evaluation=True)`)
+     read the first response ever cached, so they never expire and a rerun
+     sees the same data.
+   - The cache table is new (`openalex_responses`). The smoke test's
+     `responses` table is left in the file but no longer read; its entries
+     wouldn't match anyway, since the requests now carry the type filter and
+     authors.
+4. **Matching the original.** `rk.live.pool.match_original` reports how a
+   work is the original paper, checking all its merged versions: by OpenAlex
+   id, by any alias on either side, by DOI, or by exact normalised title.
+   Step 2's evaluation will use it.

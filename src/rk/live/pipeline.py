@@ -184,6 +184,7 @@ class LiveSearchResult:
                     "aliases": c.record["aliases"],
                     "doi": c.record["doi"],
                     "title": c.record["title"],
+                    "type": c.record.get("type"),
                     "publication_date": c.record["publication_date"],
                     "found_by": [asdict(h) for h in c.hits],
                 }
