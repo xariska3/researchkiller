@@ -48,9 +48,9 @@ design live, and keeps the Phase 1 benchmark as a regression test.
    search only. Details in `src/rk/live/openalex_search.py`.
    *Step 1 decisions:*
    - **Work types:** keep `article`, `preprint`, `conference-paper`,
-     `book-chapter`, `dissertation`, `review`, `book` and `report`
-     (`live.work_types`; a survey or tech report on the same idea is prior art
-     too). Drop `dataset`, `erratum`, `peer-review`, `paratext`, `letter`,
+     `book-chapter`, `dissertation`, `review`, `book`, `report` and (since
+     Step 2) `software-paper` (`live.work_types`; a survey, tech report or
+     software paper on the same idea is prior art too). Drop `dataset`, `erratum`, `peer-review`, `paratext`, `letter`,
      `editorial` and other non-papers. Searches send a `type:` filter, and any
      other type that comes back is dropped locally.
    - **Near-duplicates:** besides Phase 1's dedupe (shared id or DOI, or the
@@ -130,6 +130,34 @@ design live, and keeps the Phase 1 benchmark as a regression test.
     reported separately from the full run.
   - **Cost cap**: a check over its cost cap counts as a miss for live recall,
     and the number of such checks is reported separately.
+  *Final-fusion variants, pre-declared on 2026-10-14 before evaluating them:*
+  - **Dev set**: the 120 complete queries of `runs/live-20261014-122144`
+    (A0045–A0186).
+  - **Offline replay**: every check is replayed from its cached OpenAlex
+    responses (no new calls), with the agent's queries taken from the stored
+    trace (no new LLM calls). The agent loop and the final pool are L5's; only
+    the final ranking changes.
+  - **Variants**: n is the number of queries run, the proposal first. Each
+    query's ranking is the pool's hybrid ranking of the final pool, as in L5.
+    - **F1, proposal-equal**: weighted RRF. The proposal's ranking has weight
+      n − 1, equal to all agent queries combined (1 if the agent ran none),
+      and each agent query has weight 1.
+    - **F2, proposal-2x**: weighted RRF, with weight 2 for the proposal and 1
+      for each agent query.
+    - **F3, l1-l5**: RRF of two lists, L1's (the proposal's own search,
+      reranked; mapped onto the final pool's merged works) and L5's final list.
+    - **F4, proposal-only**: the final pool ranked by the proposal alone.
+  - **Selection**: the variant with the highest Hit@5 on the dev set becomes
+    **L5w**, if its Hit@5 is above L5's. Ties go to the higher MRR@20, then to
+    the order above. If no variant beats L5, L5 stays and there is no L5w. The
+    dev-set comparisons with L5 and L1 are reported, but they are exploratory,
+    since this is the set the choice is made on.
+  - **Test set**: the next 80 queries after the dev set in seeded order (from
+    A0187), run live with L1, L5 and L5w into a new run directory, sized to the
+    day's OpenAlex budget. On it, L5w vs L5 and L5w vs L1 are paired: Hit@5
+    with the McNemar test decides, and MRR supports.
+  - **Work types**: `software-paper` joins `live.work_types` for the test run.
+    One dev-set original was a software paper the filter dropped.
 - Explainer check: run 10 full checks, export a CSV for hand review (results
   useful? explanations correct?), and report the quote-verification rate.
 - The Phase 1 frozen benchmark stays runnable as a regression test.
