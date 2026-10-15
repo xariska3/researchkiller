@@ -64,6 +64,12 @@ and L5w vs L1 paired: Hit@5 with the exact McNemar test, MRR@20 supporting.
   - OpenAlex: $0.580 (580 searches).
   - LLM: $0.0320 billed.
   - $0.42 of today's OpenAlex budget is left.
+- **Product note: L1 alone is not close enough to be the default mode.** It
+  trails L5w by 8.7 points of Hit@5 on the test set (0.613 against 0.700;
+  not significant at n = 80, but the MRR CI excludes zero) and by 11.7 on
+  the dev set. It finds 3 of 15 originals in the hardest bucket, against L5's
+  9. At $0.001 and about 2 s a check, it fits an instant first pass, with
+  L5w (about $0.008 and 21 s) as the default.
 
 ## Dev and test side by side
 
