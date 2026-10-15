@@ -66,6 +66,9 @@ design live, and keeps the Phase 1 benchmark as a regression test.
 4. **Rerank locally:** BM25 + the Qwen3-Embedding dense score over the
    candidate pool, fused with the same RRF function as Phase 1 (hybrid,
    because Phase 1 showed rewrites do worse on a dense-only base). Keep the top 20.
+   *Steps 2 and 4 results:* the final fusion is L5w's (proposal-equal). Then one
+   call to the agent model reranks the union of L5w's and L5's top 30 listwise
+   (R1, giving L5r; see Evaluation).
 5. **Overlap explainer (top 10):** reuse the validated facet judge (Mistral Medium 3.1),
    reframed: compare the user's idea with each paper facet by facet (problem,
    method, domain, claim). Output per paper, as strict JSON:
@@ -165,6 +168,111 @@ design live, and keeps the Phase 1 benchmark as a regression test.
       (0.617 against 0.594), so **L5w = F1, proposal-equal**.
     - **Against L5 on the dev set**: +0.050 Hit@5 (7 queries gained, 1 lost,
       McNemar p = 0.07). This is exploratory; the test set decides.
+  - **Test result (2026-10-15)**: L5w vs L5 +0.013 Hit@5 (4 / 3, p = 1), not
+    confirmed, but L5w isn't worse. L5w stays the default check
+    (docs/reports/phase2-step2-test.md).
+  *Rerank variants (Step 4), pre-declared on 2026-10-15 before evaluating them:*
+  - **Why**: the original is sometimes in the final pool but ranked below the
+    top 5. In Step 3, 2 of the 3 examples where other systems found the original
+    and ours didn't were ranking misses.
+  - **Prompts**: `src/rk/prompts/rerank_listwise.txt` and `rerank_graded.txt`,
+    committed with the code before any call.
+  - **Offline, on cached checks**: every check is replayed as for the fusion
+    variants (cached OpenAlex responses, the agent's recorded queries), so the
+    pools and the L5 and L5w rankings are the recorded ones. Only the reranker's
+    LLM calls are new.
+  - **Candidates**: the union of L5w's and L5's top 30 in the final pool, so
+    originals that only the agent's queries ranked high aren't lost. They are
+    taken in turn, L5w's first, then L5's first, and so on, skipping works
+    already taken. This is the *presented order*, and the candidates are
+    numbered in it. A pool with fewer works gives fewer candidates.
+  - **What the reranker sees**: the proposal, and for each candidate its number,
+    title and abstract. Abstracts are cut at 2,000 characters, at a word
+    boundary (6.6% of corpus abstracts are longer). No years, authors or venues.
+  - **Product variants**: the agent model (`qwen/qwen3-235b-a22b-2507`, on the
+    agent's pinned endpoint, temperature 0, seed 42, at most 1,000 output
+    tokens). Its training cutoff (2025-07-21) is before every original.
+    - **R1, listwise**: one call. The model returns every candidate number,
+      closest first, as JSON; the paper that describes the same research idea
+      (the same problem, approach and main claim) comes first. The ranking is
+      that order. Unknown or repeated numbers are dropped, and missing ones
+      follow in presented order.
+    - **R2, listwise + first stage**: R1's order fused with the presented order
+      by RRF (k = 60, equal weights), so a candidate the first stage ranked high
+      isn't lost to one bad LLM judgment. It uses R1's calls, with no new ones.
+    - **R3, graded**: one call. The model gives every candidate a score as JSON:
+      - 3 = the same research idea;
+      - 2 = the same problem and a closely similar approach;
+      - 1 = the same broad topic;
+      - 0 = unrelated.
+
+      Candidates are sorted by score, ties in presented order. A missing score
+      counts as 0.
+    - **Unreadable replies**: a reply with no readable JSON leaves the
+      presented order. Such replies are counted and reported.
+    - **The rest of the list**: L5w's works outside the candidates follow the
+      reranked ones. Ranks count within the top 20, so MRR is MRR@20, as before.
+  - **Upper bound, RS**: R1's prompt and parsing, with Claude Sonnet 5.5
+    (Anthropic's OpenAI-compatible endpoint). It is not a product candidate and
+    can't be selected.
+    - **Settings**: temperature 1 (Claude 5 models refuse less), its default
+      adaptive thinking, and at most 16,000 output tokens.
+    - **Cap**: $20 of the Anthropic credit, in its own ledger
+      (`data/cache/rerank_sonnet.sqlite`).
+    - **Memorisation**: Sonnet 5.5's training data runs to June 2026, so it may
+      have read originals published before July. Its results are therefore
+      also reported for originals published from 2026-07-01, which it can't
+      have seen.
+  - **Pilot**: 3 queries of the Step 2 pilot run (`runs/live-20261014-114302`,
+    Phase 1 tuning targets, neither dev nor test), with every variant. It
+    checks parsing, tokens, cost and latency. If RS would cost more than $20
+    on the 200 queries, stop and report.
+  - **Selection, on the dev set** (the 120 queries of
+    `runs/live-20261014-122144`):
+    - The product variant with the best Hit@5 becomes **L5r**, if its Hit@5 is
+      above L5w's. Ties go to the higher MRR@20, then to the order R1, R2, R3.
+    - If no variant beats L5w, there is no L5r and L5w stays.
+    - The dev-set comparisons are exploratory.
+  - **Test, on the test set** (the 80 queries of `runs/live-20261015-000815`):
+    - **Decides**: L5r vs L5w, with ΔHit@5 and the exact McNemar test at
+      α = 0.05. MRR@20 supports, with a paired bootstrap 95% CI.
+    - **If significant and positive**: the reranker joins the default check.
+    - **If positive but not significant**: reported as not confirmed, and the
+      decision is left to the author.
+    - **Exploratory**: the other variants and RS against L5w, RS against L5r,
+      and RS on the originals from 2026-07-01.
+  - **Reported on both sets**:
+    - Hit@1/5/10 and MRR@20 for L5, L5w, R1–R3 and RS;
+    - the share of queries whose original is among the candidates (the
+      ceiling of any reranker);
+    - the number of candidates;
+    - unreadable replies;
+    - the reranker's cost per check (mean, median, p95, max) and the whole
+      check's cost against the $0.10 cap;
+    - the rerank call's latency.
+  - **Spend**: the R1–R3 calls go to `run.budget_cap`'s ledger
+    (`data/cache/llm.sqlite`), at about $1 for 400 calls. RS has its own cap.
+  - **Pilot result (2026-10-15)**, `runs/rerank-20261015-131744`: every reply
+    was readable. A check cost $0.0014 more with Qwen, which adds 5–9 s. RS cost
+    $0.031 a check, about $6 for the 200, so it went ahead.
+  - **Selection result (2026-10-15)**, from `python -m rk rerank` on the dev
+    set (`runs/rerank-20261015-132644`). The replay reproduced all 120 recorded
+    L5 rankings.
+    - **Hit@5**: L5 0.700, L5w 0.750, R1 0.850, R2 0.808, R3 0.850, and RS
+      0.858 (not eligible).
+    - **The ceiling**: the original was among the candidates in 103 of 120
+      checks (0.858).
+    - **Choice**: R1 and R3 tie on Hit@5, and R1 wins the MRR@20 tie-break
+      (0.842 against 0.758), so **L5r = R1, listwise**.
+    - **Against L5w on the dev set**: +0.100 Hit@5 (13 queries gained, 1
+      lost, McNemar p = 0.002). This is exploratory; the test set decides.
+  - **Test result (2026-10-15)**, `runs/rerank-20261015-140923`.
+    - **L5r vs L5w**: Hit@5 0.863 against 0.700, +0.163 (13 / 0, p = 0.0002),
+      and MRR@20 +0.228. This is confirmed.
+    - **So**: the default check becomes L5r (L5w, then R1's rerank) once the
+      live pipeline has it.
+    - **RS** (0.875) is one query ahead of R1.
+    - **Report**: docs/reports/phase2-step4-rerank.md.
 - Explainer check: run 10 full checks, export a CSV for hand review (results
   useful? explanations correct?), and report the quote-verification rate.
 - The Phase 1 frozen benchmark stays runnable as a regression test.
@@ -216,10 +324,16 @@ no fabricated citations.
    budget allows; see Evaluation.)*
 3. Competitive evaluation: landscape doc, automated head-to-head on 100
    queries, manual comparison sheet for the author.
-4. Overlap explainer + quote verification + vocabulary map + report schema.
+4. Rerank: up to three cheap LLM rerank variants and a Sonnet upper bound,
+   evaluated offline on the cached checks (chosen on dev, confirmed on test).
+   *(Added on 2026-10-15, before the explainer; see Evaluation.)*
+5. Overlap explainer + quote verification + vocabulary map + report schema.
    Tests with FakeLLM. Hand check on 10 checks.
-5. FastAPI + SQLite + background worker + web page. Tests with TestClient.
-6. User README ("how to run, what it does, what it doesn't"), screenshots,
+6. FastAPI + SQLite + background worker + web page. Tests with TestClient.
+   *Decided on 2026-10-15:* a failed or timed-out agent search is skipped with
+   a warning instead of failing the whole check. Evaluation stays strict: there,
+   a failed agent search is an error row.
+7. User README ("how to run, what it does, what it doesn't"), screenshots,
    demo. Optional: Dockerfile built and tested in GitHub Actions.
 
 ## Product ideas (not built yet)
@@ -229,7 +343,8 @@ no fabricated citations.
   pipeline. In the pilot, L1 had Hit@5 0.700 against L5's 0.833.
   *Decided on 2026-10-15, after the L5w test run:*
   - **Default check**: L5w. The reranker joins it if it wins on the test set
-    in the rerank evaluation that comes before the explainer.
+    in the rerank evaluation that comes before the explainer. *(It did, on
+    2026-10-15, so the default is L5r: L5w with R1's listwise rerank.)*
   - **Preview**: L1 is shown at once, as a first preview, while the full check
     runs. L1 alone is not the default: it trailed L5w by 8.7 points of Hit@5 on
     the test set and by 11.7 on the dev set.
@@ -263,6 +378,26 @@ no fabricated citations.
       them.
   - **Cost**: about $0.17 a check, over the $0.10 hard cap of a default
     check, so the deep check needs a cap of its own.
+  - **Exploratory preview on the test set** (requested on 2026-10-15, after
+    Step 4; recorded here before any call). It decides nothing: 39 of these
+    queries were in Step 3's sample, which the design came from.
+    - **Queries**: the 80 test queries of `runs/live-20261015-000815`.
+    - **The default check is now L5r**: its top 10 come from Step 4's test
+      run (`runs/rerank-20261015-140923`, R1).
+    - **Sonnet's answers**: from a compete run on the same 80 queries, with
+      Step 3's settings. 39 are in Step 3's cache; 41 are new calls.
+    - **Cap**: $11.61 of new spend. This is the requested $15, lowered so that
+      the Anthropic total by our count stays under the workspace's $95
+      limit (the compete group cap set to $88).
+    - **Reported**: the deep check against L5r alone, on Hit@1, Hit@5 (with
+      the exact McNemar test), Hit@10, MRR@10, the unverified share of the
+      merged top 10, and cost and latency per check.
+    - **Hit@1 is equal by construction**: the merged list starts with L5r's
+      first paper.
+    - **Result** (`runs/compete-20261015-162116`; see
+      [the rerank report](reports/phase2-step4-rerank.md)): Hit@5 0.900
+      against L5r's 0.863 (4 / 1, McNemar p = 0.375), at $0.166 a check and
+      $6.45 of new spend. Nothing is decided.
 
 ## Out of scope for Phase 2
 Docker as a requirement, user accounts, scoop alerts, `.bib` missing-citation check, the MCP server,

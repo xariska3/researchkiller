@@ -90,3 +90,10 @@ and browse to http://127.0.0.1:5000.
     attempts (275 of 344).
 
   Details are in [docs/reports/full-run.md](docs/reports/full-run.md).
+- **The benchmark suits an LLM reranker.** Each benchmark proposal is a
+  paraphrase of one specific abstract. An LLM reranker that reads the proposal
+  and each candidate's abstract may recognise that paraphrase more easily than
+  it would recognise the work closest to a real researcher's idea. The live
+  tool's reranker raised Hit@5 from 0.700 to 0.863 on the 80 test queries. On
+  real ideas, the gain may be smaller. Details are in
+  [docs/reports/phase2-step4-rerank.md](docs/reports/phase2-step4-rerank.md).
