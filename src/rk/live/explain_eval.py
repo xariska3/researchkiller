@@ -10,12 +10,13 @@ measures, tuning nothing on them:
 - **cost and time per check**, and how often a step fell back.
 
 The searches read OpenAlex's cache as an evaluation does (they never expire), so on
-queries live-eval has checked, the searches and the agent and rerank calls come from
-the caches; only the keyword lookups and the explainer calls are new. The check's own
-time is then not a live time. With `timing_run` (Step 4's rerank run on the same
-checks), each check's live time is estimated as its recorded check time (the live run's
-L5w row), plus its recorded rerank call, plus this run's snippet, keyword, explainer and
-vocabulary stages.
+queries live-eval has checked (with that run's live settings: a search whose filter
+differs isn't cached), the searches and the agent and rerank calls come from the
+caches; only the keyword lookups and the explainer calls are new. The check's own time
+is then not a live time. With `timing_run` (Step 4's rerank run on the same checks),
+each check's live time is estimated as its recorded check time (the live run's L5w
+row, or L5's), plus its recorded rerank call, plus this run's snippet, keyword,
+explainer and vocabulary stages.
 
 Writes runs/explain-<timestamp>/ (run.json, results.jsonl with one row per check,
 reports/<qid>.json, summary.json, summary.md) and a CSV for hand review: the first
@@ -91,10 +92,12 @@ class ExplainEvalRun:
 
 
 def recorded_times(timing_run: Path, results_db: Path) -> dict[str, dict[str, float | None]]:
-    """Per qid: the live run's recorded L5w check time and Step 4's R1 rerank call time.
+    """Per qid: the live run's recorded check time and Step 4's R1 rerank call time.
 
     `timing_run` is a rerank run (runs/rerank-<timestamp>); its run.json names the live
-    run, whose L5w rows are in `results_db`. A cached rerank call has no time (None).
+    run, whose rows are in `results_db`. The check time is its L5w row's, or its L5
+    row's in a run from before L5w (the same check: L5w only ranks its pool another
+    way). A cached rerank call has no time (None).
     """
     meta = json.loads((timing_run / RUN_FILE).read_text(encoding="utf-8"))
     if meta.get("kind") != "rerank":
@@ -103,11 +106,11 @@ def recorded_times(timing_run: Path, results_db: Path) -> dict[str, dict[str, fl
     times: dict[str, dict[str, float | None]] = {}
     with closing(sqlite3.connect(results_db)) as conn:
         rows = conn.execute(
-            "SELECT qid, latency_s FROM live_query_results "
-            "WHERE run_id = ? AND config = 'L5w' AND status = 'ok'",
+            "SELECT qid, config, latency_s FROM live_query_results "
+            "WHERE run_id = ? AND config IN ('L5', 'L5w') AND status = 'ok' ORDER BY config",
             (live_run,),
         )
-        for qid, latency in rows:
+        for qid, _, latency in rows:  # L5w after L5, so it wins where both exist
             times[qid] = {"check_s": latency, "rerank_s": None}
     lines = (timing_run / "results.jsonl").read_text(encoding="utf-8").splitlines()
     for row in map(json.loads, lines):

@@ -19,7 +19,15 @@ from bench_data import ABSTRACTS, GOOD, T1, T2, T3, TITLES, corpus_records, judg
 from conftest import TEST_API_KEY_ENV, FakeEncoder, FakeLLM
 from live_fakes import LIST_COST, FakeLiveOpenAlex, oa_work
 from pydantic import ValidationError
-from test_live_eval import B1_RANKS, B5_RANKS, _config_dict, _paraphraser, _phase1_run, _search
+from test_live_eval import (
+    B1_RANKS,
+    B5_RANKS,
+    _config_dict,
+    _paraphraser,
+    _phase1_run,
+    _rows,
+    _search,
+)
 from test_live_eval import agent as fake_agent
 from test_rerank import dated_corpus, original_first, rerank_dict
 
@@ -555,17 +563,21 @@ def evaluate(cfg: Config, tmp_path: Path, **kwargs: Any) -> Any:
 
 def test_explain_eval_measures_quotes_overlap_cost_and_time(bench: Config, tmp_path: Path) -> None:
     assert bench.live is not None and bench.explain is not None
-    # Step 2's live run and Step 4's rerank run on the same checks, for the timing.
+    # Step 2's live run (L5 rows only, as the dev run has) and Step 4's rerank run on the
+    # same checks, for the timing.
     live = run_live_eval(
         bench, fake_agent(), FakeEncoder(), _search(bench, FakeLiveOpenAlex(works())),
-        configs=["L5", "L5w"], log_mlflow=False,
+        configs=["L5"], log_mlflow=False,
     )
     rerank = run_rerank(
         bench, live.run_dir, encoder=FakeEncoder(),
         clients={PRODUCT_MODEL: FakeLLM(original_first)}, variants=[R1],
     )
     times = recorded_times(rerank.run_dir, bench.run.results_db)
-    assert len(times) == 3 and all(t["check_s"] and t["rerank_s"] for t in times.values())
+    rows_l5 = _rows(bench, live.run_dir).values()
+    l5 = {row["qid"]: row["latency_s"] for row in rows_l5 if row["config"] == "L5"}
+    assert {q: t["check_s"] for q, t in times.items()} == l5
+    assert len(times) == 3 and all(t["rerank_s"] for t in times.values())
     done = evaluate(bench, tmp_path, limit=3, review_n=2, timing_run=rerank.run_dir)
     s = done.summary
     assert (s["n_checks"], s["n_ok"], s["over_cap"]) == (3, 3, 0)
