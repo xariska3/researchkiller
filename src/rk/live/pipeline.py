@@ -22,7 +22,10 @@ check with its final pool ranked by L5w's fusion (DEFAULT_FUSION), then reranked
 one listwise LLM call (with_rerank, rk.live.reranker). The rerank call is charged to
 the check's ledger under the same cap. If it could cross the cap, fails, or its
 reply has no readable ranking, the check keeps L5w's order and carries a warning;
-in evaluation (strict), a failed call raises instead.
+in evaluation (strict), a failed call raises instead. The quick check (quick_check)
+is L1: one semantic search, reranked locally, with no LLM.
+
+rk.live.check runs a whole check: one of these, then what it shows for its top papers.
 """
 
 from __future__ import annotations
@@ -35,11 +38,19 @@ from typing import Any
 
 from rk.agent import AgentRetriever
 from rk.config import Config, LiveConfig, ModelConfig
-from rk.live.fusion import B5, L1_L5, PROPOSAL_EQUAL, final_ranking, l1_ranking
+from rk.live.fusion import (
+    B5,
+    L1_L5,
+    PROPOSAL_EQUAL,
+    PROPOSAL_ONLY,
+    final_ranking,
+    l1_ranking,
+)
 from rk.live.openalex_search import (
     KEYWORD,
     SEARCH_COST_USD,
     SEMANTIC,
+    KeywordLookup,
     LiveSearchClient,
     SearchResponse,
 )
@@ -108,6 +119,11 @@ class CheckLedger:
         self.openalex_spent += response.money_spent
         self.searches += 1
         self.searches_sent += not response.cached
+
+    def add_lookup(self, lookup: KeywordLookup) -> None:
+        """Another OpenAlex call that isn't a search (the vocabulary map's keywords)."""
+        self.openalex_cost += lookup.cost_usd
+        self.openalex_spent += lookup.money_spent
 
 
 class CappedChatModel:
@@ -439,6 +455,46 @@ def live_search(
         encoder_device=encoder.device,
         pool=pool,
         fusion=fusion,
+    )
+
+
+def quick_check(
+    text: str,
+    cfg: Config,
+    *,
+    search: LiveSearchClient,
+    encoder: Encoder,
+    before: date | None = None,
+) -> LiveSearchResult:
+    """The quick check, L1: one OpenAlex semantic search of `text`, reranked locally. No LLM.
+
+    The results go into a pool of their own, ranked by its hybrid ranker for `text`
+    (the final pool ranked by the proposal alone), as live-eval's L1 ranks them.
+    """
+    live = cfg.live
+    if live is None:
+        raise ValueError("the config has no live: section")
+    start = time.perf_counter()
+    ledger = CheckLedger(live.cost_cap_per_check)
+    pool = CandidatePool(encoder, max_size=live.max_pool_size)
+    ledger.require(SEARCH_COST_USD, "a semantic search")
+    response = search.search(text, SEMANTIC, before=before)
+    ledger.add_search(response)
+    pool.add(response.records, query_index=0, kind=SEMANTIC)
+    return LiveSearchResult(
+        text=text,
+        before=before,
+        candidates=ranked_candidates(pool, pool.rank(text), live.top_k),
+        trace=Trace(queries=[text], budget_used=1),
+        searches=[response],
+        pool_size=len(pool),
+        pool_dropped=pool.dropped,
+        ledger=ledger,
+        latency_s=time.perf_counter() - start,
+        encoder=encoder.name,
+        encoder_device=encoder.device,
+        pool=pool,
+        fusion=PROPOSAL_ONLY,
     )
 
 

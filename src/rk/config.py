@@ -179,7 +179,7 @@ class LiveConfig:
     keyword_max_words: int = 32
     max_pool_size: int = 500  # distinct candidates kept, in order of arrival
     top_k: int = 20  # kept after the local rerank
-    explain_top_k: int = 10  # papers the overlap explainer covers (Step 3)
+    explain_top_k: int = 10  # papers with a snippet and an explanation (Step 5)
     cost_cap_per_check: float = 0.10  # USD, OpenAlex + LLM method cost; hard cap
     openalex_timeout_s: float = 30.0  # per HTTP request
     # OpenAlex work types kept (https://help.openalex.org/data/work-types/); datasets,
@@ -384,6 +384,28 @@ class RerankConfig:
 
 
 @dataclass(frozen=True)
+class ExplainConfig:
+    """Phase 2 Step 5: what a check shows for its top papers (docs/phase2_spec.md).
+
+    `model` explains the top live.explain_top_k papers in one call: the judge's model
+    (validated in Phase 1), with room for one answer per paper. Its calls share
+    run.cache_path and run.budget_cap with every other command. `cost_cap_per_check`
+    caps a whole check of `python -m rk check` (searches, agent, rerank and explainer);
+    live-eval keeps live.cost_cap_per_check.
+    """
+
+    model: ModelConfig
+    abstract_chars: int = 2000  # each paper's abstract is cut at this many characters
+    cost_cap_per_check: float = 0.03  # USD, method cost of the whole check; hard cap
+    vocabulary_terms: int = 10  # the vocabulary map's terms, over all its groups
+
+    def __post_init__(self) -> None:
+        _require(self.abstract_chars >= 1, "abstract_chars must be >= 1")
+        _require(self.cost_cap_per_check > 0, "cost_cap_per_check must be > 0")
+        _require(self.vocabulary_terms >= 1, "vocabulary_terms must be >= 1")
+
+
+@dataclass(frozen=True)
 class Config:
     corpus: CorpusConfig
     bench: BenchConfig
@@ -395,6 +417,7 @@ class Config:
     live: LiveConfig | None = None  # Phase 2; the Phase 1 commands don't need it
     compete: CompeteConfig | None = None  # Phase 2 Step 3: python -m rk compete
     rerank: RerankConfig | None = None  # Phase 2 Step 4: python -m rk rerank
+    explain: ExplainConfig | None = None  # Phase 2 Step 5: python -m rk check
 
     def models(self) -> dict[str, ModelConfig]:
         return {"paraphraser": self.paraphraser, "judge": self.judge, "agent": self.agent}
@@ -404,6 +427,8 @@ class Config:
         check_training_cutoffs(self.bench.target_from_date, self.models())
         if self.rerank is not None:  # the product reranker must not have seen the originals
             check_training_cutoffs(self.bench.target_from_date, {"rerank": self.rerank.model})
+        if self.explain is not None:  # nor the explainer, which grades them
+            check_training_cutoffs(self.bench.target_from_date, {"explain": self.explain.model})
 
 
 def check_model_independence(models: dict[str, ModelConfig]) -> None:

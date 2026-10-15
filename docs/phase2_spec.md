@@ -275,6 +275,32 @@ design live, and keeps the Phase 1 benchmark as a regression test.
     - **Report**: docs/reports/phase2-step4-rerank.md.
 - Explainer check: run 10 full checks, export a CSV for hand review (results
   useful? explanations correct?), and report the quote-verification rate.
+  *Step 5 decisions, declared on 2026-10-15 before any explainer call:*
+  - **The command**: `python -m rk explain-eval` runs whole default checks with
+    the explainer (`rk.live.check.run_check`) on the **first 20 dev queries**
+    in seeded order, from A0045. Report only: nothing is tuned on it.
+  - **Caches**: the searches read OpenAlex's cache as an evaluation does, so
+    the searches and the agent and rerank calls replay Step 2's and Step 4's
+    dev checks. The keyword lookups and the explainer calls are new.
+  - **Measures**:
+    - **the quote-verification rate**: explained papers whose evidence
+      sentence is in the abstract verbatim (whitespace and quotation marks
+      normalised, at least 5 words);
+    - **the original's overlap level** when it is among the explained top 10
+      (it should be "high");
+    - **cost per check**, with the explainer: median, p95 and max;
+    - **time per check**, estimated as the recorded check time (the dev
+      live run's L5w row), plus the recorded rerank call (Step 4's dev rerank
+      run), plus this run's snippet, keyword, explainer and vocabulary stages;
+    - **fallbacks**: the rerank and explainer steps, partial explanations and
+      failed keyword lookups.
+  - **Caveat**: every benchmark proposal was accepted by the same Mistral
+    model, as keeping all four facets of its original. So "the original is
+    high" is expected, and is a consistency check, not an independent one.
+  - **Hand review**: `docs/evaluation/explainer_review.csv` holds the first
+    10 of the 20 checks, one row per top-5 paper, with empty columns for
+    correct?, useful? and false alarm?.
+  - **Spend cap**: $0.50 of new LLM spend; the expected spend is about $0.12.
 - The Phase 1 frozen benchmark stays runnable as a regression test.
 
 ## Competitive evaluation: is it better than what researchers already use?
@@ -341,6 +367,20 @@ no fabricated citations.
      fallbacks.
 5. Overlap explainer + quote verification + vocabulary map + report schema.
    Tests with FakeLLM. Hand check on 10 checks.
+   *Built on 2026-10-15* (`rk.live.check`, `rk.live.explain`, `rk.live.vocab`,
+   `rk.live.report`; `python -m rk check --file idea.txt [--quick]`):
+   - **Snippets**: every top-10 paper gets the abstract sentence closest to
+     the idea (Qwen3-Embedding), in the quick check too.
+   - **The explainer**: one call to the judge's model (Mistral Medium 3.1,
+     `explain.model`), strict JSON per paper. A quote not found in the abstract
+     is dropped, and the paper is marked unverified. A failed or unreadable
+     call leaves the snippets, with a warning.
+   - **The vocabulary map**: rule-based, with no LLM. Terms come from the top
+     papers' OpenAlex keywords (one extra list call by id, $0.0001), their
+     titles and the agent's queries, grouped by source and capped at 10.
+   - **The cap**: a whole check of `rk check` is capped at
+     `explain.cost_cap_per_check` ($0.03); live-eval keeps
+     `live.cost_cap_per_check`.
 6. FastAPI + SQLite + background worker + web page. Tests with TestClient.
    *Decided on 2026-10-15:* a failed or timed-out agent search is skipped with
    a warning instead of failing the whole check. Evaluation stays strict: there,
