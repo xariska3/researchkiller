@@ -227,6 +227,42 @@ no fabricated citations.
   mode is L1: one OpenAlex semantic call and the local rerank, with no LLM, in
   about 1–2 s. It would sit next to the "thorough check", L5, the full
   pipeline. In the pilot, L1 had Hit@5 0.700 against L5's 0.833.
+  *Decided on 2026-10-15, after the L5w test run:*
+  - **Default check**: L5w. The reranker joins it if it wins on the test set
+    in the rerank evaluation that comes before the explainer.
+  - **Preview**: L1 is shown at once, as a first preview, while the full check
+    runs. L1 alone is not the default: it trailed L5w by 8.7 points of Hit@5 on
+    the test set and by 11.7 on the dev set.
+- **Deep check** (pre-declared on 2026-10-15, after Step 3; not built yet): an
+  opt-in mode that adds one web-search LLM call to the default check.
+  - **Why**: in Step 3 the two kinds of system were complementary. Ours found
+    39 of 41 originals in the easiest bucket, Opus 10 of 16 in the hardest.
+    Ours' or the LLM's top 5 held the original on 87 of 100 queries with Opus
+    and 85 with Sonnet, against 72 for ours alone (exploratory).
+  - **The call**: Claude Sonnet 5.5 with web search (`max_searches` 10), given
+    Step 3's prompt (`src/rk/prompts/compete.txt`). It runs in parallel with
+    the default check. Sonnet is chosen over Opus for its cost, at about $0.16
+    against $0.29 a query, with 85 against 87 of 100 together.
+  - **Merging**: the two top-10 lists are interleaved, starting with ours'
+    first paper.
+    - A paper already listed is skipped. Papers are the same if they share an
+      OpenAlex id, a DOI or a normalised title, as in
+      `rk.live.pool.match_original`.
+    - Every LLM paper goes through Step 3's free resolution routes. One that
+      no route verifies is kept but marked "unverified". Ours' papers are
+      OpenAlex records.
+    - The merged list is cut to 10.
+  - **Evaluation (later)**: the deep check (A) against the default check alone
+    (B), paired on the same queries.
+    - **Primary**: Hit@5 with the exact McNemar test.
+    - **Also reported**: Hit@10, MRR@10, the share of unverified papers in the
+      merged top 10, and cost and latency per check.
+    - **Queries**: new ones, from A0288 onward in seeded order. The 200
+      queries checked in Step 2 can be scored for free from the caches, but
+      only as an exploratory preview, since this design came from looking at
+      them.
+  - **Cost**: about $0.17 a check, over the $0.10 hard cap of a default
+    check, so the deep check needs a cap of its own.
 
 ## Out of scope for Phase 2
 Docker as a requirement, user accounts, scoop alerts, `.bib` missing-citation check, the MCP server,
