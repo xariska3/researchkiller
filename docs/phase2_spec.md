@@ -336,6 +336,12 @@ no fabricated citations.
 7. User README ("how to run, what it does, what it doesn't"), screenshots,
    demo. Optional: Dockerfile built and tested in GitHub Actions.
 
+**Backlog** (decided on 2026-10-15):
+- **Retrieval improvements** are deferred until after the explainer and the
+  web app. Of the originals missing from L5r's candidates, 24 of 27 on the dev
+  and test sets (8 of 10 on the test set) never came back from any OpenAlex
+  search.
+
 ## Product ideas (not built yet)
 - **Quick check vs thorough check** (from the Step 2 pilot): a "quick check"
   mode is L1: one OpenAlex semantic call and the local rerank, with no LLM, in
@@ -350,6 +356,8 @@ no fabricated citations.
     the test set and by 11.7 on the dev set.
 - **Deep check** (pre-declared on 2026-10-15, after Step 3; not built yet): an
   opt-in mode that adds one web-search LLM call to the default check.
+  *Decided on 2026-10-15, after the preview below:* it isn't built for now,
+  and the rest of the Anthropic credit is left to expire.
   - **Why**: in Step 3 the two kinds of system were complementary. Ours found
     39 of 41 originals in the easiest bucket, Opus 10 of 16 in the hardest.
     Ours' or the LLM's top 5 held the original on 87 of 100 queries with Opus
