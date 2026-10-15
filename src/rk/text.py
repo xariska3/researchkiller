@@ -314,6 +314,50 @@ def opening(text: str, chars: int) -> str:
     return text[:chars].rsplit(" ", 1)[0] + " …"
 
 
+# A sentence ends at ., ! or ? (and any closing quote or bracket) before whitespace and
+# a capital, a digit or an opening quote or bracket, unless the word is an abbreviation;
+# or at a full stop between a lower-case letter, digit or closing bracket and a capital,
+# where the space was lost ("datasets.We propose", common in OpenAlex abstracts).
+_SENTENCE_END_RE = re.compile(
+    r"[.!?]+[\"'”’)\]]*\s+(?=[A-Z0-9\"'“‘(\[])|(?<=[a-z0-9)\]])\.(?=[A-Z])"
+)
+_ABBREVIATIONS = frozenset({
+    "al", "approx", "cf", "dr", "e.g", "eq", "eqs", "etc", "fig", "figs", "i.e", "inc", "no",
+    "prof", "ref", "refs", "resp", "sec", "vs",
+})
+
+
+def sentence_spans(text: str) -> list[tuple[int, int]]:
+    """Where each sentence of a text starts and ends (see `sentences`), in order."""
+    spans, start = [], 0
+    for match in _SENTENCE_END_RE.finditer(text):
+        words = text[start : match.start()].split()
+        last = words[-1].lower().lstrip("(\"'“‘") if words else ""
+        if last in _ABBREVIATIONS or (len(last) == 1 and last.isalpha()):
+            continue
+        spans.append((start, match.end()))
+        start = match.end()
+    spans.append((start, len(text)))
+    stripped = []
+    for begin, end in spans:  # without the whitespace around each sentence
+        piece = text[begin:end]
+        begin += len(piece) - len(piece.lstrip())
+        end -= len(piece) - len(piece.rstrip())
+        if end > begin:
+            stripped.append((begin, end))
+    return stripped
+
+
+def sentences(text: str) -> list[str]:
+    """A text's sentences, each exactly as written in it (a substring), in order.
+
+    Splits after ., ! or ? followed by a space and a capital or digit, and at a full
+    stop followed directly by a capital ("datasets.We"), but not after an abbreviation
+    ("et al.", "e.g.", "Fig.") or a single letter (an initial).
+    """
+    return [text[begin:end] for begin, end in sentence_spans(text)]
+
+
 def reconstruct_abstract(inverted_index: Mapping[str, Sequence[int]] | None) -> str:
     """Rebuild an abstract from OpenAlex's `abstract_inverted_index` (word -> positions)."""
     if not inverted_index:

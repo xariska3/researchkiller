@@ -69,6 +69,10 @@ The cache keeps every response it ever fetched. The live tool reads the newest
 one if it is younger than live.cache_ttl_days and fetches again otherwise;
 evaluation runs read the first one ever cached, so they never expire and a
 rerun sees the same responses.
+
+A check's vocabulary map also reads its top papers' OpenAlex keywords (`keywords`):
+one list call filtered by ids.openalex (a list+filter call, $0.0001), cached the
+same way. Searches don't select keywords, so their cached responses stay valid.
 """
 
 from __future__ import annotations
@@ -78,7 +82,7 @@ import json
 import os
 import sqlite3
 import time
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -87,11 +91,21 @@ from typing import Any
 import httpx
 
 from rk.config import SEMANTIC_MAX_RESULTS, Config, LiveConfig
-from rk.corpus import OpenAlexClient, OpenAlexError, short_id, to_record
+from rk.corpus import (
+    IDS_PER_CALL,
+    LIST_CALL_USD,
+    OpenAlexClient,
+    OpenAlexError,
+    short_id,
+    to_record,
+)
 from rk.targets import Record
 
 KEYWORD, SEMANTIC = "keyword", "semantic"
 SEARCH_COST_USD = 0.001  # documented price of one keyword or semantic search call
+# The OpenAlex keywords of a check's top papers, for its vocabulary map: one list call by
+# id. Searches don't select them, so that their cached responses stay valid.
+KEYWORDS_SELECT = "id,keywords"
 SEMANTIC_MAX_CHARS = 2000  # OpenAlex uses only the first 2,000 characters
 KEYWORD_REQUESTS_PER_SECOND = 10.0  # the keyless limit, so it holds with or without a key
 SEMANTIC_REQUESTS_PER_SECOND = 1.0
@@ -201,6 +215,19 @@ class SearchResponse:
     cached: bool
     fetched_at: datetime  # when OpenAlex sent this response
     params: dict[str, str] = field(repr=False)
+
+    @property
+    def money_spent(self) -> float:
+        return 0.0 if self.cached else self.cost_usd
+
+
+@dataclass(frozen=True)
+class KeywordLookup:
+    """The OpenAlex keywords of some works, from one list call (LiveSearchClient.keywords)."""
+
+    keywords: dict[str, list[str]]  # work id -> its keywords' display names, in OpenAlex's order
+    cost_usd: float  # what the call costs (method cost), also when served from the cache
+    cached: bool
 
     @property
     def money_spent(self) -> float:
@@ -363,6 +390,37 @@ class LiveSearchClient:
             query, kind, records, len(works), cost, hit is not None, fetched_at, params
         )
 
+    def keywords(self, ids: Sequence[str]) -> KeywordLookup:
+        """The keywords of up to IDS_PER_CALL works by OpenAlex id: one list call, cached.
+
+        A work OpenAlex doesn't return, or one without keywords, gets none.
+        """
+        if len(ids) > IDS_PER_CALL:
+            raise ValueError(f"at most {IDS_PER_CALL} ids per call, got {len(ids)}")
+        if not ids:
+            return KeywordLookup({}, 0.0, True)
+        params = {
+            "filter": f"ids.openalex:{'|'.join(ids)}",
+            "per_page": str(len(ids)),
+            "select": KEYWORDS_SELECT,
+        }
+        hit = self.cache.get(params, max_age=self.max_age)
+        if hit is None and self.offline:
+            raise OpenAlexError(f"offline, and this keyword lookup isn't cached: {ids[:3]}")
+        if hit is None:
+            data = self._clients[KEYWORD].get_works(params)
+            cost = _reported_cost(data, LIST_CALL_USD)
+            self.cache.put(params, data, cost)
+        else:
+            data, cost = hit.response, hit.cost_usd
+        found: dict[str, list[str]] = {}
+        for work in data.get("results") or []:
+            if not work.get("id"):
+                continue
+            names = [k.get("display_name") for k in work.get("keywords") or [] if k]
+            found[short_id(work["id"])] = [n for n in names if isinstance(n, str) and n.strip()]
+        return KeywordLookup(found, cost, hit is not None)
+
     def budget(self) -> Budget:
         """Today's OpenAlex budget for the API key (a free /rate-limit call)."""
         data = self._clients[KEYWORD].rate_limit()
@@ -380,9 +438,9 @@ class LiveSearchClient:
             client.close()
 
 
-def _reported_cost(data: dict[str, Any]) -> float:
+def _reported_cost(data: dict[str, Any], documented: float = SEARCH_COST_USD) -> float:
     """meta.cost_usd as OpenAlex reports it, or the documented price if it's missing."""
     value = (data.get("meta") or {}).get("cost_usd")
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return float(value)
-    return SEARCH_COST_USD
+    return documented

@@ -16,6 +16,7 @@ dependencies = [
     "faiss-cpu",
     "mlflow",
     "python-dotenv",
+    "pydantic>=2",  # the check's report schema (docs/phase2_spec.md, Architecture)
 ]
 
 [project.optional-dependencies]

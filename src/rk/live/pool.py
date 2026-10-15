@@ -8,7 +8,9 @@ only if all three hold: title Jaccard >= 0.8 (on content stems, the
 tokenisation BM25 and the leak filter use), at least one shared author, and
 publication years at most 1 apart. Authors are the same if they share an
 OpenAlex author id, or if every token of the shorter name (2 tokens or more)
-is in the other name, since an author id can be missing.
+is in the other name, since an author id can be missing. A check's final list
+(rk.live.pipeline.merge_same_text) also merges versions by their text alone
+(same_text): similar titles and abstracts that share most sentences.
 
 The pool is then ranked like Phase 1's B3 over the frozen corpus, with the pool
 as the corpus: BM25 (rk.retrieval tokenisation) and the dense encoder each rank
@@ -44,15 +46,50 @@ from rk.retrieval import (
     fuse_runs,
 )
 from rk.targets import Record, id_number
-from rk.text import content_stems, normalize_title
+from rk.text import content_stems, normalize_title, sentences, tokenize
 
 NEAR_DUPLICATE_MIN_JACCARD = 0.8
 NEAR_DUPLICATE_MAX_YEAR_GAP = 1
+# Versions by their text alone (same_text), for a check's final list: chosen on the
+# Step 5 dev checks, where a preprint and its journal version (A0053) rewrote every
+# sentence a little, so no sentence was identical.
+SAME_TEXT_MIN_TITLE_JACCARD = 0.7
+SAME_TEXT_MIN_SENTENCE_JACCARD = 0.5
 Author = Mapping[str, Any]  # {"id": OpenAlex author id or None, "name": display name}
 
 
 def _jaccard(x: set[str], y: set[str]) -> float:
     return len(x & y) / len(x | y) if x | y else 0.0
+
+
+def shared_sentences(a: str, b: str) -> float:
+    """The share of the shorter abstract's sentences that the other has, reworded or not.
+
+    A sentence is shared if a sentence of the other abstract has a word-set Jaccard of
+    at least SAME_TEXT_MIN_SENTENCE_JACCARD with it (words: rk.text.tokenize).
+    """
+    first = [s for s in (set(tokenize(t)) for t in sentences(a)) if s]
+    second = [s for s in (set(tokenize(t)) for t in sentences(b)) if s]
+    if not first or not second:
+        return 0.0
+    short, other = (first, second) if len(first) <= len(second) else (second, first)
+    found = sum(
+        any(_jaccard(s, o) >= SAME_TEXT_MIN_SENTENCE_JACCARD for o in other) for s in short
+    )
+    return found / len(short)
+
+
+def same_text(a: Record, b: Record) -> bool:
+    """Whether two works are versions of one paper by their text, whoever the authors are.
+
+    Their titles' content stems have a Jaccard of at least SAME_TEXT_MIN_TITLE_JACCARD,
+    and their abstracts share most sentences: more than half of the shorter one's
+    (shared_sentences).
+    """
+    return (
+        title_jaccard(a["title"], b["title"]) >= SAME_TEXT_MIN_TITLE_JACCARD
+        and shared_sentences(a["abstract"], b["abstract"]) > 0.5
+    )
 
 
 def title_jaccard(a: str, b: str) -> float:

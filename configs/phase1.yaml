@@ -57,7 +57,7 @@ live:
   keyword_max_words: 32           # longer queries (the user's text) get semantic search only
   max_pool_size: 500              # distinct candidates; 5 queries x 100 results never exceed it
   top_k: 20                       # kept after the local hybrid rerank
-  explain_top_k: 10               # used by the overlap explainer (Step 3)
+  explain_top_k: 10               # snippets and the overlap explainer (Step 5)
   cost_cap_per_check: 0.10        # USD, OpenAlex + LLM; the check fails rather than exceed it
   openalex_timeout_s: 30
   # OpenAlex work types kept: papers, plus literature reviews, books, reports and
@@ -202,6 +202,26 @@ rerank:
     training_cutoff: 2026-06-30   # "Training data cutoff: Jun 2026"; exempt from the check
   upper_cache_path: data/cache/rerank_sonnet.sqlite   # its own cache and spend ledger
   upper_cost_cap: 20.0            # USD of the Anthropic credit (expires 2026-10-18 UTC)
+
+# Phase 2 Step 5: what a check shows for its top live.explain_top_k papers (python -m rk
+# check; docs/phase2_spec.md, Step 5): an abstract snippet each, one explainer call for
+# all of them, and a vocabulary map.
+explain:
+  abstract_chars: 2000            # as the rerank call's
+  cost_cap_per_check: 0.03        # USD, the whole check (live-eval keeps live's $0.10)
+  vocabulary_terms: 10
+  model:                          # the judge (validated in Phase 1), room for 10 answers
+    name: mistralai/mistral-medium-3.1
+    family: mistral
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+    provider: mistral             # lists structured_outputs, so the schema is kept
+    price_in_per_m: 0.40
+    price_out_per_m: 2.00
+    temperature: 0.0
+    max_tokens: 3500              # ~200 tokens per paper; a cut-off reply can't be read
+    seed: 42
+    training_cutoff: 2025-08-13
 
 run:
   out_dir: runs

@@ -275,6 +275,90 @@ design live, and keeps the Phase 1 benchmark as a regression test.
     - **Report**: docs/reports/phase2-step4-rerank.md.
 - Explainer check: run 10 full checks, export a CSV for hand review (results
   useful? explanations correct?), and report the quote-verification rate.
+  *Step 5 decisions, declared on 2026-10-15 before any explainer call:*
+  - **The command**: `python -m rk explain-eval` runs whole default checks with
+    the explainer (`rk.live.check.run_check`) on the **first 20 dev queries**
+    in seeded order, from A0045. Report only: nothing is tuned on it.
+  - **Caches**: the searches read OpenAlex's cache as an evaluation does, so
+    the searches and the agent and rerank calls replay Step 2's and Step 4's
+    dev checks. The keyword lookups and the explainer calls are new.
+  - **Measures**:
+    - **the quote-verification rate**: explained papers whose evidence
+      sentence is in the abstract verbatim (whitespace and quotation marks
+      normalised, at least 5 words);
+    - **the original's overlap level** when it is among the explained top 10
+      (it should be "high");
+    - **cost per check**, with the explainer: median, p95 and max;
+    - **time per check**, estimated as the recorded check time (the dev
+      live run's L5w row), plus the recorded rerank call (Step 4's dev rerank
+      run), plus this run's snippet, keyword, explainer and vocabulary stages;
+    - **fallbacks**: the rerank and explainer steps, partial explanations and
+      failed keyword lookups.
+  - **Caveat**: every benchmark proposal was accepted by the same Mistral
+    model, as keeping all four facets of its original. So "the original is
+    high" is expected, and is a consistency check, not an independent one.
+  - **Hand review**: `docs/evaluation/explainer_review.csv` holds the first
+    10 of the 20 checks, one row per top-5 paper, with empty columns for
+    correct?, useful? and false alarm?.
+  - **Spend cap**: $0.50 of new LLM spend; the expected spend is about $0.12.
+  - **Result (2026-10-15)**, `runs/explain-20261015-212527`:
+    - **Quotes**: 168 of 200 verified (84.0%). The other 32 are all edited real
+      sentences: a lead-in dropped, the end cut off, or a source artefact fixed.
+    - **The original**: rated high in 16 of 16 checks that had it in the top 10.
+    - **Cost**: median $0.0133 a check (max $0.0161).
+    - **Time**: about 31 s estimated live (median).
+    - **Fallbacks**: none.
+    - **Run settings**: the run used the dev run's `live.work_types` (from before
+      `software-paper`), so that its searches replay from the cache.
+    - **Report**: docs/reports/phase2-step5-explainer.md.
+  - **Hand review (2026-10-15)**: `docs/evaluation/explainer_review.csv`, 50
+    rows, reviewed by Claude (not the author).
+    - **False alarms**: 0 / 50.
+    - **Correct**: 40 yes, 9 partly, 1 no.
+    - **Useful**: 31 yes, 17 partly, 2 no.
+  - **Product fixes, decided on 2026-10-15** after looking at those 20 dev
+    checks and the hand review, so they are labelled as such:
+    1. **Quotes**:
+       - The prompt asks for the evidence sentence exactly, from its first word.
+       - The code shows the abstract's own sentence, never the explainer's
+         version: verified-exact if the quote is in it verbatim, verified-matched
+         if it has at least 90% of the quote's words, otherwise unverified (the
+         snippet).
+       - The 5-word minimum stays.
+    2. **Vocabulary**: phrases end at the function words using, based, via,
+       with, for, by and through, and a phrase ending in one is dropped.
+    3. **"Differs"**: either a substantive difference, or exactly "No
+       substantive difference found." It is never publication status, or the
+       proposal being a plan.
+    4. **Sentences**: a full stop followed directly by a capital ends a sentence
+       ("datasets.We"). A snippet is cut at about 350 characters, at a word,
+       with "…".
+    5. **Near-duplicates in a check's final list**: two results merge when their
+       titles' content stems have a Jaccard of at least 0.7 and their abstracts
+       share most sentences, with or without a shared author.
+       - **Shared sentences**: more than half of the shorter abstract's
+         sentences, where a sentence is shared if the other abstract has one
+         with a word-set Jaccard of at least 0.5.
+       - **Why not exact**: the example (A0053, ranks 4 and 5) rewords every
+         sentence a little.
+       - **The merge**: the earlier result is kept, and the other becomes its
+         alias. live-eval doesn't merge.
+  - **Check of the fixes, declared before the run**: `explain-eval` on the next
+    20 dev queries in seeded order, from A0071, so none of the first 20.
+    - **Settings**: the dev run's work types and the timing run, as before.
+    - **Report**: the exact, matched and unverified rates of the quotes, and the
+      cost per check, with the first run's measures alongside.
+    - **Review CSV**: under runs/, since the hand-reviewed one stays as it is.
+    - **Spend cap**: $0.30, against an expected $0.10.
+    - **Result (2026-10-15)**, `runs/explain-20261015-215122`:
+      - **Quotes**: 95.5% exact, 4.0% matched, 0.5% unverified (191, 8 and 1
+        of 200).
+      - **The original**: in the top 10 and rated high in 20 of 20.
+      - **Cost**: median $0.0136 a check (max $0.0162).
+      - **Merges**: 4, all real versions of one paper.
+      - **"Differs"**: none cites publication status or "the proposal is a
+        plan".
+      - **Spend**: $0.091.
 - The Phase 1 frozen benchmark stays runnable as a regression test.
 
 ## Competitive evaluation: is it better than what researchers already use?
@@ -341,6 +425,20 @@ no fabricated citations.
      fallbacks.
 5. Overlap explainer + quote verification + vocabulary map + report schema.
    Tests with FakeLLM. Hand check on 10 checks.
+   *Built on 2026-10-15* (`rk.live.check`, `rk.live.explain`, `rk.live.vocab`,
+   `rk.live.report`; `python -m rk check --file idea.txt [--quick]`):
+   - **Snippets**: every top-10 paper gets the abstract sentence closest to
+     the idea (Qwen3-Embedding), in the quick check too.
+   - **The explainer**: one call to the judge's model (Mistral Medium 3.1,
+     `explain.model`), strict JSON per paper. A quote not found in the abstract
+     is dropped, and the paper is marked unverified. A failed or unreadable
+     call leaves the snippets, with a warning.
+   - **The vocabulary map**: rule-based, with no LLM. Terms come from the top
+     papers' OpenAlex keywords (one extra list call by id, $0.0001), their
+     titles and the agent's queries, grouped by source and capped at 10.
+   - **The cap**: a whole check of `rk check` is capped at
+     `explain.cost_cap_per_check` ($0.03); live-eval keeps
+     `live.cost_cap_per_check`.
 6. FastAPI + SQLite + background worker + web page. Tests with TestClient.
    *Decided on 2026-10-15:* a failed or timed-out agent search is skipped with
    a warning instead of failing the whole check. Evaluation stays strict: there,

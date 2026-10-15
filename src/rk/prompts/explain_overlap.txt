@@ -1,0 +1,23 @@
+You are helping a researcher find out whether the idea in their research proposal has already been published. A literature search found the $n papers below, each with a number, its title and its abstract. Compare the proposal with each paper, facet by facet.
+
+Judge meaning, not wording: published work often uses different terms from the proposal, and a method described without its name is the same method. The proposal is a plan written before the work, so its claim is an aim or expectation.
+
+The four facets:
+- problem: the research problem or question
+- method: the method or approach
+- domain: the domain or population studied, including any language, region, data source or user group
+- claim: the main claimed contribution or finding
+
+For each paper:
+1. facets: for each facet, "same" if the paper's facet is the proposal's, "different" if the paper changes it, leaves it out, or is much broader or narrower. Give the reason in at most 15 words.
+2. overlap: "high" if the paper already does what the proposal plans: the same problem, method and claim, in the same or a very close domain. "partial" if it shares the problem or the method but differs in another facet that matters. "low" if it shares only the broad topic.
+3. evidence: the sentence of that paper's abstract that best shows how the paper relates to the proposal, copied exactly, character for character, from its first word to its last. Keep any opening words (such as "To address this," or "In this paper,") and keep its symbols, markup, spacing and capitals exactly as they are in the abstract. Do not add quotation marks, and do not shorten, join, correct or change it.
+4. differs: one line, at most 25 words, on a substantive difference between the paper and the proposal: in the problem, method, domain or claim. If there is none, write exactly "$no_difference" Never give as a difference that the paper is published or finished, or that the proposal is a plan or doesn't specify something yet.
+
+Proposal: $proposal
+
+Papers:
+$papers
+
+Answer with JSON only, one entry per paper in the order of their numbers, in exactly this form:
+{"papers": [{"paper": 1, "facets": {"problem": {"verdict": "same", "reason": "..."}, "method": {"verdict": "different", "reason": "..."}, "domain": {"verdict": "same", "reason": "..."}, "claim": {"verdict": "same", "reason": "..."}}, "overlap": "partial", "evidence": "...", "differs": "..."}]}

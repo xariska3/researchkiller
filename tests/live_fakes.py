@@ -15,6 +15,7 @@ from conftest import FakeEncoder
 from rk.text import content_stems, reconstruct_abstract
 
 SEARCH_CREDITS = 10  # what one keyword or semantic search costs (1 credit = $0.0001)
+LIST_COST = 0.0001  # what a list call by id reports (meta.cost_usd)
 RESETS_IN_S = 3600
 
 
@@ -55,6 +56,10 @@ class FakeLiveOpenAlex:
     and every response carries the X-RateLimit headers (unless `budget_headers`
     is off); a search the budget can't pay for gets HTTP 429, as OpenAlex
     answers once the day's budget is spent. /rate-limit reports the budget.
+
+    A request without a search, filtered by ids.openalex, is a list call by id (the
+    vocabulary map's keyword lookup): it returns those works and reports
+    LIST_COST; with `fail_lookups`, it gets HTTP 400 instead.
     """
 
     def __init__(
@@ -67,9 +72,11 @@ class FakeLiveOpenAlex:
         hide_from_semantic: Collection[str] = (),
         budget_credits: int | None = None,
         budget_headers: bool = True,
+        fail_lookups: bool = False,
     ) -> None:
         self.works = list(works)
         self.cost = cost
+        self.fail_lookups = fail_lookups
         self.fail_with = list(fail_with)
         self.honour_types = honour_types
         self.hide_from_semantic = {f"https://openalex.org/{w}" for w in hide_from_semantic}
@@ -110,7 +117,18 @@ class FakeLiveOpenAlex:
         if self.budget_credits is not None and self.budget_credits < SEARCH_CREDITS:
             return httpx.Response(429, json={"error": "rate limited"}, headers=self._headers())
         per_page = int(params.get("per_page", "25"))
-        works = [w for w in self.works if self._passes(w, params.get("filter", ""))]
+        filters = params.get("filter", "")
+        searching = "search" in params or "search.semantic" in params
+        if not searching and "ids.openalex:" in filters:
+            if self.fail_lookups:
+                return httpx.Response(400, json={"error": "simulated lookup failure"})
+            wanted = filters.split("ids.openalex:", 1)[1].split(",", 1)[0].split("|")
+            found = [w for w in self.works if w["id"].rsplit("/", 1)[-1] in wanted]
+            fields = params["select"].split(",")
+            results = [{k: w.get(k) for k in fields} for w in found[:per_page]]
+            meta = {"count": len(found), "per_page": per_page, "cost_usd": LIST_COST}
+            return httpx.Response(200, json={"meta": meta, "results": results})
+        works = [w for w in self.works if self._passes(w, filters)]
         if "search.semantic" in params:
             if per_page > 50:
                 message = f"per_page cannot exceed 50 for semantic search. Received {per_page}."

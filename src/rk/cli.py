@@ -8,9 +8,11 @@ import re
 import sys
 from collections.abc import Sequence
 from contextlib import ExitStack, closing
+from datetime import date
 from pathlib import Path
 
 from dotenv import load_dotenv
+from pydantic import ValidationError
 
 from rk.bench import (
     HUMAN_CHECK_FILE,
@@ -28,10 +30,14 @@ from rk.config import ConfigError, load_config
 from rk.corpus import CorpusError, OpenAlexClient, OpenAlexError, build_corpus
 from rk.evaluate import CONFIG_ORDER, SUMMARY_MD, EvalError, _f, report, run_eval
 from rk.live import evaluate as live_eval
+from rk.live import explain_eval
 from rk.live import replay as live_replay
 from rk.live import rerank as live_rerank
+from rk.live.check import run_check, save_report
 from rk.live.fusion import FUSIONS
 from rk.live.openalex_search import LiveSearchClient, OpenAlexCache
+from rk.live.pipeline import CheckCostCapExceeded
+from rk.live.report import CheckRequest, render_text
 from rk.llm import BudgetExceeded, ChatModel, Ledger, LLMCache, LLMClient, LLMError
 from rk.retrieval import RetrievalError, build_index, make_encoder
 from rk.targets import TargetSelectionError
@@ -99,6 +105,13 @@ def _qid_start(text: str) -> str:
     if re.fullmatch(r"A\d{4,}", text) is None:
         raise argparse.ArgumentTypeError(f"expected a qid prefix like A0045, got {text!r}")
     return text
+
+
+def _date(text: str) -> date:
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a date like 2024-06-30, got {text!r}") from None
 
 
 def _add_config_arguments(parser: argparse.ArgumentParser) -> None:
@@ -283,6 +296,54 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             f"also save the sample as a CSV, never overwritten (e.g. {compete_eval.SAMPLE_FILE})"
         ),
+    )
+
+    check = sub.add_parser(
+        "check",
+        help="check one research idea against the literature (the live tool, Phase 2)",
+    )
+    _add_config_arguments(check)
+    check.add_argument(
+        "--file", type=Path, required=True, help="a UTF-8 text file with the idea (40-500 words)"
+    )
+    check.add_argument(
+        "--quick",
+        action="store_true",
+        help="the quick check: one OpenAlex search and the local rerank, no LLM",
+    )
+    check.add_argument(
+        "--before",
+        type=_date,
+        help="only works published before this date (YYYY-MM-DD), to test an old idea fairly",
+    )
+
+    explain_ev = sub.add_parser(
+        "explain-eval",
+        help="default checks with the explainer on dev queries: quotes, overlap, cost, time",
+    )
+    _add_config_arguments(explain_ev)
+    explain_ev.add_argument(
+        "--from-qid",
+        type=_qid_start,
+        default=explain_eval.DEV_FROM_QID,
+        help=f"first qid in seeded order (default {explain_eval.DEV_FROM_QID}, the dev set)",
+    )
+    explain_ev.add_argument(
+        "--limit", type=_positive_int, default=20, help="checks to run (default 20)"
+    )
+    explain_ev.add_argument(
+        "--review", type=_positive_int, default=10, help="checks in the review CSV (default 10)"
+    )
+    explain_ev.add_argument(
+        "--review-out",
+        type=Path,
+        default=explain_eval.REVIEW_FILE,
+        help=f"the review CSV; never overwritten (default {explain_eval.REVIEW_FILE})",
+    )
+    explain_ev.add_argument(
+        "--timing-run",
+        type=Path,
+        help="Step 4's rerank run on the same checks, to estimate live times from it",
     )
 
     report_cmd = sub.add_parser("report", help="regenerate a run's summary from the database")
@@ -616,6 +677,114 @@ def compete_command(
     return 0
 
 
+def check_command(
+    config_path: Path,
+    file: Path,
+    quick: bool,
+    before: date | None,
+    overrides: Sequence[str] = (),
+) -> int:
+    cfg = load_config(config_path, overrides)
+    if cfg.live is None or cfg.explain is None:
+        raise ConfigError(f"{config_path} needs live: and explain: sections")
+    if not quick and cfg.rerank is None:
+        raise ConfigError(f"{config_path} has no rerank: section (the default check needs it)")
+    try:
+        request = CheckRequest(text=file.read_text(encoding="utf-8"), before=before, quick=quick)
+    except OSError as exc:
+        print(f"rk check: can't read {file}: {exc}", file=sys.stderr)
+        return 1
+    except ValidationError as exc:
+        print(f"rk check: {exc.errors()[0]['msg']}", file=sys.stderr)
+        return 1
+    with ExitStack() as stack:
+        cache = stack.enter_context(LLMCache(cfg.run.cache_path))
+        ledger = stack.enter_context(
+            Ledger(cfg.run.cache_path, cfg.run.budget_cap, command="check")
+        )
+        agent = reranker = explainer = None
+        if not quick:
+            assert cfg.rerank is not None
+            agent = stack.enter_context(closing(LLMClient(cfg.agent, cache, ledger)))
+            reranker = stack.enter_context(closing(LLMClient(cfg.rerank.model, cache, ledger)))
+            explainer = stack.enter_context(closing(LLMClient(cfg.explain.model, cache, ledger)))
+        responses = stack.enter_context(closing(OpenAlexCache(cfg.live.cache_path)))
+        search = stack.enter_context(closing(LiveSearchClient.from_config(cfg, responses)))
+        try:
+            done = run_check(
+                request,
+                cfg,
+                search=search,
+                encoder=make_encoder(cfg.retrieval),
+                agent=agent,
+                reranker=reranker,
+                explainer=explainer,
+            )
+        except CheckCostCapExceeded as exc:
+            print(f"rk check: the check stopped at its cost cap: {exc}", file=sys.stderr)
+            return 1
+    path = save_report(done.report, cfg.run.out_dir)
+    print(render_text(done.report), end="")
+    print(f"\nrk check: report saved to {path}")
+    return 0
+
+
+def explain_eval_command(
+    config_path: Path,
+    from_qid: str,
+    limit: int,
+    review: int,
+    review_out: Path,
+    timing_run: Path | None,
+    overrides: Sequence[str] = (),
+) -> int:
+    cfg = load_config(config_path, overrides)
+    if cfg.live is None or cfg.rerank is None or cfg.explain is None:
+        raise ConfigError(f"{config_path} needs live:, rerank: and explain: sections")
+    with ExitStack() as stack:
+        cache = stack.enter_context(LLMCache(cfg.run.cache_path))
+        ledger = stack.enter_context(
+            Ledger(cfg.run.cache_path, cfg.run.budget_cap, command="explain-eval")
+        )
+        agent = stack.enter_context(closing(LLMClient(cfg.agent, cache, ledger)))
+        reranker = stack.enter_context(closing(LLMClient(cfg.rerank.model, cache, ledger)))
+        explainer = stack.enter_context(closing(LLMClient(cfg.explain.model, cache, ledger)))
+        responses = stack.enter_context(closing(OpenAlexCache(cfg.live.cache_path)))
+        search = stack.enter_context(
+            closing(LiveSearchClient.from_config(cfg, responses, evaluation=True))
+        )
+        done = explain_eval.run_explain_eval(
+            cfg,
+            search=search,
+            encoder=make_encoder(cfg.retrieval),
+            agent=agent,
+            reranker=reranker,
+            explainer=explainer,
+            from_qid=from_qid,
+            limit=limit,
+            review_n=review,
+            review_out=review_out,
+            timing_run=timing_run,
+            progress=lambda line: print(f"rk explain-eval: {line}", flush=True),
+        )
+        spend = f"ledger ${ledger.spent:.4f} of ${ledger.cap:.2f}"
+    s = done.summary
+    quotes = ", ".join(
+        f"{kind} {'–' if rate is None else f'{rate:.1%}'}"
+        for kind, rate in s["quotes"]["rates"].items()
+    )
+    high = s["original"]["high_rate"]
+    check = s["cost"]["check"]
+    print(
+        f"rk explain-eval: {s['n_ok']} of {s['n_checks']} checks; quotes {quotes}; the "
+        f"original rated high in {'–' if high is None else f'{high:.0%}'} of "
+        f"{s['original']['in_top']}; median check cost "
+        f"${_f(check['p50'] if check else None, 4)}; {spend}; summary in "
+        f"{done.run_dir / SUMMARY_MD}; review CSV {review_out} ({done.review_rows} rows)"
+    )
+    return 0
+
+
 def report_command(run_dir: Path) -> int:
     if live_eval.is_live_run(run_dir):
         summary = live_eval.report(run_dir)
@@ -682,6 +851,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.systems,
                 args.dry_run,
                 args.save_sample,
+                args.overrides,
+            )
+        if args.command == "check":
+            return check_command(args.config, args.file, args.quick, args.before, args.overrides)
+        if args.command == "explain-eval":
+            return explain_eval_command(
+                args.config,
+                args.from_qid,
+                args.limit,
+                args.review,
+                args.review_out,
+                args.timing_run,
                 args.overrides,
             )
         return report_command(args.run_dir)
