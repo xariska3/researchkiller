@@ -66,6 +66,9 @@ design live, and keeps the Phase 1 benchmark as a regression test.
 4. **Rerank locally:** BM25 + the Qwen3-Embedding dense score over the
    candidate pool, fused with the same RRF function as Phase 1 (hybrid,
    because Phase 1 showed rewrites do worse on a dense-only base). Keep the top 20.
+   *Steps 2 and 4 results:* the final fusion is L5w's (proposal-equal). Then one
+   call to the agent model reranks the union of L5w's and L5's top 30 listwise
+   (R1, giving L5r; see Evaluation).
 5. **Overlap explainer (top 10):** reuse the validated facet judge (Mistral Medium 3.1),
    reframed: compare the user's idea with each paper facet by facet (problem,
    method, domain, claim). Output per paper, as strict JSON:
@@ -263,6 +266,13 @@ design live, and keeps the Phase 1 benchmark as a regression test.
       (0.842 against 0.758), so **L5r = R1, listwise**.
     - **Against L5w on the dev set**: +0.100 Hit@5 (13 queries gained, 1
       lost, McNemar p = 0.002). This is exploratory; the test set decides.
+  - **Test result (2026-10-15)**, `runs/rerank-20261015-140923`.
+    - **L5r vs L5w**: Hit@5 0.863 against 0.700, +0.163 (13 / 0, p = 0.0002),
+      and MRR@20 +0.228. This is confirmed.
+    - **So**: the default check becomes L5r (L5w, then R1's rerank) once the
+      live pipeline has it.
+    - **RS** (0.875) is one query ahead of R1.
+    - **Report**: docs/reports/phase2-step4-rerank.md.
 - Explainer check: run 10 full checks, export a CSV for hand review (results
   useful? explanations correct?), and report the quote-verification rate.
 - The Phase 1 frozen benchmark stays runnable as a regression test.
@@ -333,7 +343,8 @@ no fabricated citations.
   pipeline. In the pilot, L1 had Hit@5 0.700 against L5's 0.833.
   *Decided on 2026-10-15, after the L5w test run:*
   - **Default check**: L5w. The reranker joins it if it wins on the test set
-    in the rerank evaluation that comes before the explainer.
+    in the rerank evaluation that comes before the explainer. *(It did, on
+    2026-10-15, so the default is L5r: L5w with R1's listwise rerank.)*
   - **Preview**: L1 is shown at once, as a first preview, while the full check
     runs. L1 alone is not the default: it trailed L5w by 8.7 points of Hit@5 on
     the test set and by 11.7 on the dev set.
