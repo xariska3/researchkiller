@@ -1,0 +1,10 @@
+system,n,hit_at_1,hit_at_5,unresolved_rate,mean_cost_usd,median_latency_s,mean_latency_s,l5r_only,system_only,mcnemar_p,mcnemar_p_holm,note
+L5r,80,0.8250,0.8625,0.0000,0.009185,27.35,27.25,,,,,default check: L5w + Qwen listwise rerank
+L5w,80,0.5375,0.7000,0.0000,0.007747,21.30,21.17,13,0,0.000244,0.000488,live check before the reranker
+L1,80,0.4250,0.6125,0.0000,0.001000,1.98,2.37,20,0,1.91e-06,7.63e-06,"instant preview: one OpenAlex semantic search + local rerank, no LLM"
+Claude Opus 5.5 + web search,80,0.5375,0.5500,0.0605,0.302066,33.02,33.79,30,5,2.24e-05,6.71e-05,cached (Step 3 addendum)
+Claude Sonnet 5.5 + web search,80,0.4125,0.4750,0.0623,0.157073,21.26,22.42,35,4,3.35e-07,1.68e-06,"cached (deep-check preview run), alone"
+gpt-6-luna + web search,33,0.6970,0.6970,0.0737,0.057842,45.31,45.30,10,4,0.18,0.18,"cached Step 3 answers only: the 39 test queries in Step 3's sample, less 6 over its cost cap there"
+Perplexity Sonar,80,0.1750,0.1750,0.3758,0.005643,5.05,5.34,58,3,3.29e-14,2.3e-13,search context low
+Semantic Scholar snippet search,80,0.2375,0.3250,0.2600,0.000000,4.71,4.67,43,0,2.27e-13,1.36e-12,the proposal as the query
+Semantic Scholar paper search,80,0.0000,0.0000,,0.000000,0.67,0.65,69,0,3.39e-21,2.71e-20,the proposal as the query

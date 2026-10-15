@@ -82,6 +82,10 @@ confirmed on the test set, the same discipline as L5w's choice in Step 2.
   merged with Sonnet's web-search answer reaches Hit@5 0.900 against L5r's 0.863 (4 / 1,
   p = 0.375). Hit@1 is equal by construction. It costs $0.166 a check. See
   [the addendum](#deep-check-preview-on-the-test-set).
+- **Every system on the 80 test queries** (chart data, exploratory): L5r has the highest
+  Hit@1 and Hit@5. It leads every other system significantly after Holm, except
+  gpt-6-luna on its 33 cached answers. See
+  [the table](#every-system-on-the-80-test-queries-exploratory).
 
 ## Finding the original
 
@@ -417,3 +421,96 @@ from.
 3. **One-off scripts**: the Opus comparison and the deep-check merge were computed by
    scripts outside the repository, since the deep check isn't built. Both read only the
    run files named above. The merge follows the spec's rule.
+
+## Every system on the 80 test queries (exploratory)
+
+The chart data, requested on 2026-10-15 after PR #14:
+- **The table** is in
+  [docs/evaluation/test80_comparison.csv](../evaluation/test80_comparison.csv).
+- **The whole table is exploratory**: it wasn't pre-declared, and the same 80 queries
+  also confirmed L5r against L5w.
+- **The deep check isn't built**, and the rest of the Anthropic credit is left to
+  expire (your decision).
+
+Where each system's numbers come from:
+
+| System | Source |
+|---|---|
+| **L5r** | The R1 rows of the test rerank run. Cost is the check's plus the rerank call's; time is L5w's recorded check time plus the rerank call's. |
+| **L5w and L1** | The live test run's rows (`runs/live-20261015-000815`). L1 is the instant preview: one OpenAlex semantic search and the local rerank, with no LLM. |
+| **Opus** | Step 3's addendum run (`runs/compete-20261015-101555`). |
+| **Sonnet** | The deep-check preview run (`runs/compete-20261015-162116`), on its own. |
+| **gpt-6-luna** | Step 3's answers only (`runs/compete-20261015-012022`), so n = 33, with no new OpenAI calls. 39 test queries were in Step 3's sample; the 6 missing ones are the last of them in Step 3's seeded order, where its cost cap stopped it. |
+| **Perplexity and both Semantic Scholar searches** | `runs/compete-20261015-172548`, with Step 3's prompt and settings. For each, 39 answers came from Step 3's cache and 41 were new, with 0 errors. |
+
+- **Scoring**: as in Step 3.
+  - **Hits**: Hit@1 and Hit@5 over each list's top 10. A listed paper is the original if
+    its OpenAlex id, DOI or normalised title matches.
+  - **Unresolved references**: the share of listed papers that no free route verifies.
+    Ours lists OpenAlex records, so it has none.
+  - **Cost**: the method cost at the config prices.
+  - **Latency**: the check's time, or the API call's.
+- **The test**: the exact McNemar test on Hit@5, L5r against each system on the
+  queries both answered. Holm's adjustment runs across the 8 comparisons.
+
+| System | n | Hit@1 | Hit@5 | Unresolved references | Mean cost per query | Latency median / mean (s) | Hit@5: only L5r / only it | McNemar p | Holm p |
+|---|---|---|---|---|---|---|---|---|---|
+| **L5r** (default check) | 80 | **0.825** | **0.863** | 0 | $0.0092 | 27.3 / 27.2 | – | – | – |
+| L5w | 80 | 0.537 | 0.700 | 0 | $0.0077 | 21.3 / 21.2 | 13 / 0 | 0.00024 | 0.00049 |
+| L1 (preview) | 80 | 0.425 | 0.613 | 0 | $0.0010 | 2.0 / 2.4 | 20 / 0 | 1.9e-06 | 7.6e-06 |
+| Claude Opus 5.5 + web search | 80 | 0.537 | 0.550 | 6.1% | $0.3021 | 33.0 / 33.8 | 30 / 5 | 2.2e-05 | 6.7e-05 |
+| Claude Sonnet 5.5 + web search | 80 | 0.412 | 0.475 | 6.2% | $0.1571 | 21.3 / 22.4 | 35 / 4 | 3.4e-07 | 1.7e-06 |
+| gpt-6-luna + web search | 33 | 0.697 | 0.697 | 7.4% | $0.0578 | 45.3 / 45.3 | 10 / 4 | 0.180 | 0.180 |
+| Perplexity Sonar | 80 | 0.175 | 0.175 | 37.6% | $0.0056 | 5.0 / 5.3 | 58 / 3 | 3.3e-14 | 2.3e-13 |
+| Semantic Scholar snippet search | 80 | 0.237 | 0.325 | 26.0% | free | 4.7 / 4.7 | 43 / 0 | 2.3e-13 | 1.4e-12 |
+| Semantic Scholar paper search | 80 | 0.000 | 0.000 | – (lists nothing) | free | 0.7 / 0.6 | 69 / 0 | 3.4e-21 | 2.7e-20 |
+
+- **L5r has the highest Hit@1 and Hit@5 of every system.** Every lead on Hit@5 is
+  significant after Holm, except over gpt-6-luna.
+  - On gpt-6-luna's 33 queries, L5r has 29 (0.879) against 23 (0.697): 10 / 4,
+    p = 0.18.
+  - n = 33 is too small to separate them.
+- **Unresolved references are an upper bound on fabrication.**
+  - **The calibration**: Semantic Scholar's snippet papers are all real, yet 26.0% of
+    them fail the free routes, since they come without a DOI and go through Crossref's
+    title search.
+  - Perplexity's 37.6% is above even that baseline.
+  - The web-search LLMs' 6–7% is low because most of their papers carry a DOI or link
+    that resolves directly. Step 3 compares the papers that went through the title
+    search with the baseline.
+- **Semantic Scholar's paper search** returned nothing for a whole proposal (0 papers
+  in 80 answers), as in Step 3.
+- **The caveats of the Opus comparison apply to the whole table.**
+  - **The benchmark suits our tool**: the proposals paraphrase one abstract, and the
+    originals are 2026 OpenAlex works.
+  - **Search budgets differ**: Claude had at most 10 searches, gpt-6-luna 5 tool calls.
+
+### Where L5r's misses come from, per split
+
+| Split | n | L5r Hit@5 misses | Original never reached the candidates | Never returned by any OpenAlex search | Returned, but below the top 30 of both fusions | Among the candidates, reranked below 5 |
+|---|---|---|---|---|---|---|
+| Dev | 120 | 18 | 17 | 16 | 1 (A0119) | 1 (A0109) |
+| Test | 80 | 11 | 10 | 8 | 2 (A0220, A0230) | 1 (A0191, at 8) |
+| Both | 200 | 29 | 27 | 24 | 3 | 2 |
+
+- **The candidates** are the union of L5w's and L5's top 30. The middle two columns
+  split "never reached the candidates".
+- **Never returned**: none of the check's searches returned the original. Those are the
+  proposal's semantic search, and each agent query's keyword and semantic searches.
+- **The ranking misses**:
+  - **3 by the first stage**: OpenAlex returned the original, but the fusions ranked it
+    below 30.
+  - **2 by the reranker**. A0109 is the OpenAlex record that carries another paper's
+    title.
+- **Retrieval improvements are deferred** until after the explainer and the web app
+  (spec, Backlog).
+
+### Spend for the table
+
+- **Perplexity** (OpenRouter, compete ledger): **$0.23** new, for 41 calls.
+  - Its compete total is now $0.80 of its $1 cap.
+  - That cap left $0.44 for this run, stricter than the $1 you allowed.
+- **Semantic Scholar, Crossref and OpenAlex lookups**: free.
+- **None**: no Anthropic, OpenAI or `llm.sqlite` spend.
+- **The table itself** was built by a one-off script outside the repository that reads
+  only the run files above, like the addendum's.
