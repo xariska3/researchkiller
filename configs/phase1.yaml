@@ -95,7 +95,9 @@ compete:
       base_url: https://api.anthropic.com/v1
       api_key_env: ANTHROPIC_API_KEY
       web_search_tool: web_search_20260318   # dynamic filtering, the current default
-      max_searches: 5
+      # Its code sends 6-8 searches in one batch, and a batch over max_uses is refused
+      # whole (the 2026-10-15 pilot, at 5: no search at all in 2 of 3 Sonnet answers).
+      max_searches: 10
       max_tokens: 8192
       price_in_per_m: 2.0
       price_out_per_m: 10.0
@@ -111,7 +113,7 @@ compete:
       base_url: https://api.anthropic.com/v1
       api_key_env: ANTHROPIC_API_KEY
       web_search_tool: web_search_20260318
-      max_searches: 5
+      max_searches: 10                       # as Sonnet's
       max_tokens: 8192
       price_in_per_m: 4.0
       price_out_per_m: 20.0
@@ -128,13 +130,14 @@ compete:
       base_url: https://api.openai.com/v1
       api_key_env: OPENAI_API_KEY
       web_search_tool: web_search            # search context medium, the default
-      max_searches: 5                        # max_tool_calls, to match Claude's max_uses
+      max_searches: 5                        # max_tool_calls; not raised with Claude's (budget)
       max_tokens: 16384                      # max_output_tokens, reasoning included
       price_in_per_m: 0.10
       price_out_per_m: 0.50
       price_per_search: 0.01
       reserve_per_query: 0.08
-      cost_cap: 4.5                          # OpenAI balance $5.33 on 2026-10-14
+      # OpenAI balance $5.33 on 2026-10-14: the pilot's $0.155968 plus $5.05 of new spend.
+      cost_cap: 5.2059
       requests_per_second: 0.5
       timeout_s: 600
     - name: perplexity

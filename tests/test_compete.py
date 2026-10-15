@@ -201,13 +201,14 @@ def test_the_committed_config_has_the_compete_section() -> None:
         "openai",
         "gpt-6-luna",
         5,
-        4.5,
+        5.2059,  # the pilot's $0.155968 plus $5.05 of new spend
     )
     assert luna.label == (
         "OpenAI smaller model (gpt-6-luna); flagship not tested for budget reasons"
     )
     assert systems["perplexity"].cost_cap == 1.0
-    assert systems["claude-sonnet"].max_searches == 5
+    # Claude's code batches 6-8 searches, and a batch over max_uses is refused whole.
+    assert systems["claude-sonnet"].max_searches == systems["claude-opus"].max_searches == 10
 
 
 @pytest.mark.parametrize(
