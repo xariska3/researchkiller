@@ -39,6 +39,7 @@ from rk.live.pipeline import proposal_records
 from rk.live.pool import CandidatePool
 from rk.retrieval import Encoder
 from rk.targets import Record
+from rk.text import opening
 
 FUSION_JSON = "fusion.json"
 FUSION_MD = "fusion.md"
@@ -270,13 +271,6 @@ MISSES_COLUMNS = (
 )
 
 
-def opening(text: str, chars: int = ABSTRACT_OPENING) -> str:
-    """The first `chars` characters of a text, cut at a word, with an ellipsis if cut."""
-    if len(text) <= chars:
-        return text
-    return text[:chars].rsplit(" ", 1)[0] + " …"
-
-
 def export_misses(
     run_dir: Path, encoder: Encoder, *, n: int, out_path: Path = MISSES_FILE
 ) -> int:
@@ -309,7 +303,7 @@ def export_misses(
             for doc_id in rp.recorded_l5[:MISSES_TOP]:
                 record = by_id[doc_id]
                 year = record["publication_date"][:4]
-                top += [record["title"], year, opening(record["abstract"])]
+                top += [record["title"], year, opening(record["abstract"], ABSTRACT_OPENING)]
             top += [""] * (3 * MISSES_TOP - len(top))
             writer.writerow(
                 [

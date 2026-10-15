@@ -427,6 +427,9 @@ from.
 The chart data, requested on 2026-10-15 after PR #14:
 - **The table** is in
   [docs/evaluation/test80_comparison.csv](../evaluation/test80_comparison.csv).
+- **To regenerate it**: `python scripts/test80_comparison.py`. The script makes no
+  calls: it reads `data/results.sqlite` and the run directories named below, writes the
+  CSV, and prints the numbers of this section's two tables in Markdown.
 - **The whole table is exploratory**: it wasn't pre-declared, and the same 80 queries
   also confirmed L5r against L5w.
 - **The deep check isn't built**, and the rest of the Anthropic credit is left to
@@ -512,5 +515,50 @@ Where each system's numbers come from:
   - That cap left $0.44 for this run, stricter than the $1 you allowed.
 - **Semantic Scholar, Crossref and OpenAlex lookups**: free.
 - **None**: no Anthropic, OpenAI or `llm.sqlite` spend.
-- **The table itself** was built by a one-off script outside the repository that reads
-  only the run files above, like the addendum's.
+- **The table itself** costs nothing: `scripts/test80_comparison.py` reads only the run
+  files above.
+
+## The live L5r on the test set (2026-10-15)
+
+L5r is now built into the live pipeline (branch `phase2-l5r-live`):
+- **The default check**: `rk.live.pipeline.default_check` runs L5w's check, then R1's
+  rerank call, charged to the check's $0.10 cap.
+- **The fallback**: if the call fails, could cross the cap, or its reply has no readable
+  ranking, the check keeps L5w's order and carries a warning.
+- **The evaluation**: live-eval has an L5r config. A failed rerank call is an error row
+  there, and fallbacks are counted in the run's summary.
+
+To check that the live L5r reproduces the offline R1, L5r rows were added to Step 2's
+test run, on its 80 queries:
+
+```
+python -m rk live-eval --config configs/phase1.yaml --run-dir runs/live-20261015-000815 --configs L5r --from-qid A0187 --limit 80 --set run.budget_cap=6.27
+```
+
+- **The selection**: `--from-qid A0187 --limit 80` is the run's own, A0187 to A0287.
+  Without it, live-eval would start new checks on the rest of the benchmark.
+- **The spend cap**: the `llm.sqlite` ledger is cumulative and stood at $6.0745, so a
+  cap of $6.27 allowed at most $0.1955 of new spend (you allowed $0.20).
+
+| 80 test queries | Hit@1 | Hit@5 | Hit@10 | MRR@20 | Method cost per check (mean) |
+|---|---|---|---|---|---|
+| Offline R1 (`runs/rerank-20261015-140923`) | 0.825 (66) | 0.863 (69) | 0.875 (70) | 0.842 | $0.00918 |
+| **Live L5r** (`runs/live-20261015-000815`) | 0.825 (66) | 0.863 (69) | 0.875 (70) | 0.842 | $0.00918 |
+
+- **The live L5r reproduces R1 on all 80 queries.**
+  - **Rankings**: the top 20 is the same list, in the same order, on every query, so
+    the original's rank is the same on every query too (0 differing rankings).
+  - **Candidates**: the same count on every query.
+  - **Method cost**: equal per query, to rounding (largest difference 2e-18).
+- **The rerank step**: reranked 80 times, with 0 fallbacks, 0 skipped checks and 0
+  errors.
+- **L5r vs L5w** in the run's summary repeats the test's result: +0.163 Hit@5, 13 / 0,
+  p = 0.000244.
+- **Spend: $0.**
+  - **LLM**: all 80 rerank calls, and the agent calls of the checks, came from the
+    cache, and the ledger is unchanged at $6.07. A cache hit needs the same request,
+    so the live prompts are the offline ones.
+  - **OpenAlex**: 0 searches sent.
+- **Latency**: the run's summary shows 4.9 s per L5r check because every call came
+  from the cache. That is not a live time. The live estimate is still L5w's recorded
+  check time plus the rerank call, about 27 s on average (Cost and latency per check).
