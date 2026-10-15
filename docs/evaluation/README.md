@@ -62,7 +62,31 @@ new calls.
   - `original_rank`: the original's rank in L5's top 20, or `none`;
   - for each of L5's top 3 results, `topN_title`, `topN_year` and
     `topN_abstract` (the first 300 characters);
-  - `top1_close_prior_art` and `note`: left empty for the reviewer.
+  - `top1_close_prior_art` (`yes`, `partial` or `no`) and `note`: the
+    reviewer's verdict and reason, filled in by hand;
+  - `reviewer`: who gave the verdict.
 - **Question**: is L5's top result genuinely close prior art for the
   proposal, so that the miss is partly the metric's (it credits only the
   original), not the tool's?
+
+## Results
+
+The verdicts were made by Claude (an AI assistant), not by the author; the
+`reviewer` column says so on every row. The verdict is in
+`top1_close_prior_art` and covers L5's top 3 results.
+
+- **4 of 10 had close prior art in the top 3** (A0113, A0119, A0131,
+  A0156). For these, the miss is the metric's: it credits only the original,
+  though the tool found genuinely close earlier work.
+- **3 were partially related** (A0051, A0082, A0134): same task or method
+  family, but not the proposal's contribution. A0051's original is typed
+  `dataset` in OpenAlex, so the type filter excluded it.
+- **3 were real failures**:
+  - A0064: same-language drift. Arabic NER, WordNet and WSD came back
+    instead of reverse-dictionary work.
+  - A0071: off-topic results. Zero-shot learning and food image
+    classification came back instead of food-text tagging.
+  - A0115: old, loosely related papers. Document-structure extraction from
+    1994 and 2003 ranked high.
+- **Unmerged duplicates**: in A0113 (a "yes"), the two ExpertFlow records
+  (2024, 2026) weren't merged, so the same work took two of the top 3 places.
