@@ -378,6 +378,22 @@ no fabricated citations.
       them.
   - **Cost**: about $0.17 a check, over the $0.10 hard cap of a default
     check, so the deep check needs a cap of its own.
+  - **Exploratory preview on the test set** (requested on 2026-10-15, after
+    Step 4; recorded here before any call). It decides nothing: 39 of these
+    queries were in Step 3's sample, which the design came from.
+    - **Queries**: the 80 test queries of `runs/live-20261015-000815`.
+    - **The default check is now L5r**: its top 10 come from Step 4's test
+      run (`runs/rerank-20261015-140923`, R1).
+    - **Sonnet's answers**: from a compete run on the same 80 queries, with
+      Step 3's settings. 39 are in Step 3's cache; 41 are new calls.
+    - **Cap**: $11.61 of new spend. This is the requested $15, lowered so that
+      the Anthropic total by our count stays under the workspace's $95
+      limit (the compete group cap set to $88).
+    - **Reported**: the deep check against L5r alone, on Hit@1, Hit@5 (with
+      the exact McNemar test), Hit@10, MRR@10, the unverified share of the
+      merged top 10, and cost and latency per check.
+    - **Hit@1 is equal by construction**: the merged list starts with L5r's
+      first paper.
 
 ## Out of scope for Phase 2
 Docker as a requirement, user accounts, scoop alerts, `.bib` missing-citation check, the MCP server,
