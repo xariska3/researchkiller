@@ -29,9 +29,10 @@ from rk.corpus import CorpusError, OpenAlexClient, OpenAlexError, build_corpus
 from rk.evaluate import CONFIG_ORDER, SUMMARY_MD, EvalError, _f, report, run_eval
 from rk.live import evaluate as live_eval
 from rk.live import replay as live_replay
+from rk.live import rerank as live_rerank
 from rk.live.fusion import FUSIONS
 from rk.live.openalex_search import LiveSearchClient, OpenAlexCache
-from rk.llm import BudgetExceeded, Ledger, LLMCache, LLMClient, LLMError
+from rk.llm import BudgetExceeded, ChatModel, Ledger, LLMCache, LLMClient, LLMError
 from rk.retrieval import RetrievalError, build_index, make_encoder
 from rk.targets import TargetSelectionError
 
@@ -73,6 +74,16 @@ def _live_config_list(text: str) -> list[str]:
     if unknown or not names:
         raise argparse.ArgumentTypeError(
             f"unknown live configs {unknown}; choose from {','.join(live_eval.LIVE_CONFIGS)}"
+        )
+    return names
+
+
+def _rerank_list(text: str) -> list[str]:
+    names = [name.strip() for name in text.split(",") if name.strip()]
+    unknown = [name for name in names if name not in live_rerank.VARIANTS]
+    if unknown or not names:
+        raise argparse.ArgumentTypeError(
+            f"unknown variants {unknown}; choose from {','.join(live_rerank.VARIANTS)}"
         )
     return names
 
@@ -229,6 +240,21 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=live_replay.MISSES_FILE,
         help=f"CSV to write; never overwritten (default {live_replay.MISSES_FILE})",
+    )
+
+    rerank = sub.add_parser(
+        "rerank",
+        help="the LLM rerank variants on a live run's checks, replayed offline (Phase 2 Step 4)",
+    )
+    _add_config_arguments(rerank)
+    rerank.add_argument("run_dir", type=Path, help="runs/live-<timestamp>")
+    rerank.add_argument(
+        "--variants",
+        type=_rerank_list,
+        help=f"comma-separated (default {','.join(live_rerank.VARIANTS)})",
+    )
+    rerank.add_argument(
+        "--limit", type=_positive_int, help="only the run's first N checks, in qid order"
     )
 
     compete = sub.add_parser(
@@ -479,6 +505,65 @@ def live_misses_command(run_dir: Path, n: int, out: Path) -> int:
     return 0
 
 
+def rerank_command(
+    config_path: Path,
+    run_dir: Path,
+    variants: list[str] | None,
+    limit: int | None,
+    overrides: Sequence[str] = (),
+) -> int:
+    cfg = load_config(config_path, overrides)
+    if cfg.rerank is None:
+        raise ConfigError(f"{config_path} has no rerank: section")
+    chosen = variants or list(live_rerank.VARIANTS)
+    needed = {live_rerank.CALLS[v][1] for v in chosen}
+    _, run_cfg, _ = live_replay.load_run(run_dir)
+    with ExitStack() as stack:
+        clients: dict[str, ChatModel] = {}
+        ledgers: dict[str, Ledger] = {}
+        # The product model shares the cumulative ledger of every command; the upper
+        # model (another account) has its own cache and ledger file, with its own cap.
+        homes = {
+            live_rerank.PRODUCT_MODEL: (
+                cfg.rerank.model, cfg.run.cache_path, cfg.run.budget_cap, 120.0
+            ),
+            live_rerank.UPPER_MODEL: (
+                cfg.rerank.upper_model,
+                cfg.rerank.upper_cache_path,
+                cfg.rerank.upper_cost_cap,
+                live_rerank.UPPER_TIMEOUT_S,
+            ),
+        }
+        for key in sorted(needed):
+            model, path, cap, timeout = homes[key]
+            cache = stack.enter_context(LLMCache(path))
+            ledgers[key] = stack.enter_context(Ledger(path, cap, command="rerank"))
+            clients[key] = stack.enter_context(
+                closing(LLMClient(model, cache, ledgers[key], timeout=timeout))
+            )
+        done = live_rerank.run_rerank(
+            cfg,
+            run_dir,
+            encoder=make_encoder(run_cfg.retrieval),
+            clients=clients,
+            variants=chosen,
+            limit=limit,
+            progress=lambda line: print(f"rk rerank: {line}", flush=True),
+        )
+        spend = "; ".join(
+            f"{key} ledger ${ledger.spent:.4f} of ${ledger.cap:.2f}"
+            for key, ledger in ledgers.items()
+        )
+    hit5 = ", ".join(
+        f"{c} {_f(q['hit_at_5'])}" for c, q in done.summary["quality"].items()
+    )
+    print(
+        f"rk rerank: {done.summary['n_queries']} checks; Hit@5: {hit5}; {spend}; "
+        f"summary in {done.run_dir / SUMMARY_MD}"
+    )
+    return 0
+
+
 def compete_command(
     config_path: Path,
     limit: int | None,
@@ -580,6 +665,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return live_fusion_command(args.run_dir)
         if args.command == "live-misses":
             return live_misses_command(args.run_dir, args.n, args.out)
+        if args.command == "rerank":
+            return rerank_command(
+                args.config, args.run_dir, args.variants, args.limit, args.overrides
+            )
         if args.command == "compete":
             return compete_command(
                 args.config,

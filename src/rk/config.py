@@ -360,6 +360,30 @@ class CompeteConfig:
 
 
 @dataclass(frozen=True)
+class RerankConfig:
+    """Phase 2 Step 4: LLM rerank variants, evaluated offline (docs/phase2_spec.md).
+
+    `model` reranks for the product variants (R1-R3); its calls share run.cache_path
+    and run.budget_cap with every other command. `upper_model` is RS, an upper bound
+    and not a product candidate: its training cutoff may be after the originals, so it
+    is exempt from the cutoff check, and it has its own cache and ledger file
+    (`upper_cache_path`), capped at `upper_cost_cap`.
+    """
+
+    model: ModelConfig
+    upper_model: ModelConfig
+    upper_cache_path: Path
+    upper_cost_cap: float  # USD, cumulative over every rerank run of upper_model
+    depth: int = 30  # the candidates are the union of L5w's and L5's top `depth`
+    abstract_chars: int = 2000  # each candidate's abstract is cut at this many characters
+
+    def __post_init__(self) -> None:
+        _require(self.upper_cost_cap > 0, "upper_cost_cap must be > 0")
+        _require(self.depth >= 1, "depth must be >= 1")
+        _require(self.abstract_chars >= 1, "abstract_chars must be >= 1")
+
+
+@dataclass(frozen=True)
 class Config:
     corpus: CorpusConfig
     bench: BenchConfig
@@ -370,6 +394,7 @@ class Config:
     agent: ModelConfig
     live: LiveConfig | None = None  # Phase 2; the Phase 1 commands don't need it
     compete: CompeteConfig | None = None  # Phase 2 Step 3: python -m rk compete
+    rerank: RerankConfig | None = None  # Phase 2 Step 4: python -m rk rerank
 
     def models(self) -> dict[str, ModelConfig]:
         return {"paraphraser": self.paraphraser, "judge": self.judge, "agent": self.agent}
@@ -377,6 +402,8 @@ class Config:
     def __post_init__(self) -> None:
         check_model_independence(self.models())
         check_training_cutoffs(self.bench.target_from_date, self.models())
+        if self.rerank is not None:  # the product reranker must not have seen the originals
+            check_training_cutoffs(self.bench.target_from_date, {"rerank": self.rerank.model})
 
 
 def check_model_independence(models: dict[str, ModelConfig]) -> None:

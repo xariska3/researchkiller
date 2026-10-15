@@ -169,6 +169,40 @@ compete:
       requests_per_second: 0.5
       timeout_s: 60
 
+# Phase 2 Step 4: LLM rerank variants of the live check, evaluated offline on the cached
+# checks (python -m rk rerank; pre-declared in docs/phase2_spec.md, Evaluation).
+rerank:
+  depth: 30                       # candidates: the union of L5w's and L5's top 30
+  abstract_chars: 2000            # 6.6% of corpus abstracts are longer
+  model:                          # R1-R3: the agent model, on the agent's pinned endpoint
+    name: qwen/qwen3-235b-a22b-2507
+    family: qwen
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+    provider: parasail/fp8
+    price_in_per_m: 0.14
+    price_out_per_m: 0.80
+    temperature: 0.0
+    max_tokens: 1000              # a listwise answer for 60 candidates is ~150 tokens
+    seed: 42
+    training_cutoff: 2025-07-21
+  # RS, the upper bound (not a product candidate): Anthropic's OpenAI-compatible
+  # endpoint (checked 2026-10-15: seed is ignored, and Claude 5 models refuse a
+  # temperature below 1). Thinking is adaptive by default and counts as output.
+  upper_model:
+    name: claude-sonnet-5-5
+    family: claude
+    base_url: https://api.anthropic.com/v1
+    api_key_env: ANTHROPIC_API_KEY
+    price_in_per_m: 2.0
+    price_out_per_m: 10.0
+    temperature: 1.0
+    max_tokens: 16000
+    seed: 42
+    training_cutoff: 2026-06-30   # "Training data cutoff: Jun 2026"; exempt from the check
+  upper_cache_path: data/cache/rerank_sonnet.sqlite   # its own cache and spend ledger
+  upper_cost_cap: 20.0            # USD of the Anthropic credit (expires 2026-10-18 UTC)
+
 run:
   out_dir: runs
   cache_path: data/cache/llm.sqlite   # LLM cache + cumulative spend table

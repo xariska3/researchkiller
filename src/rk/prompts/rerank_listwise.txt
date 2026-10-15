@@ -1,0 +1,11 @@
+You are helping a researcher find out whether the idea in their research proposal has already been published. Below are the proposal and $n candidate papers from a literature search, each with a number, its title and its abstract.
+
+Rank all $n candidates by how closely each paper matches the proposal. A paper that describes the same research idea as the proposal (the same problem, the same approach and the same main claim) comes first, even if it uses different terminology. Then come papers that share the problem and most of the approach, then papers on the same broad topic, and unrelated papers last.
+
+Proposal: $proposal
+
+Candidate papers:
+$candidates
+
+Answer with JSON only, listing every candidate number exactly once, the closest first:
+{"ranking": [3, 1, 2]}

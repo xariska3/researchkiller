@@ -1,0 +1,15 @@
+You are helping a researcher find out whether the idea in their research proposal has already been published. Below are the proposal and $n candidate papers from a literature search, each with a number, its title and its abstract.
+
+Score every candidate for how closely it matches the proposal:
+3 = it describes the same research idea as the proposal (the same problem, the same approach and the same main claim), even if it uses different terminology;
+2 = it shares the problem and a closely similar approach, but is not the same idea;
+1 = it is on the same broad topic only;
+0 = it is unrelated.
+
+Proposal: $proposal
+
+Candidate papers:
+$candidates
+
+Answer with JSON only, giving a score for every candidate number from 1 to $n:
+{"scores": {"1": 0, "2": 3, "3": 1}}
