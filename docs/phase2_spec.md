@@ -311,6 +311,45 @@ design live, and keeps the Phase 1 benchmark as a regression test.
     - **Run settings**: the run used the dev run's `live.work_types` (from before
       `software-paper`), so that its searches replay from the cache.
     - **Report**: docs/reports/phase2-step5-explainer.md.
+  - **Hand review (2026-10-15)**: `docs/evaluation/explainer_review.csv`, 50
+    rows, reviewed by Claude (not the author).
+    - **False alarms**: 0 / 50.
+    - **Correct**: 40 yes, 9 partly, 1 no.
+    - **Useful**: 31 yes, 17 partly, 2 no.
+  - **Product fixes, decided on 2026-10-15** after looking at those 20 dev
+    checks and the hand review, so they are labelled as such:
+    1. **Quotes**:
+       - The prompt asks for the evidence sentence exactly, from its first word.
+       - The code shows the abstract's own sentence, never the explainer's
+         version: verified-exact if the quote is in it verbatim, verified-matched
+         if it has at least 90% of the quote's words, otherwise unverified (the
+         snippet).
+       - The 5-word minimum stays.
+    2. **Vocabulary**: phrases end at the function words using, based, via,
+       with, for, by and through, and a phrase ending in one is dropped.
+    3. **"Differs"**: either a substantive difference, or exactly "No
+       substantive difference found." It is never publication status, or the
+       proposal being a plan.
+    4. **Sentences**: a full stop followed directly by a capital ends a sentence
+       ("datasets.We"). A snippet is cut at about 350 characters, at a word,
+       with "…".
+    5. **Near-duplicates in a check's final list**: two results merge when their
+       titles' content stems have a Jaccard of at least 0.7 and their abstracts
+       share most sentences, with or without a shared author.
+       - **Shared sentences**: more than half of the shorter abstract's
+         sentences, where a sentence is shared if the other abstract has one
+         with a word-set Jaccard of at least 0.5.
+       - **Why not exact**: the example (A0053, ranks 4 and 5) rewords every
+         sentence a little.
+       - **The merge**: the earlier result is kept, and the other becomes its
+         alias. live-eval doesn't merge.
+  - **Check of the fixes, declared before the run**: `explain-eval` on the next
+    20 dev queries in seeded order, from A0071, so none of the first 20.
+    - **Settings**: the dev run's work types and the timing run, as before.
+    - **Report**: the exact, matched and unverified rates of the quotes, and the
+      cost per check, with the first run's measures alongside.
+    - **Review CSV**: under runs/, since the hand-reviewed one stays as it is.
+    - **Spend cap**: $0.30, against an expected $0.10.
 - The Phase 1 frozen benchmark stays runnable as a regression test.
 
 ## Competitive evaluation: is it better than what researchers already use?

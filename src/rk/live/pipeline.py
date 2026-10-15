@@ -54,7 +54,7 @@ from rk.live.openalex_search import (
     LiveSearchClient,
     SearchResponse,
 )
-from rk.live.pool import CandidatePool, Hit
+from rk.live.pool import CandidatePool, Hit, same_text
 from rk.live.reranker import LISTWISE, candidates, listwise_ranking, parse_order, render_prompt
 from rk.llm import (
     ChatModel,
@@ -66,7 +66,7 @@ from rk.llm import (
     pessimistic_cost,
 )
 from rk.retrieval import Encoder, Trace
-from rk.targets import Record
+from rk.targets import Record, id_number
 
 AGENT_PROMPT = "agent_step"  # Phase 1's B5 prompt
 # L5w's final fusion, chosen on the dev set (rk.live.evaluate.L5W_FUSION): the default
@@ -456,6 +456,38 @@ def live_search(
         pool=pool,
         fusion=fusion,
     )
+
+
+def merge_same_text(result: LiveSearchResult) -> tuple[LiveSearchResult, list[tuple[str, str]]]:
+    """The final list with versions of one paper merged by their text (pool.same_text).
+
+    Going down the list, a work that is the same text as an earlier one joins it: its
+    id and aliases become the earlier one's aliases, and its versions and hits are
+    added. The rest move up, so the list can be shorter than live.top_k. Returns the
+    merged result and the (kept id, merged id) pairs. The pool and its ranking are
+    unchanged; live-eval doesn't merge.
+    """
+    kept: list[Candidate] = []
+    merged: list[tuple[str, str]] = []
+    for candidate in result.candidates:
+        same = next((i for i, k in enumerate(kept) if same_text(k.record, candidate.record)), None)
+        if same is None:
+            kept.append(candidate)
+            continue
+        first = kept[same]
+        ids = [*first.record["aliases"], candidate.record["id"], *candidate.record["aliases"]]
+        aliases = sorted(set(ids) - {first.record["id"]}, key=id_number)
+        kept[same] = Candidate(
+            first.rank,
+            {**first.record, "aliases": aliases},
+            sorted([*first.hits, *candidate.hits], key=lambda h: (h.query_index, h.kind, h.rank)),
+            [*first.versions, *candidate.versions],
+        )
+        merged.append((first.record["id"], candidate.record["id"]))
+    if not merged:
+        return result, []
+    renumbered = [replace(c, rank=n) for n, c in enumerate(kept, start=1)]
+    return replace(result, candidates=renumbered), merged
 
 
 def quick_check(

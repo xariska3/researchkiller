@@ -1,8 +1,9 @@
 """One whole check, as the tool runs it (docs/phase2_spec.md, Pipeline; Step 5).
 
 `run_check` runs the default check (L5r, rk.live.pipeline.default_check) or the quick
-check (L1, rk.live.pipeline.quick_check, no LLM). Then, for the top live.explain_top_k
-papers:
+check (L1, rk.live.pipeline.quick_check, no LLM), and merges versions of one paper in
+its final list (rk.live.pipeline.merge_same_text). Then, for the top
+live.explain_top_k papers:
 1. a snippet each (rk.live.explain.snippets);
 2. their OpenAlex keywords, for the vocabulary map (one list call);
 3. the explainer call (default check only; rk.live.explain.explain);
@@ -36,6 +37,7 @@ from rk.live.pipeline import (
     CheckCostCapExceeded,
     LiveSearchResult,
     default_check,
+    merge_same_text,
     quick_check,
 )
 from rk.live.report import (
@@ -80,6 +82,7 @@ class CheckRun:
     result: LiveSearchResult  # the retrieval: the candidates, the agent's trace, the pool
     explain: ExplainStep | None  # None in quick mode
     keywords_cached: bool | None  # whether the keyword lookup came from the cache
+    merged: list[tuple[str, str]]  # (kept id, merged id): versions merged in the final list
 
 
 def paper(candidate: Candidate, snippet: Snippet | None, explanation: Explanation | None) -> Paper:
@@ -135,6 +138,7 @@ def run_check(
             reranker=reranker,
             before=request.before,
         )
+    result, merged = merge_same_text(result)  # before the top papers are chosen
     warnings = list(result.warnings)
     top = result.candidates[: live.explain_top_k]
     records = [c.record for c in top]
@@ -240,4 +244,4 @@ def run_check(
         encoder_device=result.encoder_device,
         created_at=datetime.now(timezone.utc),
     )
-    return CheckRun(report, result, step, keywords_cached)
+    return CheckRun(report, result, step, keywords_cached, merged)

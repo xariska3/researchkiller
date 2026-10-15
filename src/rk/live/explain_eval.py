@@ -54,7 +54,16 @@ from rk.live.explain import EXPLAIN_PROMPT, EXPLAIN_SCHEMA_SHA256, EXPLAINED
 from rk.live.openalex_search import LiveSearchClient
 from rk.live.pipeline import AGENT_PROMPT, FALLBACK, RERANKED, SKIPPED, CheckCostCapExceeded
 from rk.live.pool import match_original
-from rk.live.report import HIGH, NOT_EXPLAINED, OVERLAPS, VERIFIED, CheckRequest, Paper
+from rk.live.report import (
+    HIGH,
+    NOT_EXPLAINED,
+    OVERLAPS,
+    UNVERIFIED,
+    VERIFIED_EXACT,
+    VERIFIED_MATCHED,
+    CheckRequest,
+    Paper,
+)
 from rk.live.rerank import _stats
 from rk.live.reranker import LISTWISE
 from rk.llm import ChatModel, load_prompt
@@ -169,7 +178,9 @@ def check_row(
         "status": "ok",
         "n_top": len(explained_top),
         "n_explained": len(explained),
-        "n_verified": sum(p.status == VERIFIED for p in explained),
+        "n_exact": sum(p.status == VERIFIED_EXACT for p in explained),
+        "n_matched": sum(p.status == VERIFIED_MATCHED for p in explained),
+        "n_unverified": sum(p.status == UNVERIFIED for p in explained),
         "overlaps": overlaps,
         "high_not_original": sum(
             p.explanation is not None and p.explanation.overlap == HIGH and p is not found
@@ -193,6 +204,8 @@ def check_row(
         "explain_cached": step.cached if step else None,
         "finish_reason": step.finish_reason if step else None,
         "keywords_cached": run.keywords_cached,
+        "merged": [list(pair) for pair in run.merged],
+        "n_papers": len(report.papers),
         "vocabulary_terms": sum(len(g.terms) for g in report.vocabulary),
         "stages": report.stages.model_dump(),
         "explainer_stage_s": tool_s,
@@ -222,7 +235,7 @@ def review_rows(
                 "rank": p.rank,
                 "title": p.title,
                 "overlap": e.overlap if e else NOT_EXPLAINED,
-                "verified": "" if e is None else ("yes" if e.verified else "no"),
+                "verified": "" if e is None else (e.match if e.verified else "no"),
                 "evidence": evidence,
                 "differs": e.differs if e else "",
                 "correct?": "",
@@ -335,9 +348,9 @@ def run_explain_eval(
         if row["status"] == "ok":
             level = row["original_overlap"] or ("not in top" if not row["original_in_top"] else "-")
             progress(
-                f"{i}/{len(queries)} {query['qid']}: original {level}; "
-                f"{row['n_verified']}/{row['n_explained']} quotes verified; "
-                f"${row['method_cost']:.4f}"
+                f"{i}/{len(queries)} {query['qid']}: original {level}; quotes "
+                f"{row['n_exact']} exact, {row['n_matched']} matched, "
+                f"{row['n_unverified']} unverified; ${row['method_cost']:.4f}"
             )
         else:
             progress(f"{i}/{len(queries)} {query['qid']}: {row['status']}")
@@ -362,7 +375,7 @@ def summarize(
 ) -> dict[str, Any]:
     ok = [r for r in rows if r["status"] == "ok"]
     explained = sum(r["n_explained"] for r in ok)
-    verified = sum(r["n_verified"] for r in ok)
+    kinds = {k: sum(r[f"n_{k}"] for r in ok) for k in ("exact", "matched", "unverified")}
     top = sum(r["n_top"] for r in ok)
     with_original = [r for r in ok if r["original_in_top"]]
     original_levels = {level: 0 for level in (*OVERLAPS, NOT_EXPLAINED)}
@@ -384,18 +397,22 @@ def summarize(
         "quotes": {
             "papers": top,
             "explained": explained,
-            "verified": verified,
-            "rate": verified / explained if explained else None,
+            **kinds,
+            "rates": {k: n / explained if explained else None for k, n in kinds.items()},
         },
         "original": {
             "in_top": len(with_original),
             "not_in_top": len(ok) - len(with_original),
             "levels": original_levels,
             "high_rate": original_levels[HIGH] / len(with_original) if with_original else None,
-            "verified": sum(r["original_status"] == "verified" for r in with_original),
+            "quotes": {
+                status: sum(r["original_status"] == status for r in with_original)
+                for status in (VERIFIED_EXACT, VERIFIED_MATCHED, UNVERIFIED)
+            },
         },
         "overlaps": overlaps,
         "high_not_original": sum(r["high_not_original"] for r in ok),
+        "merged": [f"{r['qid']}: {a} + {b}" for r in ok for a, b in r["merged"]],
         "steps": {
             "rerank": {s: count("rerank", s) for s in (RERANKED, FALLBACK, SKIPPED)},
             "explainer": {s: count("explainer", s) for s in (EXPLAINED, FALLBACK, SKIPPED)},
@@ -439,7 +456,11 @@ def render_markdown(summary: Mapping[str, Any]) -> str:
     q, o, steps = summary["quotes"], summary["original"], summary["steps"]
     cost, t = summary["cost"], summary["time"]
     first, last = summary["qids"] or ["–", "–"]
-    rate = "–" if q["rate"] is None else f"{q['rate']:.1%}"
+    quotes = ", ".join(
+        f"{kind} {q[kind]} ({'–' if rate is None else f'{rate:.1%}'})"
+        for kind, rate in q["rates"].items()
+    )
+    original_quotes = ", ".join(f"{status} {n}" for status, n in o["quotes"].items())
     high = "–" if o["high_rate"] is None else f"{o['high_rate']:.0%}"
     levels = ", ".join(f"{level} {n}" for level, n in o["levels"].items())
     overlaps = ", ".join(f"{level} {n}" for level, n in summary["overlaps"].items())
@@ -457,14 +478,14 @@ def render_markdown(summary: Mapping[str, Any]) -> str:
         "## Measures",
         "",
         (
-            f"- **Quote verification**: {q['verified']} of {q['explained']} explained papers "
-            f"({rate}) have an evidence sentence found verbatim in the abstract. "
-            f"{q['explained']} of {q['papers']} top papers were explained."
+            f"- **Quotes** of the {q['explained']} explained papers ({q['papers']} top "
+            f"papers): {quotes}. Exact: verbatim in the abstract; matched: a sentence has "
+            f"90% of its words; either way the abstract's sentence is shown."
         ),
         (
             f"- **The original's overlap** (when among the explained papers: {o['in_top']} "
-            f"checks; {o['not_in_top']} without it): {levels}. High: {high}. Its quote was "
-            f"verified in {o['verified']}."
+            f"checks; {o['not_in_top']} without it): {levels}. High: {high}. Its quote: "
+            f"{original_quotes}."
         ),
         (
             f"- **Overlap of every explained paper**: {overlaps}; "
@@ -479,6 +500,11 @@ def render_markdown(summary: Mapping[str, Any]) -> str:
             f"{steps['cut_off']} replies cut off."
         ),
         f"- Keyword lookups failed: {steps['keywords_failed']}.",
+        (
+            f"- Versions merged in the final lists (same text): {len(summary['merged'])}"
+            + "".join(f"; {m}" for m in summary["merged"])
+            + "."
+        ),
     ]
     lines += [f"  - {w}" for w in steps["warnings"]]
     lines += [

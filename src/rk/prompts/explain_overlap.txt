@@ -11,8 +11,8 @@ The four facets:
 For each paper:
 1. facets: for each facet, "same" if the paper's facet is the proposal's, "different" if the paper changes it, leaves it out, or is much broader or narrower. Give the reason in at most 15 words.
 2. overlap: "high" if the paper already does what the proposal plans: the same problem, method and claim, in the same or a very close domain. "partial" if it shares the problem or the method but differs in another facet that matters. "low" if it shares only the broad topic.
-3. evidence: one sentence copied exactly, character for character, from that paper's abstract: the sentence that best shows how the paper relates to the proposal. Do not add quotation marks, and do not shorten, join or change sentences.
-4. differs: one line, at most 25 words, on what the paper does differently from the proposal. If nothing important differs, say so.
+3. evidence: the sentence of that paper's abstract that best shows how the paper relates to the proposal, copied exactly, character for character, from its first word to its last. Keep any opening words (such as "To address this," or "In this paper,") and keep its symbols, markup, spacing and capitals exactly as they are in the abstract. Do not add quotation marks, and do not shorten, join, correct or change it.
+4. differs: one line, at most 25 words, on a substantive difference between the paper and the proposal: in the problem, method, domain or claim. If there is none, write exactly "$no_difference" Never give as a difference that the paper is published or finished, or that the proposal is a plan or doesn't specify something yet.
 
 Proposal: $proposal
 

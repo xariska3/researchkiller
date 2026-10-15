@@ -1,17 +1,26 @@
 """What a check says about its top papers (docs/phase2_spec.md, Pipeline 5; Step 5).
 
 - **Snippets** (`snippets`, free): for each paper, the abstract sentence closest to the
-  idea, by the check's encoder (the idea as a query, the sentences as documents).
+  idea, by the check's encoder (the idea as a query, the sentences as documents), cut at
+  SNIPPET_CHARS.
 - **Explanations** (`explain`): one call to the explainer model (Phase 1's validated
   judge model) with the idea and every paper (number, title, abstract cut at
   explain.abstract_chars). The answer is strict JSON (EXPLAIN_RESPONSE_FORMAT), one
   entry per paper: an overlap level, a same/different verdict and reason per facet, one
   sentence copied from the abstract as evidence, and one line on what differs. Each
   entry is read on its own, so one bad entry costs only its paper.
-- **Quote check** (`verify_quote`): the evidence must be in the abstract verbatim, up
-  to whitespace and the form of quotation marks, and at least MIN_QUOTE_WORDS words
-  long. If it isn't, the quote is dropped and the paper is marked unverified; its
-  snippet stays.
+- **Quote check** (`locate_quote`): the quote is found in the abstract verbatim (up to
+  whitespace and the form of quotation marks: EXACT), or else a sentence has at least
+  90% of its words (MATCHED); either way the report shows the abstract's own sentence,
+  never the quote. A quote under MIN_QUOTE_WORDS words, or with no such sentence, is
+  unverified: no evidence is shown, and the paper keeps its snippet.
+- **Differs**: a substantive difference, or exactly NO_DIFFERENCE; never the paper's
+  publication or the proposal being a plan.
+
+Product fixes chosen after the first dev evaluation and its hand review (Step 5): the 90%
+match and the prompt's "copy from its first word" (32 of 200 quotes were real sentences
+lightly edited), NO_DIFFERENCE (two "differs" lines were "proposal is a plan"), and the
+snippet cap with the sentence split at "datasets.We" (two snippets were whole abstracts).
 
 The call is charged to the check's ledger under its cost cap. If it could cross the
 cap, fails, or its answer can't be read, the check keeps its papers and snippets and
@@ -32,15 +41,28 @@ from pydantic import ValidationError
 
 from rk.config import ModelConfig
 from rk.live.pipeline import CappedChatModel, CheckCostCapExceeded, CheckLedger
-from rk.live.report import FACETS, OVERLAPS, Explanation, Facets, Snippet
+from rk.live.report import (
+    EXACT,
+    FACETS,
+    MATCHED,
+    NO_MATCH,
+    OVERLAPS,
+    Explanation,
+    Facets,
+    Snippet,
+)
 from rk.live.reranker import as_number, render_candidates
 from rk.llm import ChatModel, Completion, LLMError, Usage, load_prompt, parse_json
 from rk.retrieval import Encoder
 from rk.targets import Record
-from rk.text import sentences
+from rk.text import opening, sentence_spans, sentences, tokenize
 
 EXPLAIN_PROMPT = "explain_overlap"  # rk/prompts/explain_overlap.txt
 MIN_QUOTE_WORDS = 5  # shorter evidence shows nothing, so it isn't verified
+MATCH_SHARE = 0.9  # a MATCHED sentence has at least this share of the quote's words
+SNIPPET_CHARS = 350  # a longer snippet is cut at a word, with "…"
+# "differs" when nothing that matters differs; the prompt asks for exactly this.
+NO_DIFFERENCE = "No substantive difference found."
 # What the explainer step did (ExplainStep.status).
 EXPLAINED = "explained"  # at least one paper has an explanation
 FALLBACK = "fallback"  # none has: snippets only, with a warning
@@ -107,7 +129,8 @@ EXPLAIN_SCHEMA_SHA256 = hashlib.sha256(
 def snippets(text: str, records: Sequence[Record], encoder: Encoder) -> list[Snippet | None]:
     """Each record's abstract sentence closest to `text` (None if it has no sentence).
 
-    Ties go to the earlier sentence. All sentences are encoded in one batch.
+    Ties go to the earlier sentence. All sentences are encoded in one batch. A
+    sentence longer than SNIPPET_CHARS is cut at a word, with an ellipsis.
     """
     per_record = [sentences(r["abstract"]) for r in records]
     flat = [s for found in per_record for s in found]
@@ -123,7 +146,8 @@ def snippets(text: str, records: Sequence[Record], encoder: Encoder) -> list[Sni
             continue
         scores = similarity[start : start + len(found)]
         best = int(np.argmax(scores))  # the first maximum
-        out.append(Snippet(sentence=found[best], similarity=round(float(scores[best]), 4)))
+        sentence = opening(found[best], SNIPPET_CHARS)
+        out.append(Snippet(sentence=sentence, similarity=round(float(scores[best]), 4)))
         start += len(found)
     return out
 
@@ -147,14 +171,39 @@ def unwrapped(quote: str) -> str:
     return q
 
 
-def verify_quote(quote: str, abstract: str) -> bool:
-    """Whether `quote` is in `abstract` verbatim, up to whitespace and quotation marks.
+def locate_quote(quote: str, abstract: str) -> tuple[str, str | None]:
+    """How the explainer's quote is found in the abstract, and the abstract's text to show.
 
-    Quotation marks wrapped around the whole quote are ignored, and a quote of fewer
-    than MIN_QUOTE_WORDS words is not verified.
+    - EXACT: the quote is in the abstract verbatim, up to whitespace and the form of
+      quotation marks (marks around the whole quote are ignored). Shown: the sentence
+      it is in, or the fewest consecutive sentences it spans.
+    - MATCHED: otherwise, a sentence has at least MATCH_SHARE of the quote's words
+      (rk.text.tokenize). Shown: that sentence (the largest share, then the first).
+    - NO_MATCH: neither; nothing is shown.
+    A quote of fewer than MIN_QUOTE_WORDS words is NO_MATCH. What is shown is always
+    the abstract's own text, never the quote.
     """
     q = unwrapped(quote)
-    return len(q.split()) >= MIN_QUOTE_WORDS and q in normalise_quote(abstract)
+    words = tokenize(q)
+    if len(q.split()) < MIN_QUOTE_WORDS or not words:
+        return NO_MATCH, None
+    spans = sentence_spans(abstract)
+    normalised = [normalise_quote(abstract[begin:end]) for begin, end in spans]
+    if q in normalise_quote(abstract):
+        for size in range(1, len(spans) + 1):
+            for i in range(len(spans) - size + 1):
+                if q in " ".join(normalised[i : i + size]):
+                    return EXACT, abstract[spans[i][0] : spans[i + size - 1][1]]
+    best: str | None = None
+    share = 0.0
+    for (begin, end), sentence in zip(spans, normalised):
+        present = set(tokenize(sentence))
+        found = sum(w in present for w in words) / len(words)
+        if found > share:
+            best, share = abstract[begin:end], found
+    if best is not None and share >= MATCH_SHARE:
+        return MATCHED, best
+    return NO_MATCH, None
 
 
 # --- the explainer call --------------------------------------------------------------------
@@ -165,7 +214,16 @@ def render_prompt(text: str, records: Sequence[Record], abstract_chars: int) -> 
         n=str(len(records)),
         proposal=text,
         papers=render_candidates(records, abstract_chars),
+        no_difference=NO_DIFFERENCE,
     )
+
+
+def differs_line(text: str) -> str:
+    """The explainer's "differs", with NO_DIFFERENCE written exactly when it was meant."""
+    line = " ".join(text.split())
+    if line.rstrip(".").lower() == NO_DIFFERENCE.rstrip(".").lower():
+        return NO_DIFFERENCE
+    return line
 
 
 def parse_explanations(reply: str, records: Sequence[Record]) -> list[Explanation | None] | None:
@@ -190,19 +248,19 @@ def parse_explanations(reply: str, records: Sequence[Record]) -> list[Explanatio
         number = as_number(item.get("paper"))
         if number is None or not 1 <= number <= len(records) or found[number - 1] is not None:
             continue
-        quote = item.get("evidence")
-        if not isinstance(quote, str):
+        quote, differs = item.get("evidence"), item.get("differs")
+        if not isinstance(quote, str) or not isinstance(differs, str):
             continue
         try:
             facets = Facets.model_validate(item.get("facets"))
-            verified = verify_quote(quote, records[number - 1]["abstract"])
+            match, evidence = locate_quote(quote, records[number - 1]["abstract"])
             found[number - 1] = Explanation(
                 overlap=item.get("overlap"),
                 facets=facets,
-                evidence=unwrapped(quote) if verified else None,
-                verified=verified,
+                match=match,
+                evidence=evidence,
                 quote=quote,
-                differs=item.get("differs"),
+                differs=differs_line(differs),
             )
         except ValidationError:
             continue

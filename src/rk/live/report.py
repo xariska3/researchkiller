@@ -21,9 +21,14 @@ OVERLAPS = (HIGH, PARTIAL, LOW)  # closest first
 SAME, DIFFERENT = "same", "different"
 FACETS = ("problem", "method", "domain", "claim")
 FACET_LABELS = {"problem": "Problem", "method": "Method", "domain": "Domain", "claim": "Claim"}
+# How the explainer's quote was found in the abstract (Explanation.match, rk.live.explain).
+EXACT = "exact"  # verbatim in one of its sentences
+MATCHED = "matched"  # one of its sentences has at least 90% of the quote's words
+NO_MATCH = "unverified"  # neither: no evidence shown
 # What the report shows for a paper (Paper.status).
-VERIFIED = "verified"  # an explanation, with its quote found in the abstract
-UNVERIFIED = "unverified"  # an explanation whose quote isn't in the abstract: no quote shown
+VERIFIED_EXACT = "verified-exact"  # an explanation; evidence: the sentence the quote is in
+VERIFIED_MATCHED = "verified-matched"  # an explanation; evidence: the sentence it matched
+UNVERIFIED = "unverified"  # an explanation without evidence: the snippet is shown
 NOT_EXPLAINED = "not explained"  # the snippet only
 
 
@@ -60,14 +65,22 @@ class Facets(_Model):
 
 
 class Explanation(_Model):
-    """How one paper overlaps the idea, from the explainer call."""
+    """How one paper overlaps the idea, from the explainer call.
+
+    The evidence shown is always the abstract's own sentence, never the explainer's
+    version of it (`quote`, kept for the record).
+    """
 
     overlap: Literal["high", "partial", "low"]
     facets: Facets
-    evidence: str | None  # a sentence of the abstract, found there verbatim; None if not
-    verified: bool  # whether the explainer's quote was found in the abstract
+    match: Literal["exact", "matched", "unverified"]  # how the quote was found
+    evidence: str | None  # the abstract's sentence the quote was found in; None if none
     quote: str  # the sentence the explainer gave as evidence, as it gave it
     differs: str  # one line on what the paper does differently
+
+    @property
+    def verified(self) -> bool:
+        return self.match != NO_MATCH
 
 
 class Snippet(_Model):
@@ -94,7 +107,8 @@ class Paper(_Model):
     def status(self) -> str:
         if self.explanation is None:
             return NOT_EXPLAINED
-        return VERIFIED if self.explanation.verified else UNVERIFIED
+        match = self.explanation.match
+        return {EXACT: VERIFIED_EXACT, MATCHED: VERIFIED_MATCHED}.get(match, UNVERIFIED)
 
 
 class VocabularyGroup(_Model):
@@ -179,7 +193,8 @@ def render_text(report: CheckReport) -> str:
         lines.append(f"#{paper.rank} {level}{paper.title} ({_year(paper)})")
         lines.append(f"   {paper.url}" + (f"  doi:{paper.doi}" if paper.doi else ""))
         if explanation is not None and explanation.evidence is not None:
-            lines.append(f'   Evidence: "{explanation.evidence}"')
+            label = "Evidence" if explanation.match == EXACT else "Evidence (matched)"
+            lines.append(f'   {label}: "{explanation.evidence}"')
         elif paper.snippet is not None:
             label = "Snippet, quote unverified" if explanation is not None else "Snippet"
             lines.append(f'   {label}: "{paper.snippet.sentence}"')

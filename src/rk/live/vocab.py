@@ -6,14 +6,19 @@ sources, each a group of the map:
 - **titles**: phrases of the top papers' titles;
 - **queries**: phrases of the agent's own queries (not the user's text).
 
-A phrase is a run of words between stopwords and punctuation, without leading generic
-science words ("novel", "efficient"); a run longer than MAX_TERM_WORDS is cut at the
-words the text already has. A term is new if one of its content words, by stem and
-other than generic science words, isn't in the text. Its support is how many top papers
-use all those stems (in their title, abstract or keywords); a term no top paper uses
-is dropped. Each group is ranked by support, then by first appearance, and the map
-takes the best remaining term of each group in turn until it has `max_terms`. A term
-already taken (the same stems) isn't repeated in a later group.
+A phrase is a run of words between stopwords, FUNCTION_WORDS and punctuation, without
+leading generic science words ("novel", "efficient"); a run longer than MAX_TERM_WORDS
+is cut at the words the text already has. Keywords are cut at FUNCTION_WORDS and
+punctuation only (they keep "of": "analysis of variance"). A phrase that ends in a
+function word ("graph-based") is dropped. A term is new if one of its content words, by
+stem and other than generic science words, isn't in the text. Its support is how many
+top papers use all those stems (in their title, abstract or keywords); a term no top
+paper uses is dropped. Each group is ranked by support, then by first appearance, and
+the map takes the best remaining term of each group in turn until it has `max_terms`. A
+term already taken (the same stems) isn't repeated in a later group.
+
+(FUNCTION_WORDS were added after the first dev evaluation, which showed phrases such as
+"order using" and "cloze questions using".)
 """
 
 from __future__ import annotations
@@ -33,21 +38,33 @@ LABELS = {
     QUERIES: "Searched for by the agent",
 }
 MAX_TERM_WORDS = 4
+# Words that join a phrase to what follows it, so a phrase ends before them.
+FUNCTION_WORDS = frozenset({"using", "based", "via", "with", "for", "by", "through"})
 
 # Words (hyphenated compounds whole) and single punctuation marks, which end a phrase.
 _TOKEN_RE = re.compile(r"[^\W_]+(?:[-'’][^\W_]+)*|[^\w\s]")
 
 
 def _is_word(token: str) -> bool:
-    return token[0].isalnum() and token.lower() not in STOPWORDS and not token.isdigit()
+    word = token.lower()
+    return (
+        token[0].isalnum()
+        and word not in STOPWORDS
+        and word not in FUNCTION_WORDS
+        and not token.isdigit()
+    )
 
 
-def _runs(text: str) -> list[list[str]]:
-    """Runs of words between stopwords, bare numbers and punctuation, as written."""
+def _runs(text: str, *, keep_stopwords: bool = False) -> list[list[str]]:
+    """Runs of words between stopwords, function words, bare numbers and punctuation.
+
+    With `keep_stopwords`, only function words and punctuation end a run.
+    """
     runs: list[list[str]] = []
     current: list[str] = []
     for token in _TOKEN_RE.findall(text):
-        if _is_word(token):
+        kept = token[0].isalnum() and token.lower() not in FUNCTION_WORDS
+        if _is_word(token) or (keep_stopwords and kept):
             current.append(token)
         elif current:
             runs.append(current)
@@ -55,6 +72,11 @@ def _runs(text: str) -> list[list[str]]:
     if current:
         runs.append(current)
     return runs
+
+
+def _ends_in_function_word(words: Sequence[str]) -> bool:
+    """Whether the phrase's last word is a function word, alone or after a hyphen."""
+    return bool(words) and re.split(r"[-'’]", words[-1].lower())[-1] in FUNCTION_WORDS
 
 
 def _stems(words: Sequence[str]) -> tuple[str, ...]:
@@ -111,7 +133,10 @@ def vocabulary(
     ]
     sources: dict[str, list[list[str]]] = {
         KEYWORDS: [
-            _TOKEN_RE.findall(k) for p in papers for k in keywords.get(p["id"], [])
+            run
+            for p in papers
+            for k in keywords.get(p["id"], [])
+            for run in _runs(k, keep_stopwords=True)
         ],
         TITLES: [w for p in papers for w in _phrases(p["title"], known)],
         QUERIES: [w for q in queries for w in _phrases(q, known)],
@@ -119,10 +144,11 @@ def vocabulary(
     ranked: dict[str, list[tuple[tuple[str, ...], str]]] = {}
     for group, phrases in sources.items():
         seen: dict[tuple[str, ...], tuple[int, int, str]] = {}  # stems -> support, order, form
-        for order, phrase in enumerate(phrases):
-            words = [w for w in phrase if w[0].isalnum()]
+        for order, words in enumerate(phrases):
             stems = _stems(words)
             if not stems or stems in seen or all(s in known for s in stems):
+                continue
+            if _ends_in_function_word(words):
                 continue
             support = sum(set(stems) <= used for used in paper_stems)
             if support:

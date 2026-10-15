@@ -769,14 +769,17 @@ def explain_eval_command(
         )
         spend = f"ledger ${ledger.spent:.4f} of ${ledger.cap:.2f}"
     s = done.summary
-    rate = s["quotes"]["rate"]
+    quotes = ", ".join(
+        f"{kind} {'–' if rate is None else f'{rate:.1%}'}"
+        for kind, rate in s["quotes"]["rates"].items()
+    )
     high = s["original"]["high_rate"]
     check = s["cost"]["check"]
     print(
-        f"rk explain-eval: {s['n_ok']} of {s['n_checks']} checks; quotes verified "
-        f"{'–' if rate is None else f'{rate:.1%}'}; the original rated high in "
-        f"{'–' if high is None else f'{high:.0%}'} of {s['original']['in_top']}; median check "
-        f"cost ${_f(check['p50'] if check else None, 4)}; {spend}; summary in "
+        f"rk explain-eval: {s['n_ok']} of {s['n_checks']} checks; quotes {quotes}; the "
+        f"original rated high in {'–' if high is None else f'{high:.0%}'} of "
+        f"{s['original']['in_top']}; median check cost "
+        f"${_f(check['p50'] if check else None, 4)}; {spend}; summary in "
         f"{done.run_dir / SUMMARY_MD}; review CSV {review_out} ({done.review_rows} rows)"
     )
     return 0

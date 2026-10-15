@@ -10,6 +10,7 @@ from __future__ import annotations
 import csv
 import json
 import re
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -45,22 +46,29 @@ from rk.live.explain import (
     EXPLAIN_SCHEMA_SHA256,
     EXPLAINED,
     FALLBACK,
+    NO_DIFFERENCE,
     SKIPPED,
+    SNIPPET_CHARS,
     explain,
+    locate_quote,
     parse_explanations,
     render_prompt,
     snippets,
-    verify_quote,
 )
 from rk.live.explain_eval import REVIEW_COLUMNS, recorded_times, run_explain_eval
 from rk.live.openalex_search import KEYWORDS_SELECT
-from rk.live.pipeline import AGENT_PROMPT, RERANKED, CheckLedger
+from rk.live.pipeline import AGENT_PROMPT, RERANKED, Candidate, CheckLedger, merge_same_text
+from rk.live.pool import same_text, shared_sentences
 from rk.live.report import (
+    EXACT,
     FACETS,
     HEADER,
+    MATCHED,
+    NO_MATCH,
     NOT_EXPLAINED,
     UNVERIFIED,
-    VERIFIED,
+    VERIFIED_EXACT,
+    VERIFIED_MATCHED,
     CheckReport,
     CheckRequest,
     render_text,
@@ -70,7 +78,7 @@ from rk.live.reranker import LISTWISE
 from rk.live.vocab import KEYWORDS, QUERIES, vocabulary
 from rk.live.vocab import TITLES as TITLE_GROUP
 from rk.llm import LLMError
-from rk.text import content_stems, sentences
+from rk.text import content_stems, sentence_spans, sentences
 
 PAPER_RE = re.compile(r"\[(\d+)\] Title: (.*)\nAbstract: (.*)")
 KEYWORDS_OF_T1 = ["Automatic Summarization", "Sparse attention routing"]
@@ -172,6 +180,35 @@ def test_sentences_are_substrings_split_after_full_stops_only() -> None:
     ]
     assert all(s in text for s in found)
     assert sentences("") == [] and sentences("No full stop") == ["No full stop"]
+    # A full stop whose space was lost still ends a sentence, except after an abbreviation.
+    glued = "Large labelled datasets.We propose a method, e.g.The one in v2.Then it ends."
+    assert sentences(glued) == [
+        "Large labelled datasets.",
+        "We propose a method, e.g.The one in v2.",
+        "Then it ends.",
+    ]
+    assert [glued[b:e] for b, e in sentence_spans(glued)] == sentences(glued)
+
+
+def test_a_full_stop_followed_directly_by_a_capital_ends_a_sentence() -> None:
+    text = "We use a model.NER labels come next.It works (see Fig.A). Done."
+    assert sentences(text) == [
+        "We use a model.",
+        "NER labels come next.",
+        "It works (see Fig.A).",
+        "Done.",
+    ]
+
+
+def test_a_long_snippet_is_cut_at_a_word_with_an_ellipsis() -> None:
+    long_sentence = "We train " + "a very large model on noisy sensor data " * 12 + "today."
+    assert len(long_sentence) > SNIPPET_CHARS
+    records = [{"id": "W1", "abstract": long_sentence + " Short second sentence here."}]
+    (snippet,) = snippets("large model trained on noisy sensor data", records, FakeEncoder())
+    assert snippet is not None and snippet.sentence.endswith(" …")
+    kept = snippet.sentence[: -len(" …")]
+    assert len(kept) <= SNIPPET_CHARS and long_sentence.startswith(kept)
+    assert long_sentence[len(kept)] == " "  # cut at a word
 
 
 def test_the_snippet_is_the_abstract_sentence_closest_to_the_idea() -> None:
@@ -188,16 +225,44 @@ def test_the_snippet_is_the_abstract_sentence_closest_to_the_idea() -> None:
     assert other is not None and other.sentence in sentences(ABSTRACTS[T2])
 
 
-def test_a_quote_must_be_in_the_abstract_verbatim_up_to_spaces_and_quote_marks() -> None:
-    abstract = 'We call it "routing" here.  The router keeps   quality within half a point.'
-    assert verify_quote("The router keeps quality within half a point.", abstract)
-    assert verify_quote("The router keeps\nquality within half a point", abstract)  # a prefix
-    assert verify_quote("“The router keeps quality within half a point.”", abstract)
-    assert verify_quote("We call it “routing” here.", abstract)
-    assert not verify_quote("The router keeps quality within one point.", abstract)
-    assert not verify_quote("the router keeps quality within half a point.", abstract)  # case
-    assert not verify_quote("keeps quality within", abstract)  # under MIN_QUOTE_WORDS
-    assert not verify_quote("", abstract)
+ROUTER_ABSTRACT = (
+    'We call it "routing" here.  To save memory, the router keeps   quality within half a '
+    "point.Ablations follow."
+)
+ROUTER_SENTENCE = "To save memory, the router keeps   quality within half a point."
+
+
+def test_an_exact_quote_shows_the_abstract_sentence_it_is_in() -> None:
+    for quote in (
+        "the router keeps quality within half a point.",
+        "the router keeps\nquality within half a point",  # whitespace, and a part
+        "“the router keeps quality within half a point.”",  # wrapped in curly marks
+        "To save memory, the router keeps quality within half a point.",
+    ):
+        assert locate_quote(quote, ROUTER_ABSTRACT) == (EXACT, ROUTER_SENTENCE)
+    assert locate_quote("We call it “routing” here.", ROUTER_ABSTRACT) == (
+        EXACT,
+        'We call it "routing" here.',  # the abstract's own marks, never the quote's
+    )
+    spanning = "here. To save memory, the router keeps"  # across two sentences
+    assert locate_quote(spanning, ROUTER_ABSTRACT) == (
+        EXACT,
+        'We call it "routing" here.  ' + ROUTER_SENTENCE,
+    )
+
+
+def test_an_edited_quote_shows_the_sentence_with_90_percent_of_its_words() -> None:
+    # A lead-in dropped and the start capitalised: every word of the quote is there.
+    dropped = "The router keeps quality within half a point."
+    assert locate_quote(dropped, ROUTER_ABSTRACT) == (MATCHED, ROUTER_SENTENCE)
+    # 10 of the quote's 11 words are in the sentence: 91%.
+    edited = "To save memory the router keeps accuracy within half a point."
+    assert locate_quote(edited, ROUTER_ABSTRACT) == (MATCHED, ROUTER_SENTENCE)
+    # 9 of 11 are not enough, nor is a quote under 5 words, even a verbatim one.
+    assert locate_quote("To save space the router keeps accuracy within half a point.",
+                        ROUTER_ABSTRACT) == (NO_MATCH, None)
+    assert locate_quote("Ablations follow.", ROUTER_ABSTRACT) == (NO_MATCH, None)
+    assert locate_quote("", ROUTER_ABSTRACT) == (NO_MATCH, None)
 
 
 # --- the explainer call -----------------------------------------------------------------------
@@ -220,7 +285,7 @@ def test_the_explainer_sees_every_paper_and_answers_in_its_schema(cfg: Config) -
     assert explainer.response_formats == [EXPLAIN_RESPONSE_FORMAT]
     assert step.status == EXPLAINED and step.warning is None
     first, second, third = step.explanations
-    assert first is not None and first.overlap == "high" and first.verified
+    assert first is not None and first.overlap == "high" and first.match == EXACT
     assert first.evidence == sentences(ABSTRACTS[T1])[0] == first.quote
     assert first.facets.method.verdict == "same" and first.differs == "nothing important"
     assert second is not None and second.overlap == "low" and third is not None
@@ -242,11 +307,30 @@ def test_each_entry_is_read_on_its_own() -> None:
     }
     first, second, third = parse_explanations(json.dumps(reply), records()) or []
     assert first is not None and first.overlap == "high"
-    assert not first.verified and first.evidence is None  # the quote is dropped
+    assert first.match == NO_MATCH and first.evidence is None  # the quote is dropped
     assert first.quote == "A sentence the abstract doesn't have at all."
     assert second is None and third is None
     assert parse_explanations("no JSON here", records()) is None
     assert parse_explanations('{"papers": "none"}', records()) is None
+
+
+def test_differs_is_a_substantive_difference_or_the_fixed_line() -> None:
+    prompt = render_prompt(GOOD[T1], records(), 2000)
+    assert f'If there is none, write exactly "{NO_DIFFERENCE}"' in prompt
+    assert "Never give as a difference that the paper is published or finished" in prompt
+    assert "or that the proposal is a plan" in prompt
+    abstracts = [r["abstract"] for r in records()]
+    reply = {
+        "papers": [
+            entry(1, abstracts[0], True, differs="no substantive difference found"),
+            entry(2, abstracts[1], False, differs="  Rewards,  not   summaries. "),
+            entry(3, abstracts[2], False, differs=None),  # not a string: no explanation
+        ]
+    }
+    first, second, third = parse_explanations(json.dumps(reply), records()) or []
+    assert first is not None and first.differs == NO_DIFFERENCE
+    assert second is not None and second.differs == "Rewards, not summaries."
+    assert third is None
 
 
 def test_missing_entries_get_a_warning(cfg: Config) -> None:
@@ -332,6 +416,29 @@ def test_the_vocabulary_map_lists_supported_terms_the_text_lacks() -> None:
     assert [(g.source, len(g.terms)) for g in capped] == [(KEYWORDS, 1), (TITLE_GROUP, 1)]
 
 
+def test_function_words_end_a_phrase() -> None:
+    text = "We will make fill-in-the-blank exercises for language learners."
+    papers = [
+        {"id": "W1", "title": "Cloze questions using templates via graph-based ranking",
+         "abstract": "Cloze questions from templates; ranking is graph-based."},
+    ]
+    keywords = {"W1": ["Graph-based", "Templates for cloze questions"]}
+    queries = ["cloze questions using templates", "templates with ranking"]
+    groups = vocabulary(text, queries, papers, keywords, max_terms=10)
+    terms = [t for g in groups for t in g.terms]
+    assert [(g.source, g.terms) for g in groups] == [
+        # "Graph-based" ends in a function word, so it is dropped; the other keyword is
+        # cut at "for" into "Templates" and "cloze questions".
+        (KEYWORDS, ["templates"]),
+        # The title is cut at "using" and "via"; the groups take turns, so the titles
+        # take "cloze questions" before the keywords' second turn.
+        (TITLE_GROUP, ["cloze questions", "graph-based ranking"]),
+        # The queries are cut at "using" and "with"; only "ranking" is left untaken.
+        (QUERIES, ["ranking"]),
+    ]
+    assert not any(t.split()[-1] in ("using", "based", "via", "with", "for") for t in terms)
+
+
 def test_a_term_no_top_paper_uses_is_dropped() -> None:
     papers = [{"id": "W1", "title": "Graph forecasting", "abstract": "Graph forecasting."}]
     groups = vocabulary("We predict speeds.", ["quantum annealing schedules"], papers, {},
@@ -371,7 +478,7 @@ def test_the_default_check_explains_its_top_papers(cfg: Config) -> None:
     top, rest = report.papers[: cfg.live.explain_top_k], report.papers[cfg.live.explain_top_k :]
     assert all(p.snippet is not None and p.explanation is not None for p in top)
     assert all(p.snippet is None and p.explanation is None for p in rest)
-    assert report.papers[0].id == T1 and report.papers[0].status == VERIFIED
+    assert report.papers[0].id == T1 and report.papers[0].status == VERIFIED_EXACT
     assert report.papers[0].explanation is not None
     assert report.papers[0].explanation.overlap == "high"
     assert (report.rerank, report.explainer) == (RERANKED, EXPLAINED)
@@ -401,17 +508,104 @@ def test_the_default_check_explains_its_top_papers(cfg: Config) -> None:
     assert "Words the literature uses that your text doesn't:" in text
 
 
-def test_an_unverified_quote_shows_the_snippet(cfg: Config) -> None:
-    def paraphrased(messages: list[dict[str, str]]) -> str:
-        reply = json.loads(explainer_reply(messages))
-        reply["papers"][0]["evidence"] = "Long books need sparse attention to fit in memory."
-        return json.dumps(reply)
+def quoting(evidence: str) -> FakeLLM:
+    """The explainer, with this evidence for the first paper."""
 
-    report = check(cfg, explainer=FakeLLM(paraphrased)).report
+    def reply(messages: list[dict[str, str]]) -> str:
+        answer = json.loads(explainer_reply(messages))
+        answer["papers"][0]["evidence"] = evidence
+        return json.dumps(answer)
+
+    return FakeLLM(reply)
+
+
+def test_a_matched_quote_shows_the_abstract_sentence_not_the_quote(cfg: Config) -> None:
+    sentence = sentences(ABSTRACTS[T1])[1]
+    assert sentence.startswith("We introduce a routing layer")
+    edited = sentence.replace("We introduce a routing layer that sends", "A routing layer sends")
+    report = check(cfg, explainer=quoting(edited)).report
+    first = report.papers[0]
+    assert first.status == VERIFIED_MATCHED and first.explanation is not None
+    assert first.explanation.evidence == sentence and first.explanation.quote == edited
+    text = render_text(report)
+    assert f'Evidence (matched): "{sentence}"' in text and edited not in text
+
+
+def test_an_unverified_quote_shows_the_snippet(cfg: Config) -> None:
+    quote = "Long books need sparse attention to fit in memory."
+    report = check(cfg, explainer=quoting(quote)).report
     first = report.papers[0]
     assert first.status == UNVERIFIED and first.explanation is not None
     assert first.explanation.evidence is None and first.snippet is not None
     assert f'Snippet, quote unverified: "{first.snippet.sentence}"' in render_text(report)
+
+
+# A second version of T1 with a reworded title and abstract: no sentence is identical.
+T1_VERSION = {
+    "id": "W301",
+    "aliases": [],
+    "title": "Sparse attention routing for summarising long documents",
+    "abstract": (
+        "Transformer summarisers struggle with very long inputs because full self-attention "
+        "grows quadratically with the input length. We propose a routing layer that sends "
+        "every token to a few learned clusters, so attention is computed only within "
+        "clusters. Trained end to end with the summarisation objective, the router keeps "
+        "ROUGE within half a point of dense baselines on arXiv and PubMed while reducing "
+        "memory eightfold. Ablations show that the number of clusters matters more than "
+        "cluster size."
+    ),
+}
+OTHER_ROUTING = {  # a similar title, another paper
+    "id": "W302",
+    "aliases": [],
+    "title": "Sparse attention routing for long document translation",
+    "abstract": ABSTRACTS[T2],
+}
+
+
+def t1_record() -> dict[str, Any]:
+    return {"id": T1, "aliases": [], "title": TITLES[T1], "abstract": ABSTRACTS[T1]}
+
+
+def test_versions_of_one_paper_are_known_by_their_text() -> None:
+    assert not set(sentences(T1_VERSION["abstract"])) & set(sentences(ABSTRACTS[T1]))
+    assert shared_sentences(ABSTRACTS[T1], T1_VERSION["abstract"]) > 0.5
+    assert same_text(t1_record(), T1_VERSION)  # with no shared author
+    assert not same_text(t1_record(), OTHER_ROUTING)  # similar title, other abstract
+    unlike = {**T1_VERSION, "title": "Clustered transformers for book summaries"}
+    assert not same_text(t1_record(), unlike)  # same abstract, other title
+
+
+def test_the_final_list_merges_versions_and_keeps_the_earlier(cfg: Config) -> None:
+    result = check(cfg).result
+    first, second, third = result.candidates[:3]
+    version = Candidate(2, {**second.record, **T1_VERSION}, second.hits, [T1_VERSION])
+    t1 = Candidate(1, {**first.record, **t1_record()}, first.hits, first.versions)
+    listed = replace(result, candidates=[t1, version, third])
+    merged, pairs = merge_same_text(listed)
+    assert pairs == [(T1, "W301")]
+    assert [c.record["id"] for c in merged.candidates] == [T1, third.record["id"]]
+    assert [c.rank for c in merged.candidates] == [1, 2]
+    kept = merged.candidates[0]
+    assert kept.record["aliases"] == ["W301"] and kept.record["title"] == TITLES[T1]
+    assert kept.versions == [*first.versions, T1_VERSION]
+    assert merge_same_text(replace(result, candidates=[t1, third])) == (
+        replace(result, candidates=[t1, third]),
+        [],
+    )
+
+
+def test_a_check_shows_one_entry_for_two_versions(cfg: Config) -> None:
+    version = oa_work(T1_VERSION)
+    fake = FakeLiveOpenAlex([*works(), version])
+    run = run_check(
+        CheckRequest(text=ABSTRACTS[T1], quick=True), cfg, search=_search(cfg, fake),
+        encoder=FakeEncoder(),
+    )
+    ids = [p.id for p in run.report.papers]
+    assert run.merged == [(T1, "W301")] and T1 in ids and "W301" not in ids
+    (t1,) = [p for p in run.report.papers if p.id == T1]
+    assert t1.aliases == ["W301"]
 
 
 def test_nothing_after_the_search_fails_the_check(cfg: Config) -> None:
@@ -549,13 +743,13 @@ def bench(tmp_path: Path) -> Config:
 
 def evaluate(cfg: Config, tmp_path: Path, **kwargs: Any) -> Any:
     kwargs.setdefault("review_out", tmp_path / "review.csv")
+    kwargs.setdefault("explainer", FakeLLM(explainer_reply))
     return run_explain_eval(
         cfg,
         search=_search(cfg, FakeLiveOpenAlex(works())),
         encoder=FakeEncoder(),
         agent=fake_agent(),
         reranker=FakeLLM(original_first),
-        explainer=FakeLLM(explainer_reply),
         from_qid="A0000",
         **kwargs,
     )
@@ -578,13 +772,35 @@ def test_explain_eval_measures_quotes_overlap_cost_and_time(bench: Config, tmp_p
     l5 = {row["qid"]: row["latency_s"] for row in rows_l5 if row["config"] == "L5"}
     assert {q: t["check_s"] for q, t in times.items()} == l5
     assert len(times) == 3 and all(t["rerank_s"] for t in times.values())
-    done = evaluate(bench, tmp_path, limit=3, review_n=2, timing_run=rerank.run_dir)
+    def mixed(messages: list[dict[str, str]]) -> str:
+        """Paper 1's quote exact, paper 2's edited (its first word dropped), 3's invented."""
+        answer = json.loads(explainer_reply(messages))
+        second = answer["papers"][1]["evidence"].split(" ", 1)[1]
+        answer["papers"][1]["evidence"] = second[0].upper() + second[1:]
+        answer["papers"][2]["evidence"] = "A sentence that no abstract of these papers has."
+        return json.dumps(answer)
+
+    done = evaluate(
+        bench, tmp_path, limit=3, review_n=2, timing_run=rerank.run_dir,
+        explainer=FakeLLM(mixed),
+    )
     s = done.summary
     assert (s["n_checks"], s["n_ok"], s["over_cap"]) == (3, 3, 0)
-    assert s["quotes"] == {"papers": 9, "explained": 9, "verified": 9, "rate": 1.0}
+    third = pytest.approx(1 / 3)
+    assert s["quotes"] == {
+        "papers": 9,
+        "explained": 9,
+        "exact": 3,
+        "matched": 3,
+        "unverified": 3,
+        "rates": {"exact": third, "matched": third, "unverified": third},
+    }
     original = s["original"]
     assert original["in_top"] + original["not_in_top"] == 3 and original["in_top"] >= 1
     assert original["levels"]["high"] == original["in_top"] and original["high_rate"] == 1.0
+    assert original["quotes"] == {  # the original is first, with the exact quote
+        VERIFIED_EXACT: original["in_top"], VERIFIED_MATCHED: 0, UNVERIFIED: 0
+    }
     assert s["high_not_original"] == 0
     assert s["steps"]["explainer"] == {"explained": 3, "fallback": 0, "skipped": 0}
     assert s["cost"]["check"]["max"] <= bench.explain.cost_cap_per_check
@@ -609,7 +825,9 @@ def test_explain_eval_measures_quotes_overlap_cost_and_time(bench: Config, tmp_p
     # an explanation nor a snippet.
     explained = [r for r in review if r["overlap"] != NOT_EXPLAINED]
     assert [r["rank"] for r in explained] == ["1", "2", "3"] * 2
-    assert all(r["verified"] == "yes" and r["evidence"] for r in explained)
+    assert [r["verified"] for r in explained] == ["exact", "matched", "no"] * 2
+    assert all(r["evidence"] and not r["evidence"].startswith("[") for r in explained[:2])
+    assert explained[2]["evidence"].startswith("[snippet] ")
     assert all(r["evidence"] == r["verified"] == "" for r in review if r not in explained)
     with pytest.raises(EvalError, match="never overwritten"):
         evaluate(bench, tmp_path, limit=1)
@@ -629,6 +847,6 @@ def test_the_explain_eval_command(
             "--review", "1", "--review-out", str(out_csv)]
     assert cli.main(argv) == 0
     out = capsys.readouterr().out
-    assert "rk explain-eval: 2 of 2 checks; quotes verified 100.0%" in out
+    assert "rk explain-eval: 2 of 2 checks; quotes exact 100.0%, matched 0.0%" in out
     assert models == [bench.agent.name, "fake/reranker", "fake/explainer"]
     assert out_csv.exists() and "(5 rows)" in out
