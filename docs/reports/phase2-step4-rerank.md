@@ -427,6 +427,9 @@ from.
 The chart data, requested on 2026-10-15 after PR #14:
 - **The table** is in
   [docs/evaluation/test80_comparison.csv](../evaluation/test80_comparison.csv).
+- **To regenerate it**: `python scripts/test80_comparison.py`. The script makes no
+  calls: it reads `data/results.sqlite` and the run directories named below, writes the
+  CSV, and prints the numbers of this section's two tables in Markdown.
 - **The whole table is exploratory**: it wasn't pre-declared, and the same 80 queries
   also confirmed L5r against L5w.
 - **The deep check isn't built**, and the rest of the Anthropic credit is left to
@@ -512,5 +515,5 @@ Where each system's numbers come from:
   - That cap left $0.44 for this run, stricter than the $1 you allowed.
 - **Semantic Scholar, Crossref and OpenAlex lookups**: free.
 - **None**: no Anthropic, OpenAI or `llm.sqlite` spend.
-- **The table itself** was built by a one-off script outside the repository that reads
-  only the run files above, like the addendum's.
+- **The table itself** costs nothing: `scripts/test80_comparison.py` reads only the run
+  files above.
