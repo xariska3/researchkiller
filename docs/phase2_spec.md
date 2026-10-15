@@ -301,6 +301,16 @@ design live, and keeps the Phase 1 benchmark as a regression test.
     10 of the 20 checks, one row per top-5 paper, with empty columns for
     correct?, useful? and false alarm?.
   - **Spend cap**: $0.50 of new LLM spend; the expected spend is about $0.12.
+  - **Result (2026-10-15)**, `runs/explain-20261015-212527`:
+    - **Quotes**: 168 of 200 verified (84.0%). The other 32 are all edited real
+      sentences: a lead-in dropped, the end cut off, or a source artefact fixed.
+    - **The original**: rated high in 16 of 16 checks that had it in the top 10.
+    - **Cost**: median $0.0133 a check (max $0.0161).
+    - **Time**: about 31 s estimated live (median).
+    - **Fallbacks**: none.
+    - **Run settings**: the run used the dev run's `live.work_types` (from before
+      `software-paper`), so that its searches replay from the cache.
+    - **Report**: docs/reports/phase2-step5-explainer.md.
 - The Phase 1 frozen benchmark stays runnable as a regression test.
 
 ## Competitive evaluation: is it better than what researchers already use?
