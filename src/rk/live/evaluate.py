@@ -28,7 +28,9 @@ daily budget is spent, the run stops: the unfinished query gets no row, and
 resuming with --run-dir after midnight UTC redoes it, its earlier searches
 coming from the cache. A check over its cost cap is a finished check that
 found nothing: a miss (stop_reason "cost_cap"), counted apart in the summary.
-Other OpenAlex errors and LLM errors are error rows.
+Other OpenAlex errors and LLM errors are error rows. L5w shares L5's check,
+so it shares its outcome too: a check that failed for L5 is an error row in
+L5w as well, and is not run again.
 
 The comparisons were pre-declared in docs/phase2_spec.md (Evaluation): L5 vs
 L1 is Step 2's primary comparison, and L5w vs L5 and L5w vs L1 the test set's,
@@ -552,10 +554,11 @@ def run_live_eval(
                 last["result"] = live_search(
                     proposal, cfg, search=search, encoder=encoder, agent=agent
                 )
-            except CheckCostCapExceeded as exc:  # the same miss for both
-                last["capped"] = exc
-        if "capped" in last:
-            raise last["capped"]
+            # The same outcome for both: a miss over the cost cap, or an error row.
+            except (CheckCostCapExceeded, OpenAlexError, LLMError) as exc:
+                last["failed"] = exc
+        if "failed" in last:
+            raise last["failed"]
         return last["result"]
 
     def l5w(proposal: str) -> Outcome:
