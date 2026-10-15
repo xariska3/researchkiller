@@ -576,23 +576,40 @@ def test_versions_of_one_paper_are_known_by_their_text() -> None:
     assert not same_text(t1_record(), unlike)  # same abstract, other title
 
 
-def test_the_final_list_merges_versions_and_keeps_the_earlier(cfg: Config) -> None:
+def test_the_final_list_merges_versions_into_the_earliest_published(cfg: Config) -> None:
     result = check(cfg).result
     first, second, third = result.candidates[:3]
-    version = Candidate(2, {**second.record, **T1_VERSION}, second.hits, [T1_VERSION])
-    t1 = Candidate(1, {**first.record, **t1_record()}, first.hits, first.versions)
-    listed = replace(result, candidates=[t1, version, third])
-    merged, pairs = merge_same_text(listed)
+
+    def listed(t1_date: str, version_date: str) -> Any:
+        t1 = {**first.record, **t1_record(), "publication_date": t1_date}
+        version = {**second.record, **T1_VERSION, "publication_date": version_date}
+        return replace(
+            result,
+            candidates=[
+                Candidate(1, t1, first.hits, first.versions),
+                Candidate(2, version, second.hits, [version]),
+                third,
+            ],
+        )
+
+    # The earlier entry is the earlier version: it stays as it is, the other its alias.
+    merged, pairs = merge_same_text(listed("2025-01-01", "2025-06-01"))
     assert pairs == [(T1, "W301")]
     assert [c.record["id"] for c in merged.candidates] == [T1, third.record["id"]]
     assert [c.rank for c in merged.candidates] == [1, 2]
     kept = merged.candidates[0]
     assert kept.record["aliases"] == ["W301"] and kept.record["title"] == TITLES[T1]
-    assert kept.versions == [*first.versions, T1_VERSION]
-    assert merge_same_text(replace(result, candidates=[t1, third])) == (
-        replace(result, candidates=[t1, third]),
-        [],
-    )
+    assert [v["id"] for v in kept.versions] == [*(v["id"] for v in first.versions), "W301"]
+    # The later entry was published first: the entry keeps its place, shows that
+    # version, and the earlier entry's id becomes its alias. A tie keeps the earlier.
+    merged, pairs = merge_same_text(listed("2025-06-01", "2025-01-01"))
+    assert pairs == [("W301", T1)]
+    kept = merged.candidates[0]
+    assert (kept.rank, kept.record["id"], kept.record["aliases"]) == (1, "W301", [T1])
+    assert kept.record["title"] == T1_VERSION["title"]
+    assert merge_same_text(listed("2025-03-01", "2025-03-01"))[1] == [(T1, "W301")]
+    unmerged = replace(result, candidates=[listed("2025-01-01", "2025-01-01").candidates[0]])
+    assert merge_same_text(unmerged) == (unmerged, [])
 
 
 def test_a_check_shows_one_entry_for_two_versions(cfg: Config) -> None:

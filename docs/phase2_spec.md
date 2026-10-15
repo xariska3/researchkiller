@@ -341,8 +341,12 @@ design live, and keeps the Phase 1 benchmark as a regression test.
          with a word-set Jaccard of at least 0.5.
        - **Why not exact**: the example (A0053, ranks 4 and 5) rewords every
          sentence a little.
-       - **The merge**: the earlier result is kept, and the other becomes its
-         alias. live-eval doesn't merge.
+       - **The merge**: the entry keeps the earlier place in the list. *Changed
+         after PR #17*: it shows the earliest-published version, and the others
+         become its aliases. live-eval doesn't merge.
+       - **On the test set** (a check only, offline): it changes L5r's Hit@1
+         from 0.825 to 0.838, and leaves Hit@5 at 0.863
+         (`scripts/l5r_merge_check.py`).
   - **Check of the fixes, declared before the run**: `explain-eval` on the next
     20 dev queries in seeded order, from A0071, so none of the first 20.
     - **Settings**: the dev run's work types and the timing run, as before.

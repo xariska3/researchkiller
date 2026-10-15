@@ -458,36 +458,47 @@ def live_search(
     )
 
 
-def merge_same_text(result: LiveSearchResult) -> tuple[LiveSearchResult, list[tuple[str, str]]]:
-    """The final list with versions of one paper merged by their text (pool.same_text).
+def merge_versions(
+    candidates: Sequence[Candidate],
+) -> tuple[list[Candidate], list[tuple[str, str]]]:
+    """A ranked list with versions of one paper merged by their text (pool.same_text).
 
-    Going down the list, a work that is the same text as an earlier one joins it: its
-    id and aliases become the earlier one's aliases, and its versions and hits are
-    added. The rest move up, so the list can be shorter than live.top_k. Returns the
-    merged result and the (kept id, merged id) pairs. The pool and its ranking are
-    unchanged; live-eval doesn't merge.
+    Going down the list, a work that is the same text as an earlier entry joins that
+    entry, which keeps its place. The entry shows the earliest-published version (on a
+    tie, the one earlier in the list); the others' ids and aliases become its aliases,
+    and all their versions and hits are kept. The rest move up, so the list can get
+    shorter. Returns the list, renumbered, and the (kept id, merged id) pairs.
     """
     kept: list[Candidate] = []
     merged: list[tuple[str, str]] = []
-    for candidate in result.candidates:
+    for candidate in candidates:
         same = next((i for i, k in enumerate(kept) if same_text(k.record, candidate.record)), None)
         if same is None:
             kept.append(candidate)
             continue
         first = kept[same]
-        ids = [*first.record["aliases"], candidate.record["id"], *candidate.record["aliases"]]
-        aliases = sorted(set(ids) - {first.record["id"]}, key=id_number)
+        later = candidate.record["publication_date"] < first.record["publication_date"]
+        main, other = (candidate.record, first.record) if later else (first.record, candidate.record)
+        ids = {*first.record["aliases"], other["id"], *candidate.record["aliases"]}
         kept[same] = Candidate(
             first.rank,
-            {**first.record, "aliases": aliases},
+            {**main, "aliases": sorted(ids - {main["id"]}, key=id_number)},
             sorted([*first.hits, *candidate.hits], key=lambda h: (h.query_index, h.kind, h.rank)),
             [*first.versions, *candidate.versions],
         )
-        merged.append((first.record["id"], candidate.record["id"]))
+        merged.append((main["id"], other["id"]))
+    return [replace(c, rank=n) for n, c in enumerate(kept, start=1)], merged
+
+
+def merge_same_text(result: LiveSearchResult) -> tuple[LiveSearchResult, list[tuple[str, str]]]:
+    """The check's final list with versions of one paper merged (merge_versions).
+
+    The pool and its ranking are unchanged; live-eval doesn't merge.
+    """
+    candidates, merged = merge_versions(result.candidates)
     if not merged:
         return result, []
-    renumbered = [replace(c, rank=n) for n, c in enumerate(kept, start=1)]
-    return replace(result, candidates=renumbered), merged
+    return replace(result, candidates=candidates), merged
 
 
 def quick_check(
