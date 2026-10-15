@@ -100,6 +100,9 @@ The design and the analysis were fixed before any paid call, in
   | Semantic Scholar | one call |
 - **OpenAI** reached its cap after 91 answered queries. The other 9 are over
   the cap: they are counted and left out of its statistics.
+- **Addendum, on all 200 checked queries**: ours vs Opus on Hit@5 is
+  significant, 0.730 against 0.610 (52 / 28, McNemar p = 0.0097). See
+  [the addendum](#addendum-ours-vs-opus-on-all-200-checked-queries).
 - **Spend**: $52.32 in all.
   - Anthropic: $46.58 of the $89 group cap.
   - OpenAI: $5.18, of which $5.02 is new spend, under your $5.05.
@@ -425,3 +428,105 @@ The pattern across the 15:
    returned the original but our final ranking dropped it. This is the
    Step 2 gap again. Should improving the rerank come before the explainer
    step?
+
+## Addendum: ours vs Opus on all 200 checked queries
+
+This addendum follows your answers of 2026-10-15 to the open questions above:
+1. Opus runs on the other 100 checked queries, which this addendum reports.
+2. There is no OpenAI top-up, so the search-budget asymmetry stays as reported.
+3. The "deep check" hybrid is pre-declared in
+   [docs/phase2_spec.md](../phase2_spec.md) (Product ideas), not built.
+4. Improving the ranking comes next, before the explainer.
+
+The analysis was pre-declared before any call, in
+[phase2-step3-plan.md](phase2-step3-plan.md) (Addendum).
+
+- **Run**: `runs/compete-20261015-101555`, from 7ab9832 (clean tree), on
+  2026-10-15 from 10:15 to 11:33 UTC.
+  - **Command**: `python -m rk compete --config configs/phase1.yaml
+    --set compete.n_queries=200 --systems ours,claude-opus`.
+  - **Settings**: as in the 100-query run, with `max_searches` 10, the same
+    prompt and tool. Opus's cap was $40 of new spend.
+- **Queries**: all 200 that the dev and test runs checked. The other 100,
+  those not in `compete_sample.csv`, are 59 dev and 41 test queries.
+  - **Buckets of the other 100**: rank 1: 41, ranks 2–10: 24, ranks 11–100:
+    18, not found: 17.
+  - **Buckets of all 200**: 82 / 48 / 37 / 33.
+- **The first 100 are unchanged**: both systems' answers came from the
+  cache, and every rank equals the 100-query run's.
+- **New calls**: 100 Opus calls, with 0 errors, 0 over the cap and 0
+  unparsed answers.
+- **Ours**: the replay reproduced all 80 recorded L5w rankings of the test
+  run.
+
+### Pre-declared test: ours vs Opus on Hit@5
+
+| Queries | n | Ours Hit@5 | Opus Hit@5 | ΔHit@5 [95% CI] | ΔMRR@10 [95% CI] | Only ours / only Opus | McNemar p |
+|---|---|---|---|---|---|---|---|
+| **All 200** | 200 | **0.730** | 0.610 | **+0.120 [+0.035, +0.205]** | +0.024 [−0.062, +0.108] | 52 / 28 | **0.0097** |
+| The other 100 (descriptive) | 100 | 0.740 | 0.610 | +0.130 [+0.010, +0.250] | +0.009 [−0.108, +0.127] | 26 / 13 | 0.053 |
+| The first 100 (as reported above) | 100 | 0.720 | 0.610 | +0.110 [−0.020, +0.230] | +0.038 [−0.088, +0.159] | 26 / 15 | 0.117 |
+
+- **Result: on all 200 queries, ours finds the original in its top 5
+  significantly more often than Opus with web search** (p = 0.0097, below
+  the pre-declared α = 0.05). This is one pre-declared test, so there is no
+  Holm adjustment.
+- **The other 100 behave like the first 100.** On them, ours leads by
+  +0.13, close to +0.11 on the first 100, with p = 0.053 at n = 100.
+- **How independent the test is**: the 200 include the first 100, whose
+  result prompted this test, so they aren't a fresh replication. The other
+  100 alone are the fresh part, and they point the same way.
+- **MRR@10 doesn't separate the two systems**, as on the first 100.
+- **Opus is ahead on Hit@1**: 0.575 against 0.520. When Opus finds the
+  original, it lists it first 115 times out of 122. Ours finds more
+  originals but spreads them over ranks 1–10: 104 at rank 1, 146 in the
+  top 5, 160 in the top 10.
+
+| System | Hit@1 | Hit@5 | Hit@10 | MRR@10 |
+|---|---|---|---|---|
+| ours (L5w) | 0.520 | **0.730** | **0.800** | **0.612** |
+| claude-opus | **0.575** | 0.610 | 0.610 | 0.588 |
+
+### Hit@5 by difficulty, all 200
+
+| System | 1 (n = 82) | 2–10 (n = 48) | 11–100 (n = 37) | not found (n = 33) |
+|---|---|---|---|---|
+| ours | **0.915** (75) | **0.771** (37) | 0.568 (21) | 0.394 (13) |
+| claude-opus | 0.561 (46) | 0.562 (27) | **0.784** (29) | **0.606** (20) |
+
+- **The complementary pattern holds on 200 queries.** Ours wins the two
+  easier buckets, and Opus the two harder ones.
+- **Together (exploratory)**: the original is in ours' or Opus's top 5 for
+  174 of 200 queries (0.87), as on the first 100.
+
+### Opus's answers on the other 100
+
+- **Unresolved papers**: 63 of 995 (6.3%). Over all 200 it is 6.6%. DOIs or
+  links that lead to another paper: 2.2% (2.8% over 200).
+- **Cost**: $0.298 a query on average (median $0.282, p95 $0.434, max
+  $0.511). Ours costs $0.0072 on the same queries.
+- **Latency**: 33.8 s on average. Ours takes 17.8 s on the same queries.
+- **Web searches**: 7.0 a query on average (median 6, max 10).
+  - In 52 of the 100 answers, a batch of searches was refused at the limit
+    of 10, against 47 on the first 100.
+  - Opus therefore often wants more than 10 searches.
+
+### Spend
+
+- **This run**: $29.81 of the $40 allowed, for the 100 new Opus calls.
+- **Opus in total**: $59.77 of its $69.96 cap.
+- **Anthropic group**: $76.39 of the $89 cap.
+  - About $23.61 of the $100 credit is left, by our count. Anthropic doesn't
+    report a billed cost, so the console's figure may differ slightly.
+  - The credit expires on 2026-10-18 UTC.
+- **All compete runs**: $82.13 in total.
+- **Nothing else**: no OpenAI, Perplexity or `llm.sqlite` spend.
+
+### Deviations
+
+- **The 200-query run** used `--set compete.n_queries=200`, not a new
+  sample file. With 200, the sample is the whole frame, and the run's
+  `run.json` lists it. `compete_sample.csv` still holds the first 100.
+- **An untracked `test_report.md`** was in the repository root when the run
+  started (recorded in `run.json`). This step's work didn't create it, and
+  it isn't committed.
