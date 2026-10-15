@@ -92,6 +92,8 @@ def test_env_example_lists_every_variable_the_config_reads_with_empty_values() -
     cfg = load_config(root / "configs" / "phase1.yaml")
     read = {m.api_key_env for m in cfg.models().values()}
     read |= {cfg.corpus.api_key_env, cfg.corpus.mailto_env}
+    assert cfg.compete is not None
+    read |= {s.api_key_env for s in cfg.compete.systems} | {cfg.compete.crossref_mailto_env}
     example = dotenv_values(root / ".env.example")
     assert read == set(example)
     assert not any(example.values())

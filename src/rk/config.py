@@ -234,6 +234,131 @@ class LiveConfig:
         _require(self.openalex_timeout_s > 0, "openalex_timeout_s must be > 0")
 
 
+COMPETE_KINDS = ("anthropic", "openai", "openrouter", "s2-search", "s2-snippets")
+PAID_COMPETE_KINDS = ("anthropic", "openai", "openrouter")
+SEARCH_CONTEXT_SIZES = ("low", "medium", "high")
+OPENROUTER_WEB_SEARCH = "openrouter:web_search"  # OpenRouter's server tool
+OPENAI_WEB_SEARCH = "web_search"  # the Responses API's built-in tool
+
+
+@dataclass(frozen=True)
+class CompeteSystemConfig:
+    """One system in the competitive evaluation (rk.compete).
+
+    `kind` picks the client: "anthropic" (Messages API with Anthropic's web search
+    tool), "openai" (Responses API with OpenAI's web search tool), "openrouter"
+    (chat completions; with web_search_tool the OpenRouter server tool runs the
+    model's own search, otherwise Perplexity-style models search by themselves),
+    "s2-search" and "s2-snippets" (Semantic Scholar's paper and snippet search, free).
+    """
+
+    name: str  # in tables and for --systems
+    kind: str
+    base_url: str
+    label: str | None = None  # how reports describe the system; None: from its settings
+    model: str | None = None
+    api_key_env: str | None = None  # required for paid kinds; optional for Semantic Scholar
+    # anthropic: the tool type; openai: web_search; openrouter: the server tool
+    web_search_tool: str | None = None
+    max_searches: int | None = None  # anthropic and openrouter max_uses; openai max_tool_calls
+    spend_group: str | None = None  # a CompeteConfig.spend_groups entry whose cap it shares
+    search_context_size: str | None = None  # low / medium / high
+    reasoning_effort: str | None = None  # openai/openrouter `reasoning.effort`; None: default
+    max_tokens: int = 4096  # output tokens (openai: max_output_tokens, reasoning included)
+    price_in_per_m: float = 0.0  # USD per million input tokens (search results included)
+    price_out_per_m: float = 0.0  # USD per million output tokens (reasoning included)
+    price_per_search: float = 0.0  # USD per web search the model runs
+    price_per_request: float = 0.0  # USD per request (Perplexity's request fee)
+    reserve_per_query: float = 0.0  # USD held back before each real call (an upper bound)
+    cost_cap: float = 0.0  # USD, cumulative over every compete run of this system
+    requests_per_second: float = 1.0
+    timeout_s: float = 300.0
+
+    def __post_init__(self) -> None:
+        _require(bool(self.name.strip()), "name must not be empty")
+        _require(
+            self.name == self.name.strip() and "," not in self.name,
+            "name must have no commas or surrounding spaces (it is a --systems value)",
+        )
+        _require(self.kind in COMPETE_KINDS, f"kind must be one of {list(COMPETE_KINDS)}")
+        paid = self.kind in PAID_COMPETE_KINDS
+        if paid:
+            _require(bool(self.model), f"{self.kind} systems need a model")
+            _require(bool(self.api_key_env), f"{self.kind} systems need api_key_env")
+            _require(self.reserve_per_query > 0, "paid systems need reserve_per_query > 0")
+            _require(self.cost_cap > 0, "paid systems need cost_cap > 0")
+        else:
+            _require(self.cost_cap == 0, "free systems have no cost_cap")
+        if self.kind == "anthropic":
+            _require(
+                (self.web_search_tool or "").startswith("web_search_"),
+                "anthropic systems need web_search_tool, e.g. web_search_20260318",
+            )
+        elif self.kind == "openai":
+            _require(
+                self.web_search_tool == OPENAI_WEB_SEARCH,
+                f"the web_search_tool of openai systems is {OPENAI_WEB_SEARCH}",
+            )
+        elif self.kind == "openrouter":
+            _require(
+                self.web_search_tool in (None, OPENROUTER_WEB_SEARCH),
+                f"the web_search_tool of openrouter systems is {OPENROUTER_WEB_SEARCH} or null",
+            )
+        else:
+            _require(self.web_search_tool is None, "Semantic Scholar has no web_search_tool")
+        _require(
+            self.search_context_size in (None, *SEARCH_CONTEXT_SIZES),
+            f"search_context_size must be one of {list(SEARCH_CONTEXT_SIZES)} or null",
+        )
+        _require(self.max_searches is None or self.max_searches >= 1, "max_searches must be >= 1")
+        _require(self.max_tokens >= 1, "max_tokens must be >= 1")
+        prices = (self.price_in_per_m, self.price_out_per_m, self.price_per_search)
+        _require(min(*prices, self.price_per_request) >= 0, "prices must be >= 0")
+        _require(self.reserve_per_query >= 0 and self.cost_cap >= 0, "costs must be >= 0")
+        _require(self.requests_per_second > 0, "requests_per_second must be > 0")
+        _require(self.timeout_s > 0, "timeout_s must be > 0")
+        _require(
+            self.spend_group is None or self.kind in PAID_COMPETE_KINDS,
+            "only paid systems have a spend_group",
+        )
+
+
+@dataclass(frozen=True)
+class SpendGroupConfig:
+    """A cap on the combined spend of the systems that name it (e.g. one API account)."""
+
+    name: str
+    cost_cap: float  # USD, cumulative over every compete run of its systems
+
+    def __post_init__(self) -> None:
+        _require(bool(self.name.strip()), "name must not be empty")
+        _require(self.cost_cap > 0, "cost_cap must be > 0")
+
+
+@dataclass(frozen=True)
+class CompeteConfig:
+    """Phase 2 competitive evaluation (docs/phase2_spec.md, Competitive evaluation)."""
+
+    # live-eval runs whose checked queries are sampled; ours (L5w) is replayed from them
+    runs: tuple[Path, ...]
+    cache_path: Path  # SQLite: every system response, resolver lookup and the spend table
+    systems: tuple[CompeteSystemConfig, ...]
+    n_queries: int = 100
+    crossref_mailto_env: str | None = None  # an email for Crossref's polite pool (optional)
+    spend_groups: tuple[SpendGroupConfig, ...] = ()
+
+    def __post_init__(self) -> None:
+        _require(len(self.runs) > 0, "runs must list at least one live-eval run directory")
+        _require(self.n_queries >= 1, "n_queries must be >= 1")
+        names = [s.name for s in self.systems]
+        _require(len(set(names)) == len(names), f"system names must be unique: {names}")
+        _require("ours" not in names, "'ours' is the live tool's name; pick another")
+        groups = [g.name for g in self.spend_groups]
+        _require(len(set(groups)) == len(groups), f"spend group names must be unique: {groups}")
+        unknown = sorted({s.spend_group for s in self.systems if s.spend_group} - set(groups))
+        _require(not unknown, f"spend_group(s) {unknown} not declared in spend_groups")
+
+
 @dataclass(frozen=True)
 class Config:
     corpus: CorpusConfig
@@ -244,6 +369,7 @@ class Config:
     judge: ModelConfig
     agent: ModelConfig
     live: LiveConfig | None = None  # Phase 2; the Phase 1 commands don't need it
+    compete: CompeteConfig | None = None  # Phase 2 Step 3: python -m rk compete
 
     def models(self) -> dict[str, ModelConfig]:
         return {"paraphraser": self.paraphraser, "judge": self.judge, "agent": self.agent}

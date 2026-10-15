@@ -21,9 +21,12 @@ from rk.bench import (
     make_bench,
     validate_judge,
 )
+from rk.compete import evaluate as compete_eval
+from rk.compete.resolve import Resolver
+from rk.compete.systems import CompeteError, connect_store, make_system
 from rk.config import ConfigError, load_config
 from rk.corpus import CorpusError, OpenAlexClient, OpenAlexError, build_corpus
-from rk.evaluate import CONFIG_ORDER, SUMMARY_MD, EvalError, report, run_eval
+from rk.evaluate import CONFIG_ORDER, SUMMARY_MD, EvalError, _f, report, run_eval
 from rk.live import evaluate as live_eval
 from rk.live import replay as live_replay
 from rk.live.fusion import FUSIONS
@@ -71,6 +74,13 @@ def _live_config_list(text: str) -> list[str]:
         raise argparse.ArgumentTypeError(
             f"unknown live configs {unknown}; choose from {','.join(live_eval.LIVE_CONFIGS)}"
         )
+    return names
+
+
+def _name_list(text: str) -> list[str]:
+    names = [name.strip() for name in text.split(",") if name.strip()]
+    if not names:
+        raise argparse.ArgumentTypeError("expected comma-separated names")
     return names
 
 
@@ -219,6 +229,33 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=live_replay.MISSES_FILE,
         help=f"CSV to write; never overwritten (default {live_replay.MISSES_FILE})",
+    )
+
+    compete = sub.add_parser(
+        "compete",
+        help="compare the live tool with other systems on a stratified sample of live-eval queries",
+    )
+    _add_config_arguments(compete)
+    compete.add_argument(
+        "--limit", type=_positive_int, help="ask only the first N sampled queries (seeded order)"
+    )
+    compete.add_argument(
+        "--systems",
+        type=_name_list,
+        help="comma-separated systems (default: ours and every system in compete.systems)",
+    )
+    compete.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="show the sample and what the uncached calls could cost; send nothing",
+    )
+    compete.add_argument(
+        "--save-sample",
+        type=Path,
+        metavar="CSV",
+        help=(
+            f"also save the sample as a CSV, never overwritten (e.g. {compete_eval.SAMPLE_FILE})"
+        ),
     )
 
     report_cmd = sub.add_parser("report", help="regenerate a run's summary from the database")
@@ -442,6 +479,52 @@ def live_misses_command(run_dir: Path, n: int, out: Path) -> int:
     return 0
 
 
+def compete_command(
+    config_path: Path,
+    limit: int | None,
+    systems: list[str] | None,
+    dry_run: bool,
+    save_sample: Path | None = None,
+    overrides: Sequence[str] = (),
+) -> int:
+    cfg = load_config(config_path, overrides)
+    if cfg.compete is None:
+        raise ConfigError(f"{config_path} has no compete: section")
+    plan = compete_eval.make_plan(cfg, systems=systems, limit=limit)
+    if save_sample is not None:
+        compete_eval.save_sample(plan, save_sample)
+        print(f"rk compete: wrote the {len(plan.sample)} sampled queries to {save_sample}")
+    by_name = {s.name: s for s in cfg.compete.systems}
+    with ExitStack() as stack:
+        conn = stack.enter_context(closing(connect_store(cfg.compete.cache_path)))
+        clients = {
+            name: stack.enter_context(closing(make_system(by_name[name])))
+            for name in plan.systems
+            if name != compete_eval.OURS
+        }
+        if dry_run:
+            ledger = compete_eval.make_ledger(cfg.compete, conn)
+            print(compete_eval.describe_plan(plan, clients, conn, ledger))
+            return 0
+        resolver = stack.enter_context(closing(Resolver.from_config(cfg, conn)))
+        ours = compete_eval.OURS in plan.systems
+        done = compete_eval.run_compete(
+            cfg,
+            plan,
+            clients=clients,
+            resolver=resolver,
+            conn=conn,
+            encoder=make_encoder(cfg.retrieval) if ours else None,
+            progress=lambda line: print(f"rk compete: {line}", flush=True),
+        )
+    hit5 = ", ".join(f"{s} {_f(q['hit_at_5'])}" for s, q in done.summary["quality"].items())
+    print(
+        f"rk compete: {len(plan.sample)} queries; Hit@5: {hit5}; "
+        f"summary in {done.run_dir / SUMMARY_MD}"
+    )
+    return 0
+
+
 def report_command(run_dir: Path) -> int:
     if live_eval.is_live_run(run_dir):
         summary = live_eval.report(run_dir)
@@ -497,6 +580,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             return live_fusion_command(args.run_dir)
         if args.command == "live-misses":
             return live_misses_command(args.run_dir, args.n, args.out)
+        if args.command == "compete":
+            return compete_command(
+                args.config,
+                args.limit,
+                args.systems,
+                args.dry_run,
+                args.save_sample,
+                args.overrides,
+            )
         return report_command(args.run_dir)
     except (
         ConfigError,
@@ -508,6 +600,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         BudgetExceeded,
         RetrievalError,
         EvalError,
+        CompeteError,
     ) as exc:
         print(f"rk {args.command}: {exc}", file=sys.stderr)
         return 1
