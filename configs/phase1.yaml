@@ -79,7 +79,7 @@ live:
 # the group's cap. Systems run in this order. Prices are USD per million tokens, per
 # search and per request.
 compete:
-  runs: [runs/live-20261014-122144]   # the dev set; the test run is added when it finishes
+  runs: [runs/live-20261014-122144, runs/live-20261015-000815]   # the dev and test sets
   cache_path: data/cache/compete.sqlite
   n_queries: 100
   crossref_mailto_env: CROSSREF_MAILTO
