@@ -74,6 +74,14 @@ confirmed on the test set, the same discipline as L5w's choice in Step 2.
 - **Spend**:
   - Qwen: $0.59, in `llm.sqlite`, now $6.07 of $12.
   - Sonnet: $6.53 of its $20 cap.
+- **Addendum, against Claude Opus on the 80 test queries** (exploratory): L5r's Hit@5
+  is 0.863 against Opus's 0.550 (30 / 5, McNemar p = 2.2e-5), and its Hit@1 0.825
+  against 0.537 (29 / 6, p = 0.00012), at 1/33 of the cost. See
+  [the addendum](#l5r-against-claude-opus-on-the-test-set).
+- **Addendum, deep-check preview** (exploratory; it decides nothing): L5r's list
+  merged with Sonnet's web-search answer reaches Hit@5 0.900 against L5r's 0.863 (4 / 1,
+  p = 0.375). Hit@1 is equal by construction. It costs $0.166 a check. See
+  [the addendum](#deep-check-preview-on-the-test-set).
 
 ## Finding the original
 
@@ -261,3 +269,151 @@ recognise the paraphrase by its meaning: the same problem, approach and claim.
    The deep-check evaluation needs Sonnet with web search on new queries, about $0.17
    a query, so about 100 queries would fit. Use it for that before it expires, or let
    it go?
+
+## Addendum: after the test (2026-10-15)
+
+Your answers to the open questions above:
+1. **L5r goes into the live pipeline** as its own step, the next one: the default check,
+   with an L5r config in live-eval.
+2. **A failed rerank call falls back** to L5w's order, with a warning.
+3. **Retrieval**: not decided yet.
+4. **The Anthropic credit** goes to a deep-check preview on the test set, capped at $15.
+
+You also asked for L5r against Opus on the test set, as the number to quote publicly,
+and for the benchmark caveat in the README's limitations (done).
+
+### L5r against Claude Opus on the test set
+
+Exploratory: not pre-declared. But neither system was tuned on these 80 queries:
+- **L5r** was chosen on the dev set.
+- **Opus's answers** are Step 3's, from `runs/compete-20261015-101555`: Opus 5.5 with
+  web search, at most 10 searches, the same prompt as every system.
+
+Both lists are scored as in Step 3, from the two runs' `results.jsonl` files. There
+were no new calls.
+
+| 80 test queries | Hit@1 | Hit@5 | Hit@10 | MRR@10 | Cost per check | Time per check (mean) |
+|---|---|---|---|---|---|---|
+| **L5r** | **0.825** (66) | **0.863** (69) | **0.875** (70) | **0.842** | $0.0092 | 27.2 s |
+| Claude Opus 5.5 with web search | 0.537 (43) | 0.550 (44) | 0.550 (44) | 0.542 | $0.302 | 33.8 s |
+| *L5w, before the reranker* | *0.537 (43)* | *0.700 (56)* | *0.775 (62)* | *0.608* | *$0.0077* | *21.2 s* |
+
+| L5r vs Opus | n | Difference [95% CI] | Only L5r / only Opus | McNemar p |
+|---|---|---|---|---|
+| **Hit@5** | 80 | **+0.312 [+0.188, +0.438]** | 30 / 5 | **2.2e-5** |
+| **Hit@1** | 80 | **+0.287 [+0.163, +0.412]** | 29 / 6 | **0.00012** |
+| MRR@10 | 80 | +0.300 [+0.174, +0.425] | – | – |
+
+- **The reranker made the difference at rank 1.** Before it, L5w tied Opus on Hit@1
+  (21 / 21, p = 1). It led on Hit@5, but not significantly (+0.150, 24 / 12, p = 0.065).
+- **By difficulty** (Hit@5, by the original's rank in Phase 1's BM25):
+
+  | System | 1 (n = 34) | 2–10 (n = 18) | 11–100 (n = 13) | not found (n = 15) |
+  |---|---|---|---|---|
+  | L5r | 32 | 15 | 9 | 13 |
+  | Opus | 18 | 10 | 9 | 7 |
+
+  In Step 3, Opus beat L5w on the two hardest buckets. L5r ties it on 11–100 and leads
+  on "not found".
+- **Cost and time**: L5r costs 1/33 of Opus's answer and is faster on average. L5r's
+  time is the check's (Step 2's test run) plus the rerank call.
+- **Caveats to quote with it**:
+  - **The benchmark suits our tool.**
+    - Each proposal paraphrases one abstract, which an LLM reranker may recognise more
+      easily than a real idea (README, Limitations).
+    - Every original is a 2026 OpenAlex work with an abstract, which is the index our
+      tool searches. Web search may not have indexed the newest ones yet: 24 of the 80
+      were published from July 2026, and Step 3 saw web search miss papers a few weeks
+      old.
+  - **Opus's search budget**: at most 10 searches. In Step 3 it hit that limit in
+    about half its answers.
+  - **Not pre-declared**, one answer per system and query, n = 80.
+- **A wording that stays within the data**: "On 80 held-out benchmark proposals,
+  ResearchKiller's default check listed the source paper in its top 5 for 86% of them,
+  against 55% for Claude Opus 5.5 with web search (paired McNemar test, p < 0.001), at
+  about 1/30 of the cost."
+
+### Deep-check preview on the test set
+
+The deep check (docs/phase2_spec.md, Product ideas) adds one Sonnet web-search call to
+the default check and merges the two lists:
+- **Interleaving**: the two top-10 lists alternate, starting with L5r's first paper.
+- **Repeats**: a paper already listed is skipped. Papers are the same if they share an
+  OpenAlex id (or alias), a DOI or a normalised title.
+- **Unverified papers**: a Sonnet paper that no free route verifies is kept and marked.
+- **Length**: the merged list is cut to 10.
+
+This preview and its measures were declared in the spec before any call (81f425a).
+It decides nothing: 39 of the 80 queries were in Step 3's sample, which the design came
+from.
+
+- **Run**: `runs/compete-20261015-162116`, Step 3's compete command on the 80 test
+  queries with ours and Sonnet:
+
+  ```
+  python -m rk compete --config configs/phase1.yaml --systems ours,claude-sonnet --set "compete.runs=[runs/live-20261015-000815]" --set compete.n_queries=80 --set "compete.spend_groups=[{name: anthropic, cost_cap: 88.0}]"
+  ```
+
+  - **Sonnet's answers**: 80, with 0 errors and 0 unparsed. 39 came from Step 3's
+    cache and 41 were new calls ($6.45).
+  - **The replay** reproduced all 80 recorded L5w rankings.
+- **The merge**: L5r's top 10 come from the R1 rows of the test rerank run. The merge
+  was computed offline from them and from Sonnet's resolved lists in the run's
+  `results.jsonl`. The per-query result is in the run directory,
+  `deep_check_preview.jsonl`.
+
+| 80 test queries | Hit@1 | Hit@5 | Hit@10 | MRR@10 | Cost per check: mean / p95 / max | Time per check: mean / p50 / p95 |
+|---|---|---|---|---|---|---|
+| L5r alone | 0.825 (66) | 0.863 (69) | 0.875 (70) | 0.842 | $0.0092 / $0.0112 / $0.0115 | 27.2 / 27.3 / 36.3 s |
+| **Deep check** (L5r + Sonnet) | 0.825 (66) | **0.900** (72) | **0.912** (73) | **0.857** | $0.166 / $0.200 / $0.209 | 29.3 / 27.8 / 37.2 s |
+| *Sonnet alone* | *0.412 (33)* | *0.475 (38)* | *0.475 (38)* | *0.438* | *$0.157 / $0.189 / $0.200* | *22.4 / 21.3 / 25.4 s* |
+
+| Deep check vs L5r | n | Difference [95% CI] | Only deep / only L5r | McNemar p |
+|---|---|---|---|---|
+| Hit@5 | 80 | +0.037 [−0.013, +0.100] | 4 / 1 | 0.375 |
+| Hit@10 | 80 | +0.037 [−0.013, +0.100] | 4 / 1 | 0.375 |
+| MRR@10 | 80 | +0.016 [−0.001, +0.037] | – | – |
+| Hit@1 | 80 | 0 (equal by construction) | 0 / 0 | 1 |
+
+- **Gains**: 4 queries whose original wasn't among L5r's candidates (A0207, A0218,
+  A0219, A0247). Sonnet listed it at 1–3, and the merge put it at 2–5.
+- **The loss**: A0216. L5r had the original 5th; Sonnet's papers pushed it to 8th.
+- **What the merge could reach**: L5r's or Sonnet's top 5 holds the original on 73 of
+  80 queries, and the deep check gets 72.
+- **Unverified papers**: 20 of the 800 merged entries (2.5%).
+  - 366 entries came from Sonnet, so 5.5% of those are unverified.
+  - Another 133 of Sonnet's papers were already in L5r's list and were skipped.
+- **Cost**: $0.166 a check, 18 times L5r's and over the default check's $0.10 cap, as
+  the spec expected (about $0.17).
+- **Time**: the Sonnet call runs alongside L5r, so a check takes the longer of the two:
+  29.3 s on average against L5r's 27.2 s.
+  - One Sonnet answer, from Step 3's cache (A0280), took 116 s.
+  - Not counted: the lookups that verify Sonnet's papers, all of which came from the
+    cache here. In the live tool they would add a few seconds.
+- **Power**: with 5 discordant queries out of 80, the preview can't tell a 4-point gain
+  from noise. The pre-declared evaluation on new queries (from A0288) hasn't been run.
+
+### Spend in this addendum
+
+| Ledger | Spent | Total / cap |
+|---|---|---|
+| `data/cache/compete.sqlite`, Sonnet (Anthropic credit) | **$6.45** | Sonnet $23.06 of $40; the Anthropic group $82.84 of $88 (the config's $89, lowered on the command line for this run) |
+| `data/cache/llm.sqlite` (Qwen) | 0 | $6.07 of $12 |
+| OpenAlex, Crossref | 0 (free singleton lookups) | – |
+
+- **The Anthropic credit**: by our count, $89.37 of the $100 is spent: the compete
+  group's $82.84 plus this step's $6.53 of reranking.
+  - **Left**: $10.63 of the credit, or $5.63 under the workspace's $95 spend limit.
+  - **Expires**: 2026-10-18 UTC.
+
+### Deviations in this addendum
+
+1. **The cap**: you allowed $15. The run's cap was $11.61 of new spend (the group cap
+   at $88), so that the Anthropic total by our count couldn't cross the workspace's
+   $95 limit. The run spent $6.45.
+2. **The compete run's tree wasn't clean**: its `run.json` records uncommitted changes.
+   The only change was this addendum's README edit, saved 12 s before the run started.
+   No code differed from 81f425a.
+3. **One-off scripts**: the Opus comparison and the deep-check merge were computed by
+   scripts outside the repository, since the deep check isn't built. Both read only the
+   run files named above. The merge follows the spec's rule.

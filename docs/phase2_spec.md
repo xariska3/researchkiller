@@ -394,6 +394,10 @@ no fabricated citations.
       merged top 10, and cost and latency per check.
     - **Hit@1 is equal by construction**: the merged list starts with L5r's
       first paper.
+    - **Result** (`runs/compete-20261015-162116`; see
+      [the rerank report](reports/phase2-step4-rerank.md)): Hit@5 0.900
+      against L5r's 0.863 (4 / 1, McNemar p = 0.375), at $0.166 a check and
+      $6.45 of new spend. Nothing is decided.
 
 ## Out of scope for Phase 2
 Docker as a requirement, user accounts, scoop alerts, `.bib` missing-citation check, the MCP server,
