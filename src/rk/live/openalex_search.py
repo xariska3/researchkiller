@@ -70,9 +70,9 @@ one if it is younger than live.cache_ttl_days and fetches again otherwise;
 evaluation runs read the first one ever cached, so they never expire and a
 rerun sees the same responses.
 
-A check's vocabulary map also reads its top papers' OpenAlex keywords (`keywords`):
-one list call filtered by ids.openalex (a list+filter call, $0.0001), cached the
-same way. Searches don't select keywords, so their cached responses stay valid.
+A check also reads its papers' OpenAlex keywords (for the vocabulary map) and venues
+(`details`): one list call filtered by ids.openalex (a list+filter call, $0.0001),
+cached the same way. Searches don't select them, so their cached responses stay valid.
 """
 
 from __future__ import annotations
@@ -103,9 +103,9 @@ from rk.targets import Record
 
 KEYWORD, SEMANTIC = "keyword", "semantic"
 SEARCH_COST_USD = 0.001  # documented price of one keyword or semantic search call
-# The OpenAlex keywords of a check's top papers, for its vocabulary map: one list call by
-# id. Searches don't select them, so that their cached responses stay valid.
-KEYWORDS_SELECT = "id,keywords"
+# The OpenAlex keywords (for the vocabulary map) and venues of a check's papers: one list
+# call by id. Searches don't select them, so that their cached responses stay valid.
+DETAILS_SELECT = "id,keywords,primary_location"
 SEMANTIC_MAX_CHARS = 2000  # OpenAlex uses only the first 2,000 characters
 KEYWORD_REQUESTS_PER_SECOND = 10.0  # the keyless limit, so it holds with or without a key
 SEMANTIC_REQUESTS_PER_SECOND = 1.0
@@ -222,10 +222,11 @@ class SearchResponse:
 
 
 @dataclass(frozen=True)
-class KeywordLookup:
-    """The OpenAlex keywords of some works, from one list call (LiveSearchClient.keywords)."""
+class WorkDetails:
+    """Keywords and venues of some works, from one list call (LiveSearchClient.details)."""
 
     keywords: dict[str, list[str]]  # work id -> its keywords' display names, in OpenAlex's order
+    venues: dict[str, str]  # work id -> its primary location's source (journal, conference)
     cost_usd: float  # what the call costs (method cost), also when served from the cache
     cached: bool
 
@@ -390,36 +391,43 @@ class LiveSearchClient:
             query, kind, records, len(works), cost, hit is not None, fetched_at, params
         )
 
-    def keywords(self, ids: Sequence[str]) -> KeywordLookup:
-        """The keywords of up to IDS_PER_CALL works by OpenAlex id: one list call, cached.
+    def details(self, ids: Sequence[str]) -> WorkDetails:
+        """Keywords and venues of up to IDS_PER_CALL works by OpenAlex id: one list call, cached.
 
-        A work OpenAlex doesn't return, or one without keywords, gets none.
+        A work OpenAlex doesn't return gets neither; one without keywords gets none,
+        and one without a source (primary_location.source) has no venue.
         """
         if len(ids) > IDS_PER_CALL:
             raise ValueError(f"at most {IDS_PER_CALL} ids per call, got {len(ids)}")
         if not ids:
-            return KeywordLookup({}, 0.0, True)
+            return WorkDetails({}, {}, 0.0, True)
         params = {
             "filter": f"ids.openalex:{'|'.join(ids)}",
             "per_page": str(len(ids)),
-            "select": KEYWORDS_SELECT,
+            "select": DETAILS_SELECT,
         }
         hit = self.cache.get(params, max_age=self.max_age)
         if hit is None and self.offline:
-            raise OpenAlexError(f"offline, and this keyword lookup isn't cached: {ids[:3]}")
+            raise OpenAlexError(f"offline, and this details lookup isn't cached: {ids[:3]}")
         if hit is None:
             data = self._clients[KEYWORD].get_works(params)
             cost = _reported_cost(data, LIST_CALL_USD)
             self.cache.put(params, data, cost)
         else:
             data, cost = hit.response, hit.cost_usd
-        found: dict[str, list[str]] = {}
+        keywords: dict[str, list[str]] = {}
+        venues: dict[str, str] = {}
         for work in data.get("results") or []:
             if not work.get("id"):
                 continue
+            work_id = short_id(work["id"])
             names = [k.get("display_name") for k in work.get("keywords") or [] if k]
-            found[short_id(work["id"])] = [n for n in names if isinstance(n, str) and n.strip()]
-        return KeywordLookup(found, cost, hit is not None)
+            keywords[work_id] = [n for n in names if isinstance(n, str) and n.strip()]
+            source = (work.get("primary_location") or {}).get("source") or {}
+            venue = source.get("display_name")
+            if isinstance(venue, str) and venue.strip():
+                venues[work_id] = venue.strip()
+        return WorkDetails(keywords, venues, cost, hit is not None)
 
     def budget(self) -> Budget:
         """Today's OpenAlex budget for the API key (a free /rate-limit call)."""

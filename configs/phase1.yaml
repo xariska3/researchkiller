@@ -223,6 +223,15 @@ explain:
     seed: 42
     training_cutoff: 2025-08-13
 
+# Phase 2 Step 6: the web app (python -m rk serve). Its checks run as `python -m rk
+# check` does, under explain.cost_cap_per_check each.
+web:
+  db_path: data/web.sqlite        # checks, candidates and explanations (SQLite)
+  daily_cost_cap: 1.00            # USD a UTC day, LLM as billed plus OpenAlex; then refused
+  history_days: 7                 # the same idea, mode and date within 7 days: stored report
+  host: 127.0.0.1                 # local only; --host to change it
+  port: 8000
+
 run:
   out_dir: runs
   cache_path: data/cache/llm.sqlite   # LLM cache + cumulative spend table

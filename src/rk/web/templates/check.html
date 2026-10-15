@@ -1,0 +1,105 @@
+{% extends "base.html" %}
+{% block title %}Check {{ row.id[:8] }} · ResearchKiller{% endblock %}
+{% block content %}
+<p><a href="/">← New check</a></p>
+
+{% if report %}
+<h1>Closest prior work found</h1>
+<p class="note">{{ report.coverage }} No close match is not proof of novelty.</p>
+{% if source %}
+<p class="history">From history: the same check ran on
+  {{ source.created_at.strftime('%Y-%m-%d %H:%M') }} UTC. This is its stored report; it
+  cost nothing now.</p>
+{% endif %}
+<details>
+  <summary>Your idea ({{ 'quick check' if report.mode == 'quick' else 'full check' }}{% if report.request.before %},
+    only work published before {{ report.request.before }}{% endif %})</summary>
+  <p>{{ report.request.text }}</p>
+</details>
+
+{% for p in shown %}
+<article class="paper">
+  <h3><a href="{{ p.link }}" target="_blank" rel="noopener">{{ p.title }}</a></h3>
+  <p class="meta">#{{ p.rank }} · {{ p.year }}{% if p.venue %} · {{ p.venue }}{% endif %}
+    {% if p.explanation %}<span class="badge {{ p.explanation.overlap }}">{{ p.explanation.overlap }} overlap</span>{% endif %}</p>
+  {% set evidence = p.evidence() %}
+  {% if evidence %}
+  <blockquote>{{ evidence[0] }}</blockquote>
+  <p class="evidence-status">{{ evidence[1] }}</p>
+  {% endif %}
+  {% if p.explanation %}
+  <ul class="facets">
+    {% for f in facets %}
+    {% set v = p.explanation.facets[f] %}
+    <li><b>{{ facet_labels[f] }}</b>: <span class="verdict {{ v.verdict }}">{{ v.verdict }}</span>
+      — {{ v.reason }}</li>
+    {% endfor %}
+  </ul>
+  <p><b>Differs:</b> {{ p.explanation.differs }}</p>
+  {% endif %}
+</article>
+{% endfor %}
+{% if not shown %}
+<p>No papers were found.</p>
+{% endif %}
+
+{% if rest %}
+<h2>Also found</h2>
+<ol>
+  {% for p in rest %}
+  <li value="{{ p.rank }}"><a href="{{ p.link }}" target="_blank" rel="noopener">{{ p.title }}</a>
+    <span class="muted">· {{ p.year }}{% if p.venue %} · {{ p.venue }}{% endif %}</span></li>
+  {% endfor %}
+</ol>
+{% endif %}
+
+{% if report.vocabulary %}
+<h2>Words the literature uses that your text doesn't</h2>
+{% for g in report.vocabulary %}
+<p><b>{{ g.label }}</b><br>{% for t in g.terms %}<span class="term">{{ t }}</span>{% endfor %}</p>
+{% endfor %}
+{% endif %}
+
+{% if report.warnings %}
+<h2>Warnings</h2>
+<ul>{% for w in report.warnings %}<li>{{ w }}</li>{% endfor %}</ul>
+{% endif %}
+
+<p>
+  <a class="button" href="/api/checks/{{ row.id }}/export?format=md">Export Markdown</a>
+  <a class="button" href="/api/checks/{{ row.id }}/export?format=json">Export JSON</a>
+</p>
+
+<footer>
+  {% if source %}Cost now: $0 (from history; the check cost ${{ '%.4f' | format(report.cost.method_cost) }}).
+  {% else %}Cost: ${{ '%.4f' | format(report.cost.method_cost) }} (money spent
+  ${{ '%.4f' | format(report.cost.billed_cost) }}; cap ${{ '%.2f' | format(report.cost.cap) }}).{% endif %}
+  Time: {{ '%.1f' | format(report.stages.total_s) }} s.
+  Candidates searched: {{ report.n_candidates }} ({{ report.n_searches }} OpenAlex searches).
+  Models: {% for role, name in report.models.items() %}{{ role }} {{ name }}{% if not loop.last %}, {% endif %}{% endfor %}.
+  Checked {{ report.created_at.strftime('%Y-%m-%d %H:%M') }} UTC.
+</footer>
+
+{% elif failed %}
+<h1>The check failed</h1>
+<p class="error">{{ row.error }}</p>
+<details><summary>Your idea</summary><p>{{ row.text }}</p></details>
+
+{% else %}
+<h1>Checking</h1>
+<p><span class="spinner"></span><span id="stage">{{ row.stage }}</span></p>
+<details><summary>Your idea</summary><p>{{ row.text }}</p></details>
+{% endif %}
+{% endblock %}
+
+{% block script %}
+{% if not report and not failed %}
+<script>
+const stage = document.getElementById("stage");
+stage.textContent = stageLabel(stage.textContent);
+pollCheck({{ row.id | tojson }}, (check) => {
+  stage.textContent = stageLabel(check.stage);
+}).then(() => window.location.reload());
+</script>
+{% endif %}
+{% endblock %}

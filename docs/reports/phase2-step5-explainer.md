@@ -276,7 +276,10 @@ checked on 20 other dev checks, as declared in docs/phase2_spec.md before the ru
 5. **Versions of one paper in the final list** (`rk.live.pipeline.merge_same_text`):
    two results merge when their titles' content stems have a Jaccard of at least 0.7
    and their abstracts share most sentences, with or without a shared author. The
-   earlier in the list is kept, and the other becomes its alias.
+   entry keeps the earlier place in the list.
+   - **Which version it shows** (changed after PR #17, by your decision): the
+     earliest-published version, with the others as its aliases. Before, it showed
+     the one earlier in the list.
    - **Shared sentences**: more than half of the shorter abstract's sentences, where
      a sentence is shared if the other abstract has one with a word-set Jaccard of at
      least 0.5.
@@ -337,10 +340,39 @@ checked on 20 other dev checks, as declared in docs/phase2_spec.md before the ru
   - "Probabilistic models for semantic visualization…" (a 2020 dissertation and
     its 2017 article);
   - "3D-SE Viewer…" (2007 and 2012).
-- **"The earlier" means earlier in the list.** In the third pair, that kept the
-  2020 dissertation and made the 2017 article its alias.
+- **"The earlier" meant earlier in the list in this run.** In the third pair, that
+  kept the 2020 dissertation and made the 2017 article its alias. Since PR #17, the
+  2017 article is shown, and the dissertation is its alias.
 - **Cost**: the explainer call is $0.0002 more, from the longer prompt. Merging and
   snippets cost nothing.
+
+### L5r on the test set with the final-list merge (a check only)
+
+live-eval doesn't merge versions, so Step 4's test numbers come from unmerged lists.
+`scripts/l5r_merge_check.py` measures the difference offline, at $0:
+- it replays each of the 80 test checks' pools from the OpenAlex cache
+  (`runs/live-20261015-000815`);
+- takes its recorded L5r top 20, merges it as the tool now does (earliest-published
+  version shown), and finds the original's rank again.
+
+The replay reproduces every recorded L5r rank before the merge.
+
+| 80 test queries | Hit@1 | Hit@5 | Hit@10 | MRR@20 |
+|---|---|---|---|---|
+| L5r as recorded (no merge) | 0.825 | 0.863 | 0.875 | 0.842 |
+| L5r with the final-list merge | **0.838** | 0.863 | 0.875 | 0.848 |
+
+- **Merges**: 9, in 9 checks.
+  - **Only one moved an original**: A0211, from rank 2 to rank 1. Its original is the
+    2026-09 article, and rank 1 was the same paper's 2026-03 preprint. The merge shows
+    the preprint and lists the article as its alias, so the original now counts at
+    rank 1.
+  - **8 of the 9 are real versions**: preprints and their articles, conference papers
+    and their journal versions, and two citation records with garbled titles.
+  - **One is probably a false merge**: "NTCIR-4 Patent Retrieval Experiments at
+    RICOH" (2004) and "NTCIR-5 …" (2015). The title rule drops bare numbers, and the
+    group reused most of its abstract. It is outside the top 5 and isn't an original.
+- **Hit@5 doesn't change**, so Step 4's conclusions stand.
 
 ## Spend
 
@@ -389,11 +421,10 @@ checked on 20 other dev checks, as declared in docs/phase2_spec.md before the ru
    rows, and 4 of A0049's 5 high papers are real prior art.
 3. **Vocabulary**: end phrases at function words. Done: item 2.
 
-**Now:**
-1. **Overlap calibration**: in 5 of the 50 reviewed rows, the level was one step off
-   (high, partial or low), in both directions. Is that acceptable, or should the
-   definitions in the prompt be tightened, checked on new dev queries?
-2. **"The earlier" in the merge** is the earlier in the list. Should it be the
-   earlier published version, as the pool's own dedupe keeps?
-3. **live-eval doesn't merge versions**, so a merged duplicate can't change Hit@k.
-   Should it, for the web app's numbers to match what users see?
+**From the product fixes, answered after PR #17:**
+1. **Overlap calibration** (5 of 50 levels one step off): accepted, with no tuning.
+2. **The merge** keeps the earliest-published version, with the others as aliases.
+   Done (`rk.live.pipeline.merge_versions`).
+3. **live-eval and the merge**: checked once, offline, on the test set, without
+   changing live-eval. Hit@1 is 0.838 instead of 0.825, and Hit@5 is unchanged at
+   0.863 (see above).

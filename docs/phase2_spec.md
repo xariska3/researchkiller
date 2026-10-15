@@ -341,8 +341,12 @@ design live, and keeps the Phase 1 benchmark as a regression test.
          with a word-set Jaccard of at least 0.5.
        - **Why not exact**: the example (A0053, ranks 4 and 5) rewords every
          sentence a little.
-       - **The merge**: the earlier result is kept, and the other becomes its
-         alias. live-eval doesn't merge.
+       - **The merge**: the entry keeps the earlier place in the list. *Changed
+         after PR #17*: it shows the earliest-published version, and the others
+         become its aliases. live-eval doesn't merge.
+       - **On the test set** (a check only, offline): it changes L5r's Hit@1
+         from 0.825 to 0.838, and leaves Hit@5 at 0.863
+         (`scripts/l5r_merge_check.py`).
   - **Check of the fixes, declared before the run**: `explain-eval` on the next
     20 dev queries in seeded order, from A0071, so none of the first 20.
     - **Settings**: the dev run's work types and the timing run, as before.
@@ -443,6 +447,22 @@ no fabricated citations.
    *Decided on 2026-10-15:* a failed or timed-out agent search is skipped with
    a warning instead of failing the whole check. Evaluation stays strict: there,
    a failed agent search is an error row.
+   *Built on 2026-10-15* (`rk.web`; `python -m rk serve`):
+   - **Checks**: the web app runs them through `rk.live.check.run_check`, as
+     `rk check` does, one at a time in a background thread.
+   - **Storage**: SQLite (`web.db_path`), tables `checks`, `candidates` and
+     `explanations`.
+   - **Reuse**: the same text, mode and date within `web.history_days` (7)
+     reuses the stored report at $0.
+   - **Daily cap**: `web.daily_cost_cap` ($1.00) counts money spent today
+     (UTC), plus $0.03 held for each check in progress.
+   - **Refusals**: OpenAlex's spent daily budget refuses new checks until it
+     resets.
+   - **Restarts**: unfinished checks are marked failed, never re-run.
+   - **Agent searches**: the tool (`skip_failed_searches`) skips a failed one
+     with a warning; `strict` runs (evaluation) raise.
+   - **Venues**: they come from the same list call as the keywords
+     (`LiveSearchClient.details`, now for all 20 papers).
 7. User README ("how to run, what it does, what it doesn't"), screenshots,
    demo. Optional: Dockerfile built and tested in GitHub Actions.
 
