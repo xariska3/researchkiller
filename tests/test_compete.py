@@ -194,7 +194,7 @@ def test_the_committed_config_has_the_compete_section() -> None:
     ]
     assert (systems["claude-opus"].model, systems["claude-opus"].cost_cap) == (
         "claude-opus-5-5",
-        55.0,
+        69.9621,  # $29.962188 spent on the first 100, plus $40 for the other 100
     )
     luna = systems["openai-luna"]
     assert (luna.kind, luna.model, luna.max_searches, luna.cost_cap) == (

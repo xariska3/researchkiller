@@ -119,7 +119,9 @@ compete:
       price_out_per_m: 20.0
       price_per_search: 0.01
       reserve_per_query: 1.5
-      cost_cap: 55.0
+      # On the other 100 checked queries (--set compete.n_queries=200): the $29.962188
+      # spent on the first 100 and the pilots, plus at most $40 of new spend.
+      cost_cap: 69.9621
       spend_group: anthropic
       requests_per_second: 0.5
       timeout_s: 600

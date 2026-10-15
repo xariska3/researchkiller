@@ -388,3 +388,35 @@ These are fixed before any paid call.
      results-database table and no MLflow run.
    - Spend is tracked per system in `data/cache/compete.sqlite`, not in
      `llm.sqlite`'s cumulative ledger.
+
+## Addendum: Opus on all 200 checked queries (pre-declared 2026-10-15)
+
+Fixed after the 100-query results ([phase2-step3-results.md](phase2-step3-results.md))
+and before any call for the other 100 queries.
+
+- **Your decision**: run Opus on the 100 checked queries that are not in
+  `docs/evaluation/compete_sample.csv`, with the same settings (`max_searches` 10, the
+  same prompt and tool), capped at $40, within the Anthropic group cap. Ours is replayed
+  from the cache.
+- **Command**: `python -m rk compete --config configs/phase1.yaml
+  --set compete.n_queries=200 --systems ours,claude-opus`.
+  - With 200, the sample is the whole frame: every query the dev and test runs checked
+    (rank 1: 82, ranks 2–10: 48, ranks 11–100: 37, not found: 33).
+  - Opus's answers to the first 100 come from the cache. The dry run counts 100
+    uncached calls.
+- **Cap**: Opus's `cost_cap` is 69.9621, which is the $29.962188 already spent plus $40.
+  The group cap stays at $89, with $42.42 left. If the cap stops the run before 200,
+  the over-cap queries are left out of the statistics and counted, and the completed N
+  is reported.
+- **Primary**: ours vs Opus on Hit@5 over all 200 queries (those both answered), by the
+  exact two-sided McNemar test at α = 0.05. This is one test, so there is no Holm
+  adjustment. MRR@10 supports, with a paired bootstrap 95% CI.
+- **Also reported**:
+  - the other 100 queries on their own (descriptive);
+  - Hit@1 and Hit@10;
+  - Hit@5 by difficulty bucket;
+  - the unresolved and DOI-mismatch shares;
+  - cost, latency and searches per query;
+  - the spend.
+- **Weights**: none. The 200 are every checked query, so the bucket mix is the frame's
+  rather than the 100-query sample's.
