@@ -58,6 +58,17 @@ from rk.retrieval import rrf
 
 CANDIDATE_RE = re.compile(r"^\[(\d+)\] Title: (.*)$", re.MULTILINE)
 GRADED_MARK = '{"scores":'  # only the graded prompt's answer format has it
+CHOSEN = live_rerank.RERANK_CHOICE  # as committed, before any test patches it
+
+
+@pytest.fixture(autouse=True)
+def _no_choice_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Runs here have no L5r unless a test chooses one itself."""
+    monkeypatch.setattr(live_rerank, "RERANK_CHOICE", None)
+
+
+def test_l5r_is_the_variant_the_dev_set_chose() -> None:
+    assert CHOSEN == R1  # docs/phase2_spec.md, runs/rerank-20261015-132644
 
 
 # --- candidates and the prompt ------------------------------------------------------------

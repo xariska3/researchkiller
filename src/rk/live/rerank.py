@@ -99,8 +99,10 @@ REPLY_CHARS = 4000  # of each reply kept in results.jsonl
 # Sonnet 5.5's training data runs to June 2026: originals published from this date
 # on are ones it can't have read.
 UNSEEN_FROM = date(2026, 7, 1)
-# L5r: the rerank variant the dev set chose by select_rerank; None until it is run.
-RERANK_CHOICE: str | None = None
+# L5r: the rerank variant the dev set chose by select_rerank (docs/phase2_spec.md). On
+# runs/live-20261014-122144 (runs/rerank-20261015-132644) R1 and R3 tied on Hit@5 (0.850,
+# against L5w's 0.750), and R1 won the MRR@20 tie-break (0.842 against 0.758).
+RERANK_CHOICE: str | None = R1
 
 
 # --- candidates, prompts and replies ---------------------------------------------------------

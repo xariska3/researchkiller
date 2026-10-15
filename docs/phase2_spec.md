@@ -249,6 +249,20 @@ design live, and keeps the Phase 1 benchmark as a regression test.
     - the rerank call's latency.
   - **Spend**: the R1–R3 calls go to `run.budget_cap`'s ledger
     (`data/cache/llm.sqlite`), at about $1 for 400 calls. RS has its own cap.
+  - **Pilot result (2026-10-15)**, `runs/rerank-20261015-131744`: every reply
+    was readable. A check cost $0.0014 more with Qwen, which adds 5–9 s. RS cost
+    $0.031 a check, about $6 for the 200, so it went ahead.
+  - **Selection result (2026-10-15)**, from `python -m rk rerank` on the dev
+    set (`runs/rerank-20261015-132644`). The replay reproduced all 120 recorded
+    L5 rankings.
+    - **Hit@5**: L5 0.700, L5w 0.750, R1 0.850, R2 0.808, R3 0.850, and RS
+      0.858 (not eligible).
+    - **The ceiling**: the original was among the candidates in 103 of 120
+      checks (0.858).
+    - **Choice**: R1 and R3 tie on Hit@5, and R1 wins the MRR@20 tie-break
+      (0.842 against 0.758), so **L5r = R1, listwise**.
+    - **Against L5w on the dev set**: +0.100 Hit@5 (13 queries gained, 1
+      lost, McNemar p = 0.002). This is exploratory; the test set decides.
 - Explainer check: run 10 full checks, export a CSV for hand review (results
   useful? explanations correct?), and report the quote-verification rate.
 - The Phase 1 frozen benchmark stays runnable as a regression test.
