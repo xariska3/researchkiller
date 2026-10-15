@@ -327,6 +327,18 @@ no fabricated citations.
 4. Rerank: up to three cheap LLM rerank variants and a Sonnet upper bound,
    evaluated offline on the cached checks (chosen on dev, confirmed on test).
    *(Added on 2026-10-15, before the explainer; see Evaluation.)*
+   *Built into the live pipeline on 2026-10-15, after PR #15:*
+   - **The default check**: `rk.live.pipeline.default_check` is L5r, L5w's check
+     followed by R1's listwise call (`with_rerank`). The call is charged to the
+     check, under its $0.10 cap.
+   - **Fallback**: if the call fails, could cross the cap, or its reply has no
+     readable ranking, the check keeps L5w's order and carries a warning in the
+     result (`warnings`). Step 4's offline R1 kept the presented order for an
+     unreadable reply, but none was unreadable there.
+   - **Evaluation**: live-eval has an L5r config. As for agent searches, it is
+     strict: a failed rerank call is an error row. An unreadable reply or a call
+     over the cap falls back as in the tool, and the summary counts these
+     fallbacks.
 5. Overlap explainer + quote verification + vocabulary map + report schema.
    Tests with FakeLLM. Hand check on 10 checks.
 6. FastAPI + SQLite + background worker + web page. Tests with TestClient.
@@ -350,7 +362,8 @@ no fabricated citations.
   *Decided on 2026-10-15, after the L5w test run:*
   - **Default check**: L5w. The reranker joins it if it wins on the test set
     in the rerank evaluation that comes before the explainer. *(It did, on
-    2026-10-15, so the default is L5r: L5w with R1's listwise rerank.)*
+    2026-10-15, so the default is L5r: L5w with R1's listwise rerank, built in
+    as `rk.live.pipeline.default_check`; see Steps, 4.)*
   - **Preview**: L1 is shown at once, as a first preview, while the full check
     runs. L1 alone is not the default: it trailed L5w by 8.7 points of Hit@5 on
     the test set and by 11.7 on the dev set.

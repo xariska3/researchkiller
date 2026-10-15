@@ -16,6 +16,13 @@ plus LLM, cache hits included, so a replayed check stops where the original
 would): before each search it reserves the documented price, and before each
 agent call a pessimistic bound (rk.llm.pessimistic_cost). A call that could
 cross live.cost_cap_per_check raises CheckCostCapExceeded, and the check fails.
+
+The default check is L5r (default_check; docs/phase2_spec.md, Product ideas): the
+check with its final pool ranked by L5w's fusion (DEFAULT_FUSION), then reranked by
+one listwise LLM call (with_rerank, rk.live.reranker). The rerank call is charged to
+the check's ledger under the same cap. If it could cross the cap, fails, or its
+reply has no readable ranking, the check keeps L5w's order and carries a warning;
+in evaluation (strict), a failed call raises instead.
 """
 
 from __future__ import annotations
@@ -28,7 +35,7 @@ from typing import Any
 
 from rk.agent import AgentRetriever
 from rk.config import Config, LiveConfig, ModelConfig
-from rk.live.fusion import B5, L1_L5, final_ranking, l1_ranking
+from rk.live.fusion import B5, L1_L5, PROPOSAL_EQUAL, final_ranking, l1_ranking
 from rk.live.openalex_search import (
     KEYWORD,
     SEARCH_COST_USD,
@@ -37,11 +44,27 @@ from rk.live.openalex_search import (
     SearchResponse,
 )
 from rk.live.pool import CandidatePool, Hit
-from rk.llm import ChatModel, Completion, Message, Usage, load_prompt, pessimistic_cost
+from rk.live.reranker import LISTWISE, candidates, listwise_ranking, parse_order, render_prompt
+from rk.llm import (
+    ChatModel,
+    Completion,
+    LLMError,
+    Message,
+    Usage,
+    load_prompt,
+    pessimistic_cost,
+)
 from rk.retrieval import Encoder, Trace
 from rk.targets import Record
 
 AGENT_PROMPT = "agent_step"  # Phase 1's B5 prompt
+# L5w's final fusion, chosen on the dev set (rk.live.evaluate.L5W_FUSION): the default
+# check ranks its pool this way before the rerank call.
+DEFAULT_FUSION = PROPOSAL_EQUAL
+# What the rerank step did (RerankStep.status).
+RERANKED = "reranked"  # the reply's order
+FALLBACK = "fallback"  # L5w's order, with a warning
+SKIPPED = "skipped"  # no candidates, so no call
 
 
 class CheckCostCapExceeded(RuntimeError):
@@ -90,10 +113,18 @@ class CheckLedger:
 class CappedChatModel:
     """A ChatModel that refuses calls whose pessimistic cost could cross the check's cap."""
 
-    def __init__(self, inner: ChatModel, model: ModelConfig, ledger: CheckLedger) -> None:
+    def __init__(
+        self,
+        inner: ChatModel,
+        model: ModelConfig,
+        ledger: CheckLedger,
+        *,
+        what: str = "an agent call",
+    ) -> None:
         self.inner = inner
         self.model = model
         self.ledger = ledger
+        self.what = what  # names the call in the refusal
 
     def complete(
         self,
@@ -102,7 +133,7 @@ class CappedChatModel:
         seed: int | None = None,
         response_format: Mapping[str, Any] | None = None,
     ) -> Completion:
-        self.ledger.require(pessimistic_cost(self.model, messages), "an agent call")
+        self.ledger.require(pessimistic_cost(self.model, messages), self.what)
         reply = self.inner.complete(messages, seed=seed, response_format=response_format)
         self.ledger.llm += reply.usage
         return reply
@@ -153,6 +184,18 @@ class Candidate:
 
 
 @dataclass(frozen=True)
+class RerankStep:
+    """What the rerank step did to a check (with_rerank)."""
+
+    status: str  # RERANKED, FALLBACK (L5w's order kept) or SKIPPED (no candidates)
+    n_candidates: int
+    latency_s: float  # the step's time, the call included
+    usage: Usage  # the call's, if it was answered
+    finish_reason: str | None = None
+    warning: str | None = None  # why the order is L5w's (FALLBACK only)
+
+
+@dataclass(frozen=True)
 class LiveSearchResult:
     """One check's retrieval: the top candidates and what it took to find them."""
 
@@ -169,12 +212,16 @@ class LiveSearchResult:
     encoder_device: str
     pool: CandidatePool = field(repr=False, compare=False)  # the final pool
     fusion: str = B5  # how the final pool was ranked (rk.live.fusion)
+    rerank: RerankStep | None = None  # set by with_rerank
+    warnings: tuple[str, ...] = ()  # for the user, e.g. that the rerank step fell back
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "text": self.text,
             "before": self.before.isoformat() if self.before else None,
             "fusion": self.fusion,
+            "rerank": asdict(self.rerank) if self.rerank else None,
+            "warnings": list(self.warnings),
             "queries": self.trace.queries,
             "steps": self.trace.steps,
             "stop_reason": self.trace.stop_reason,
@@ -235,11 +282,15 @@ def final_candidates(
     l1: Sequence[str] = (),
 ) -> list[Candidate]:
     """The top_k of the final pool ranked by `fusion`, with their hits and versions."""
+    return ranked_candidates(pool, final_ranking(pool, queries, fusion, l1=l1), top_k)
+
+
+def ranked_candidates(pool: CandidatePool, ranking: Sequence[str], top_k: int) -> list[Candidate]:
+    """The top_k of a ranking of the pool's works, with their hits and versions."""
     by_id = {r["id"]: r for r in pool.records}
-    top = final_ranking(pool, queries, fusion, l1=l1)[:top_k]
     return [
         Candidate(n, by_id[d], pool.hits(by_id[d]), pool.versions(by_id[d]))
-        for n, d in enumerate(top, start=1)
+        for n, d in enumerate(ranking[:top_k], start=1)
     ]
 
 
@@ -262,6 +313,82 @@ def with_fusion(
     candidates = final_candidates(result.pool, result.trace.queries, fusion, live.top_k, l1=l1)
     latency = result.latency_s + time.perf_counter() - start
     return replace(result, candidates=candidates, fusion=fusion, latency_s=latency)
+
+
+def with_rerank(
+    result: LiveSearchResult,
+    cfg: Config,
+    reranker: ChatModel,
+    encoder: Encoder,
+    *,
+    strict: bool = False,
+) -> LiveSearchResult:
+    """L5r: the check's final pool reranked by one listwise LLM call (rk.live.reranker).
+
+    `result` is the check as L5w ranks it (its fusion). The candidates are the union
+    of that ranking's top rerank.depth and B5's, and L5w's other works follow the
+    reranked ones. The call is charged to a copy of the check's ledger, under the
+    check's cost cap, and the step's time is added to the check's latency.
+
+    If the call could cross the cap, fails (LLMError), or its reply has no readable
+    ranking, the result keeps L5w's order and gets a warning. With `strict`, for
+    evaluation, a failed call raises instead: an API failure is an error, not L5w.
+    """
+    rr, live = cfg.rerank, cfg.live
+    if rr is None or live is None:
+        raise ValueError("the rerank step needs the config's live: and rerank: sections")
+    start = time.perf_counter()
+    queries = result.trace.queries
+    l1 = _l1(result.text, result.searches, encoder, live) if result.fusion == L1_L5 else []
+    l5w = final_ranking(result.pool, queries, result.fusion, l1=l1)
+    cands = candidates(l5w, final_ranking(result.pool, queries, B5), rr.depth)
+    ledger = replace(result.ledger)  # the check's own ledger stays as L5w had it
+    if not cands:
+        seconds = time.perf_counter() - start
+        step = RerankStep(SKIPPED, 0, seconds, Usage())
+        return replace(result, ledger=ledger, latency_s=result.latency_s + seconds, rerank=step)
+    by_id = {r["id"]: r for r in result.pool.records}
+    prompt = load_prompt(LISTWISE)
+    text = render_prompt(prompt, result.text, [by_id[d] for d in cands], rr.abstract_chars)
+    capped = CappedChatModel(reranker, rr.model, ledger, what="the rerank call")
+    completion: Completion | None = None
+    order: list[int] | None = None
+    problem: str | None = None
+    try:
+        completion = capped.complete([{"role": "user", "content": text}])
+    except CheckCostCapExceeded as exc:  # "the rerank call could cost $x, and the check ..."
+        problem = str(exc)
+    except LLMError as exc:
+        if strict:
+            raise
+        problem = f"the rerank call failed: {exc}"
+    if completion is not None:
+        order = parse_order(completion.text, len(cands))
+        if order is None:
+            problem = "the rerank reply had no readable ranking"
+    if order is None:
+        ranking = l5w
+        warning: str | None = f"Not reranked ({problem}); the results keep the check's order."
+    else:
+        ranking = list(dict.fromkeys([*listwise_ranking(cands, order), *l5w]))
+        warning = None
+    seconds = time.perf_counter() - start
+    step = RerankStep(
+        status=FALLBACK if warning else RERANKED,
+        n_candidates=len(cands),
+        latency_s=seconds,
+        usage=completion.usage if completion else Usage(),
+        finish_reason=completion.finish_reason if completion else None,
+        warning=warning,
+    )
+    return replace(
+        result,
+        candidates=ranked_candidates(result.pool, ranking, live.top_k),
+        ledger=ledger,
+        latency_s=result.latency_s + seconds,
+        rerank=step,
+        warnings=(*result.warnings, warning) if warning else result.warnings,
+    )
 
 
 def live_search(
@@ -313,3 +440,32 @@ def live_search(
         pool=pool,
         fusion=fusion,
     )
+
+
+def default_check(
+    text: str,
+    cfg: Config,
+    *,
+    search: LiveSearchClient,
+    encoder: Encoder,
+    agent: ChatModel,
+    reranker: ChatModel,
+    before: date | None = None,
+) -> LiveSearchResult:
+    """The tool's default check, L5r: live_search ranked by DEFAULT_FUSION, then with_rerank.
+
+    A rerank call that fails or can't be read leaves L5w's order, with a warning in
+    the result's `warnings`.
+    """
+    if cfg.rerank is None:
+        raise ValueError("the default check needs the config's rerank: section")
+    result = live_search(
+        text,
+        cfg,
+        search=search,
+        encoder=encoder,
+        agent=agent,
+        before=before,
+        fusion=DEFAULT_FUSION,
+    )
+    return with_rerank(result, cfg, reranker, encoder)

@@ -19,6 +19,9 @@ Variants:
 - RS, the upper bound: R1 with `rerank.upper_model` (Claude Sonnet 5.5). It is not a
   product candidate.
 
+R1's candidates, prompt and reply parsing are in rk.live.reranker, which the live
+pipeline's L5r (rk.live.pipeline.with_rerank) calls too.
+
 A reply with no readable JSON leaves the presented order and is counted. L5w's
 works outside the candidates follow the reranked ones, and ranks count within
 the run's live.top_k (20), so MRR is MRR@20. L5 and L5w are scored as replayed;
@@ -37,7 +40,6 @@ again costs nothing for what was already asked.
 from __future__ import annotations
 
 import dataclasses
-import itertools
 import json
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -64,7 +66,15 @@ from rk.evaluate import (
 )
 from rk.live import evaluate as live_evaluate
 from rk.live.fusion import B5, final_ranking
-from rk.live.replay import Replay, _originals, _rows, _scored, load_run, opening, replay_run
+from rk.live.replay import Replay, _originals, _rows, _scored, load_run, replay_run
+from rk.live.reranker import (
+    LISTWISE,
+    as_number,
+    candidates,
+    listwise_ranking,
+    parse_order,
+    render_prompt,
+)
 from rk.llm import BudgetExceeded, ChatModel, Completion, LLMError, Prompt, load_prompt, parse_json
 from rk.retrieval import Encoder, rrf
 from rk.targets import Record
@@ -76,7 +86,7 @@ L5, L5W = "L5", "L5w"
 R1, R2, R3, RS = "R1", "R2", "R3", "RS"
 PRODUCT = (R1, R2, R3)  # the candidates for L5r, in declared order
 VARIANTS = (*PRODUCT, RS)
-LISTWISE, GRADED = "rerank_listwise", "rerank_graded"  # prompt names
+GRADED = "rerank_graded"  # R3's prompt; LISTWISE (R1, R2, RS) is rk.live.reranker's
 PRODUCT_MODEL, UPPER_MODEL = "model", "upper_model"  # rerank: config keys
 # Which call each variant reads: (prompt, model). R1 and R2 read the same reply.
 CALLS = {
@@ -105,66 +115,7 @@ UNSEEN_FROM = date(2026, 7, 1)
 RERANK_CHOICE: str | None = R1
 
 
-# --- candidates, prompts and replies ---------------------------------------------------------
-
-
-def candidates(l5w: Sequence[str], l5: Sequence[str], depth: int) -> list[str]:
-    """The union of both top `depth`s, taken in turn (L5w's first), without repeats."""
-    taken: dict[str, None] = {}
-    for pair in itertools.zip_longest(l5w[:depth], l5[:depth]):
-        for doc_id in pair:
-            if doc_id is not None:
-                taken.setdefault(doc_id, None)
-    return list(taken)
-
-
-def render_candidates(records: Sequence[Record], abstract_chars: int) -> str:
-    """Each candidate as its number, title and abstract (cut at a word), in the given order."""
-    return "\n\n".join(
-        f"[{n}] Title: {r['title']}\nAbstract: {opening(r['abstract'], abstract_chars)}"
-        for n, r in enumerate(records, start=1)
-    )
-
-
-def render_prompt(
-    prompt: Prompt, proposal: str, records: Sequence[Record], abstract_chars: int
-) -> str:
-    return prompt.render(
-        n=str(len(records)),
-        proposal=proposal,
-        candidates=render_candidates(records, abstract_chars),
-    )
-
-
-def _number(value: Any) -> int | None:
-    """An integer from a JSON number or a string of digits; None otherwise."""
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float) and value.is_integer():
-        return int(value)
-    if isinstance(value, str) and value.strip().isdigit():
-        return int(value.strip())
-    return None
-
-
-def parse_order(text: str, n: int) -> list[int] | None:
-    """A listwise reply's candidate numbers (1..n), in order; None if nothing usable."""
-    try:
-        data = parse_json(text)
-    except ValueError:
-        return None
-    if isinstance(data, dict):
-        data = data.get("ranking")
-    if not isinstance(data, list):
-        return None
-    order: dict[int, None] = {}
-    for item in data:
-        number = _number(item)
-        if number is not None and 1 <= number <= n:
-            order.setdefault(number, None)
-    return list(order) or None
+# --- replies (R1's candidates, prompt and parsing are in rk.live.reranker) ------------------
 
 
 def parse_scores(text: str, n: int) -> dict[int, int] | None:
@@ -179,18 +130,12 @@ def parse_scores(text: str, n: int) -> dict[int, int] | None:
         return None
     scores: dict[int, int] = {}
     for key, value in data.items():
-        number, score = _number(key), _number(value)
+        number, score = as_number(key), as_number(value)
         if number is None or score is None:
             continue
         if 1 <= number <= n and 0 <= score <= MAX_SCORE:
             scores.setdefault(number, score)
     return scores or None
-
-
-def listwise_ranking(cands: Sequence[str], order: Sequence[int] | None) -> list[str]:
-    """The candidates in the reply's order, then the ones it left out, in presented order."""
-    chosen = [cands[n - 1] for n in order or ()]
-    return list(dict.fromkeys([*chosen, *cands]))
 
 
 def fused_ranking(cands: Sequence[str], order: Sequence[int] | None) -> list[str]:

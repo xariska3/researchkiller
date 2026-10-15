@@ -10,6 +10,11 @@ Three pre-declared configurations run on each Phase 1 benchmark proposal:
   on live search, the candidate pool and the final RRF rerank.
 - L5w: the same check as L5 (one agent loop serves both), with its final pool
   ranked by the fusion chosen on the dev set (L5W_FUSION, rk.live.fusion).
+- L5r, the default check: L5w's check reranked by one listwise LLM call
+  (rk.live.pipeline.with_rerank; Step 4's R1). It needs a reranker client and the
+  config's rerank: section. A reply with no readable ranking, or a call that could
+  cross the cost cap, keeps L5w's order, as in the tool, and is counted in the
+  summary; a failed call is an error row (evaluation is strict).
 
 A result is the original paper if one of its versions matches it
 (rk.live.pool.match_original: OpenAlex id, alias, DOI or exact normalised
@@ -85,13 +90,18 @@ from rk.live.fusion import PROPOSAL_EQUAL
 from rk.live.openalex_search import SEARCH_COST_USD, SEMANTIC, LiveSearchClient, SearchResponse
 from rk.live.pipeline import (
     AGENT_PROMPT,
+    FALLBACK,
+    RERANKED,
+    SKIPPED,
     CheckCostCapExceeded,
     CheckLedger,
     LiveSearchResult,
     live_search,
     with_fusion,
+    with_rerank,
 )
 from rk.live.pool import CandidatePool, match_original
+from rk.live.reranker import LISTWISE
 from rk.llm import ChatModel, LLMError, load_prompt
 from rk.retrieval import ENCODER_SETTINGS, Encoder, encoder_settings
 from rk.targets import Record
@@ -99,7 +109,7 @@ from rk.targets import Record
 KIND = "live-eval"  # run.json "kind" of a live evaluation run
 RUN_PREFIX = "live-"
 TABLE = "live_query_results"
-LIVE_CONFIGS = ("L0", "L1", "L5", "L5w")
+LIVE_CONFIGS = ("L0", "L1", "L5", "L5w", "L5r")
 PHASE1_B5 = "P1-B5"  # Phase 1's B5 on the frozen corpus, compared on the same queries
 # L5w: L5's check with this final fusion, chosen on the dev set by the pre-declared rule
 # (docs/phase2_spec.md): F1 proposal-equal had the best Hit@5 (0.750, tied with F2 and
@@ -108,13 +118,15 @@ L5W_FUSION: str | None = PROPOSAL_EQUAL
 # Pre-declared in docs/phase2_spec.md; (a, b) is a minus b. L5 vs L1 is Step 2's primary
 # comparison; L5w vs L5 and L5w vs L1 are the test set's.
 PRIMARY_PAIRS = (("L5", "L1"), ("L5w", "L5"), ("L5w", "L1"))
-SECONDARY_PAIRS = (("L1", "L0"), ("L5", "L0"), ("L5", PHASE1_B5))
+# L5r vs L5w was decided offline in Step 4 (rk.live.rerank); in a live run it is exploratory.
+SECONDARY_PAIRS = (("L1", "L0"), ("L5", "L0"), ("L5", PHASE1_B5), ("L5r", "L5w"))
 COST_CAP = "cost_cap"  # stop_reason of a check over its cost cap: a miss
 CONFIG_LABELS = {
     "L0": "OpenAlex semantic search on the proposal, in OpenAlex's order (1 call, no LLM)",
     "L1": "the L0 results reranked locally (BM25 + dense, RRF)",
     "L5": "the full live pipeline (B5's agent loop on live search, pool, final rerank)",
     "L5w": "L5's check (same agent loop and pool), its final pool ranked by the fusion",
+    "L5r": "the default check: L5w's check reranked by one listwise LLM call (Step 4's R1)",
     PHASE1_B5: "Phase 1's B5 on the frozen corpus, on the same queries",
 }
 EFFORT = (
@@ -462,6 +474,19 @@ def _fingerprint(meta: dict[str, Any]) -> dict[str, Any]:
         "live": {k: v for k, v in config["live"].items() if k != "cache_ttl_days"},
         "prompts": meta["prompt_hashes"],
         "l5w_fusion": meta.get("l5w_fusion"),
+        "rerank": meta.get("rerank"),
+    }
+
+
+def rerank_settings(cfg: Config) -> dict[str, Any] | None:
+    """What L5r's rows depend on beyond the check: the rerank model, depth, cut and prompt."""
+    if cfg.rerank is None:
+        return None
+    return {
+        "model": _jsonable(dataclasses.asdict(cfg.rerank.model)),
+        "depth": cfg.rerank.depth,
+        "abstract_chars": cfg.rerank.abstract_chars,
+        "prompt_sha256": load_prompt(LISTWISE).sha256,
     }
 
 
@@ -491,12 +516,14 @@ def run_live_eval(
     retry_errors: bool = False,
     run_dir: Path | None = None,
     log_mlflow: bool = True,
+    reranker: ChatModel | None = None,
 ) -> LiveEvalRun:
     """Run (or resume) a live evaluation of the first `limit` benchmark queries.
 
     The queries are in seeded (qid) order, starting at `from_qid` (e.g. A0045)
     if given. Finished rows are skipped; with retry_errors, error rows are run
-    again.
+    again. L5r runs with `reranker` (rerank.model's client); without one, it is
+    left out unless asked for, which is an error.
     `search` should read its cache as an evaluation
     (LiveSearchClient.from_config(..., evaluation=True)). A spent OpenAlex
     budget stops the run with no row for the unfinished query; other
@@ -511,9 +538,19 @@ def run_live_eval(
     unknown = [c for c in configs or () if c not in LIVE_CONFIGS]
     if unknown:
         raise EvalError(f"unknown live configs {unknown}; choose from {list(LIVE_CONFIGS)}")
-    available = [c for c in LIVE_CONFIGS if c != "L5w" or L5W_FUSION is not None]
+    can_rerank = L5W_FUSION is not None and cfg.rerank is not None and reranker is not None
+    available = [
+        c
+        for c in LIVE_CONFIGS
+        if (c != "L5w" or L5W_FUSION is not None) and (c != "L5r" or can_rerank)
+    ]
     if configs and "L5w" in configs and L5W_FUSION is None:
         raise EvalError("L5w has no final fusion yet (rk.live.evaluate.L5W_FUSION)")
+    if configs and "L5r" in configs and not can_rerank:
+        raise EvalError(
+            "L5r needs L5w's fusion (rk.live.evaluate.L5W_FUSION), the config's rerank: "
+            "section and a reranker client"
+        )
     selected = [c for c in available if not configs or c in configs]
 
     corpus, _, corpus_manifest = load_frozen_corpus(cfg.corpus.out_dir)
@@ -537,6 +574,7 @@ def run_live_eval(
         "bench_sha256": bench_sha,
         "phase1_run": live.phase1_run,
         "l5w_fusion": L5W_FUSION,
+        "rerank": rerank_settings(cfg),
         "prompt_hashes": {"retrieval": {AGENT_PROMPT: load_prompt(AGENT_PROMPT).sha256}},
         "models": {"agent": cfg.agent.name, **encoder_settings(encoder)},
         "encoder_device": encoder.device,
@@ -566,12 +604,25 @@ def run_live_eval(
             raise EvalError("L5w has no final fusion yet (rk.live.evaluate.L5W_FUSION)")
         return check_outcome(with_fusion(check(proposal), L5W_FUSION, encoder, live))
 
+    def l5r(proposal: str) -> Outcome:
+        if L5W_FUSION is None or live is None or reranker is None:
+            raise EvalError("L5r needs L5w's fusion and a reranker client")
+        l5w_check = with_fusion(check(proposal), L5W_FUSION, encoder, live)
+        return check_outcome(with_rerank(l5w_check, cfg, reranker, encoder, strict=True))
+
     runners: dict[str, Callable[[str], Outcome]] = {
         "L0": lambda proposal: run_l0(proposal, search, live),
         "L1": lambda proposal: run_l1(proposal, search, live, encoder),
         "L5": lambda proposal: check_outcome(check(proposal)),
         "L5w": l5w,
+        "L5r": l5r,
     }
+
+    def fingerprint(m: dict[str, Any]) -> dict[str, Any]:
+        # A run started before L5r existed has no rerank settings, and no L5r rows
+        # they could disagree with, so it takes this one's.
+        return _fingerprint(m if "rerank" in m else {**m, "rerank": meta["rerank"]})
+
     if run_dir is not None and (run_dir / RUN_FILE).exists() and not is_live_run(run_dir):
         raise EvalError(f"{run_dir} is not a live-eval run")
     stop: OpenAlexBudgetExhausted | None = None
@@ -585,9 +636,12 @@ def run_live_eval(
             meta,
             run_dir,
             retry_errors=retry_errors,
-            fingerprint=_fingerprint,
+            fingerprint=fingerprint,
             prefix=RUN_PREFIX,
         )
+        if "rerank" not in run_meta:
+            run_meta["rerank"] = meta["rerank"]
+            (run_dir / RUN_FILE).write_text(json.dumps(run_meta, indent=2) + "\n", encoding="utf-8")
         run_id = run_meta["run_id"]
         done = {
             (r["config"], r["qid"]): r["status"]
@@ -692,6 +746,20 @@ def _effort_value(row: sqlite3.Row, metric: str) -> float | None:
 
 def _effort(rows: Sequence[sqlite3.Row], metric: str) -> dict[str, float] | None:
     return _spread([v for r in rows if (v := _effort_value(r, metric)) is not None])
+
+
+def rerank_steps(rows: Sequence[sqlite3.Row]) -> dict[str, Any]:
+    """What L5r's rerank step did over its finished rows, with the first warnings."""
+    counts = {status: 0 for status in (RERANKED, FALLBACK, SKIPPED)}
+    warnings = []
+    for row in rows:
+        step = json.loads(row["trace"]).get("rerank") if row["trace"] else None
+        if step is None:  # a check over its cost cap never reached the step
+            continue
+        counts[step["status"]] += 1
+        if step["warning"]:
+            warnings.append(f"{row['qid']}: {step['warning']}")
+    return {**counts, "warnings": warnings[:3]}
 
 
 def summarize(db_path: Path, meta: dict[str, Any], *, seed: int) -> dict[str, Any]:
@@ -805,6 +873,7 @@ def summarize(db_path: Path, meta: dict[str, Any], *, seed: int) -> dict[str, An
         "error_examples": {
             c: [f"{e['qid']}: {e['error']}" for e in errors[c]][:3] for c in configs
         },
+        "rerank_steps": rerank_steps(list(ok["L5r"].values())) if "L5r" in ok else None,
     }
 
 
@@ -955,6 +1024,19 @@ def render_markdown(summary: dict[str, Any]) -> str:
     for c in summary["configs"]:
         examples = "; ".join(summary["error_examples"][c]).replace("|", "\\|")
         lines.append(f"| {c} | {summary['errors'][c]} | {examples} |")
+    steps = summary.get("rerank_steps")
+    if steps is not None:
+        lines += [
+            "",
+            "## L5r's rerank step",
+            "",
+            (
+                f"Reranked: {steps[RERANKED]}. Kept L5w's order, with a warning: "
+                f"{steps[FALLBACK]}. No candidates to rerank: {steps[SKIPPED]}. A failed "
+                "rerank call is an error row (Errors)."
+            ),
+            *(f"- {w}" for w in steps["warnings"]),
+        ]
     return "\n".join(lines) + "\n"
 
 

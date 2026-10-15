@@ -307,6 +307,13 @@ def normalize_title(title: str | None) -> str:
     return _NON_ALNUM_RE.sub("", _fold(text).lower())
 
 
+def opening(text: str, chars: int) -> str:
+    """The first `chars` characters of a text, cut at a word, with an ellipsis if cut."""
+    if len(text) <= chars:
+        return text
+    return text[:chars].rsplit(" ", 1)[0] + " …"
+
+
 def reconstruct_abstract(inverted_index: Mapping[str, Sequence[int]] | None) -> str:
     """Rebuild an abstract from OpenAlex's `abstract_inverted_index` (word -> positions)."""
     if not inverted_index:

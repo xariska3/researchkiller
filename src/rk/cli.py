@@ -194,7 +194,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     live = sub.add_parser(
-        "live-eval", help="evaluate live retrieval over OpenAlex (L0, L1, L5) on the benchmark"
+        "live-eval",
+        help="evaluate live retrieval over OpenAlex (L0, L1, L5, L5w, L5r) on the benchmark",
     )
     _add_config_arguments(live)
     live.add_argument(
@@ -453,6 +454,10 @@ def live_eval_command(
             Ledger(cfg.run.cache_path, cfg.run.budget_cap, command="live-eval")
         )
         agent = stack.enter_context(closing(LLMClient(cfg.agent, cache, ledger)))
+        # L5r's reranker: the product rerank model, on the same cache and ledger.
+        reranker = None
+        if cfg.rerank is not None:
+            reranker = stack.enter_context(closing(LLMClient(cfg.rerank.model, cache, ledger)))
         responses = stack.enter_context(closing(OpenAlexCache(cfg.live.cache_path)))
         search = stack.enter_context(
             closing(LiveSearchClient.from_config(cfg, responses, evaluation=True))
@@ -468,6 +473,7 @@ def live_eval_command(
             limit=limit,
             retry_errors=retry_errors,
             run_dir=run_dir,
+            reranker=reranker,
         )
     progress = f"{done.n_done} of {done.n_queries} queries done"
     summary = done.run_dir / SUMMARY_MD
