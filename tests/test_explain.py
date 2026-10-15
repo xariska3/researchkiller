@@ -14,6 +14,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 import yaml
 from bench_data import ABSTRACTS, GOOD, T1, T2, T3, TITLES, corpus_records, judge_reply, target_rows
@@ -21,6 +22,7 @@ from conftest import TEST_API_KEY_ENV, FakeEncoder, FakeLLM
 from live_fakes import LIST_COST, FakeLiveOpenAlex, oa_work
 from pydantic import ValidationError
 from test_live_eval import (
+    AGENT_QUERY,
     B1_RANKS,
     B5_RANKS,
     _config_dict,
@@ -36,7 +38,7 @@ from rk import cli
 from rk.bench import FACETS as JUDGE_FACETS
 from rk.bench import make_bench
 from rk.config import Config, ConfigError, config_from_dict
-from rk.corpus import IDS_PER_CALL, freeze
+from rk.corpus import IDS_PER_CALL, OpenAlexError, freeze
 from rk.evaluate import EvalError
 from rk.live.check import REPORT_FILE, run_check
 from rk.live.evaluate import run_l1, run_live_eval
@@ -56,7 +58,7 @@ from rk.live.explain import (
     snippets,
 )
 from rk.live.explain_eval import REVIEW_COLUMNS, recorded_times, run_explain_eval
-from rk.live.openalex_search import KEYWORDS_SELECT
+from rk.live.openalex_search import DETAILS_SELECT
 from rk.live.pipeline import AGENT_PROMPT, RERANKED, Candidate, CheckLedger, merge_same_text
 from rk.live.pool import same_text, shared_sentences
 from rk.live.report import (
@@ -82,6 +84,7 @@ from rk.text import content_stems, sentence_spans, sentences
 
 PAPER_RE = re.compile(r"\[(\d+)\] Title: (.*)\nAbstract: (.*)")
 KEYWORDS_OF_T1 = ["Automatic Summarization", "Sparse attention routing"]
+VENUE_OF_T1 = "Transactions of the Association for Computational Linguistics"
 
 
 def explain_dict(**overrides: Any) -> dict[str, Any]:
@@ -114,11 +117,15 @@ def cfg(tmp_path: Path) -> Config:
 
 
 def works() -> list[dict[str, Any]]:
-    """The fixture corpus as OpenAlex returns it, T1 with OpenAlex keywords."""
+    """The fixture corpus as OpenAlex returns it, T1 with OpenAlex keywords and a venue."""
     return [
-        oa_work(r, keywords=[{"display_name": k} for k in KEYWORDS_OF_T1])
+        oa_work(
+            r,
+            keywords=[{"display_name": k} for k in KEYWORDS_OF_T1],
+            primary_location={"source": {"display_name": VENUE_OF_T1}},
+        )
         if r["id"] == T1
-        else oa_work(r)
+        else oa_work(r, primary_location={"source": None})
         for r in corpus_records()
     ]
 
@@ -446,22 +453,23 @@ def test_a_term_no_top_paper_uses_is_dropped() -> None:
     assert [g.source for g in groups] == [TITLE_GROUP]  # the agent's terms had no support
 
 
-# --- the keyword lookup ---------------------------------------------------------------------
+# --- the details lookup: keywords and venues ------------------------------------------------
 
 
-def test_keywords_come_from_one_cached_list_call(cfg: Config) -> None:
+def test_keywords_and_venues_come_from_one_cached_list_call(cfg: Config) -> None:
     fake = FakeLiveOpenAlex(works())
     search = _search(cfg, fake)
-    lookup = search.keywords([T1, T2])
+    lookup = search.details([T1, T2])
     assert lookup.keywords == {T1: KEYWORDS_OF_T1, T2: []}
+    assert lookup.venues == {T1: VENUE_OF_T1}  # T2 has no source
     assert (lookup.cost_usd, lookup.cached, lookup.money_spent) == (LIST_COST, False, LIST_COST)
     (request,) = fake.requests
-    assert request["filter"] == f"ids.openalex:{T1}|{T2}" and request["select"] == KEYWORDS_SELECT
-    again = search.keywords([T1, T2])
+    assert request["filter"] == f"ids.openalex:{T1}|{T2}" and request["select"] == DETAILS_SELECT
+    again = search.details([T1, T2])
     assert again.cached and again.money_spent == 0.0 and len(fake.requests) == 1
-    assert search.keywords([]).keywords == {}
+    assert search.details([]).keywords == {}
     with pytest.raises(ValueError, match="at most"):
-        search.keywords([f"W{n}" for n in range(IDS_PER_CALL + 1)])
+        search.details([f"W{n}" for n in range(IDS_PER_CALL + 1)])
 
 
 # --- the whole check ------------------------------------------------------------------------
@@ -481,6 +489,8 @@ def test_the_default_check_explains_its_top_papers(cfg: Config) -> None:
     assert report.papers[0].id == T1 and report.papers[0].status == VERIFIED_EXACT
     assert report.papers[0].explanation is not None
     assert report.papers[0].explanation.overlap == "high"
+    assert report.papers[0].venue == VENUE_OF_T1
+    assert all(p.venue is None for p in report.papers[1:])
     assert (report.rerank, report.explainer) == (RERANKED, EXPLAINED)
     assert report.warnings == []
     assert report.queries == run.result.trace.queries[1:] and report.queries
@@ -625,6 +635,61 @@ def test_a_check_shows_one_entry_for_two_versions(cfg: Config) -> None:
     assert t1.aliases == ["W301"]
 
 
+def test_a_check_reports_each_stage(cfg: Config) -> None:
+    stages: list[str] = []
+    run_check(
+        CheckRequest(text=GOOD[T1]),
+        cfg,
+        search=_search(cfg, FakeLiveOpenAlex(works())),
+        encoder=FakeEncoder(),
+        agent=fake_agent(),
+        reranker=FakeLLM(original_first),
+        explainer=FakeLLM(explainer_reply),
+        progress=stages.append,
+    )
+    agent_queries = cfg.retrieval.max_queries - 1
+    assert stages == ["searching", f"agent query 1 of {agent_queries}", "reranking", "explaining"]
+    quick: list[str] = []
+    run_check(
+        CheckRequest(text=GOOD[T1], quick=True),
+        cfg,
+        search=_search(cfg, FakeLiveOpenAlex(works())),
+        encoder=FakeEncoder(),
+        progress=quick.append,
+    )
+    assert quick == ["searching"]
+
+
+class AgentQueryTimesOut(FakeLiveOpenAlex):
+    """OpenAlex timing out (HTTP 504) on the agent's query, every time."""
+
+    def handle(self, request: httpx.Request) -> httpx.Response:
+        params = dict(request.url.params)
+        if AGENT_QUERY in (params.get("search"), params.get("search.semantic")):
+            return httpx.Response(504, json={"error": "query_timeout"})
+        return super().handle(request)
+
+
+def test_the_tool_skips_a_failed_agent_search_and_evaluation_fails(cfg: Config) -> None:
+    run = check(cfg, fake=AgentQueryTimesOut(works()))
+    (keyword, semantic) = [w for w in run.report.warnings if "agent search failed" in w]
+    assert keyword.startswith("An agent search failed and was skipped (keyword search for")
+    assert "semantic search" in semantic and "HTTP 504" in semantic
+    assert run.report.papers and run.report.explainer == EXPLAINED
+    assert all(s.query != AGENT_QUERY for s in run.result.searches)
+    with pytest.raises(OpenAlexError, match="HTTP 504"):
+        run_check(
+            CheckRequest(text=GOOD[T1]),
+            cfg,
+            search=_search(cfg, AgentQueryTimesOut(works())),
+            encoder=FakeEncoder(),
+            agent=fake_agent(),
+            reranker=FakeLLM(original_first),
+            explainer=FakeLLM(explainer_reply),
+            strict=True,
+        )
+
+
 def test_nothing_after_the_search_fails_the_check(cfg: Config) -> None:
     def down(messages: list[dict[str, str]]) -> str:
         raise LLMError("upstream 503")
@@ -633,7 +698,7 @@ def test_nothing_after_the_search_fails_the_check(cfg: Config) -> None:
     run = check(cfg, fake=fake, explainer=FakeLLM(down))
     report = run.report
     assert report.explainer == FALLBACK and len(report.warnings) == 2
-    assert report.warnings[0].startswith("No OpenAlex keywords for the vocabulary map (")
+    assert report.warnings[0].startswith("No OpenAlex keywords for the vocabulary map, or")
     assert report.warnings[1].startswith("Not explained (the explainer call failed: upstream")
     top = report.papers[:3]
     assert all(p.snippet is not None and p.status == NOT_EXPLAINED for p in top)

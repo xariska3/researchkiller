@@ -36,6 +36,14 @@ class _Model(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
+def idea_text(text: str) -> str:
+    """The idea without surrounding whitespace, if it is MIN_WORDS-MAX_WORDS words long."""
+    n = len(text.split())
+    if not MIN_WORDS <= n <= MAX_WORDS:
+        raise ValueError(f"the idea must be {MIN_WORDS}-{MAX_WORDS} words long; it has {n}")
+    return text.strip()
+
+
 class CheckRequest(_Model):
     """One idea to check: 40-500 words, optionally only against work published before a date."""
 
@@ -46,10 +54,23 @@ class CheckRequest(_Model):
     @field_validator("text")
     @classmethod
     def _length(cls, text: str) -> str:
-        n = len(text.split())
-        if not MIN_WORDS <= n <= MAX_WORDS:
-            raise ValueError(f"the idea must be {MIN_WORDS}-{MAX_WORDS} words long; it has {n}")
-        return text.strip()
+        return idea_text(text)
+
+
+class CheckSubmission(_Model):
+    """The web API's POST body (rk.web): the idea, the mode and an optional date."""
+
+    text: str
+    mode: Literal["full", "quick"] = "full"  # full: the default check; quick: L1, no LLM
+    before_date: date | None = None  # only works published before this date
+
+    @field_validator("text")
+    @classmethod
+    def _length(cls, text: str) -> str:
+        return idea_text(text)
+
+    def request(self) -> CheckRequest:
+        return CheckRequest(text=self.text, before=self.before_date, quick=self.mode == "quick")
 
 
 class FacetVerdict(_Model):
@@ -100,6 +121,7 @@ class Paper(_Model):
     publication_date: str
     type: str | None
     authors: list[str]
+    venue: str | None = None  # the journal or conference (OpenAlex primary_location.source)
     snippet: Snippet | None = None  # the top live.explain_top_k only
     explanation: Explanation | None = None  # the top live.explain_top_k, default check only
 
@@ -109,6 +131,26 @@ class Paper(_Model):
             return NOT_EXPLAINED
         match = self.explanation.match
         return {EXACT: VERIFIED_EXACT, MATCHED: VERIFIED_MATCHED}.get(match, UNVERIFIED)
+
+    @property
+    def link(self) -> str:
+        """The DOI's address if it has one, else its OpenAlex page."""
+        return f"https://doi.org/{self.doi}" if self.doi else self.url
+
+    @property
+    def year(self) -> str:
+        return self.publication_date[:4]
+
+    def evidence(self) -> tuple[str, str] | None:
+        """The text to show as evidence and its label, or None if there is nothing."""
+        e = self.explanation
+        if e is not None and e.evidence is not None:
+            label = "exact quote" if e.match == EXACT else "matched to the abstract"
+            return e.evidence, label
+        if self.snippet is not None:
+            label = "unverified quote: snippet shown" if e is not None else "snippet"
+            return self.snippet.sentence, label
+        return None
 
 
 class VocabularyGroup(_Model):
@@ -210,4 +252,56 @@ def render_text(report: CheckReport) -> str:
     if report.vocabulary:
         lines += ["", "Words the literature uses that your text doesn't:"]
         lines += [f"   {g.label}: {', '.join(g.terms)}" for g in report.vocabulary]
+    return "\n".join(lines) + "\n"
+
+
+def render_markdown(report: CheckReport) -> str:
+    """The report as Markdown (the web app's export): the same order as the result page."""
+    mode = "Quick check (no LLM)" if report.mode == QUICK else "Full check"
+    lines = [
+        f"# {report.header}",
+        "",
+        report.coverage,
+        "",
+        f"**Idea** ({mode}"
+        + (f", published before {report.request.before}" if report.request.before else "")
+        + f"): {report.request.text}",
+    ]
+    if report.warnings:
+        lines += ["", "**Warnings**", ""] + [f"- {w}" for w in report.warnings]
+    shown = report.shown()
+    for paper in shown:
+        e = paper.explanation
+        level = f" ({e.overlap} overlap)" if e else ""
+        venue = f", {paper.venue}" if paper.venue else ""
+        lines += ["", f"## {paper.rank}. [{paper.title}]({paper.link}){level}", ""]
+        lines.append(f"{paper.year}{venue}")
+        evidence = paper.evidence()
+        if evidence is not None:
+            lines += ["", f"> {evidence[0]}", "", f"*{evidence[1]}*"]
+        if e is not None:
+            lines.append("")
+            for facet in FACETS:
+                verdict = getattr(e.facets, facet)
+                lines.append(f"- **{FACET_LABELS[facet]}**: {verdict.verdict}. {verdict.reason}")
+            lines += ["", f"**Differs**: {e.differs}"]
+    rest = [p for p in report.papers if p not in shown]
+    if rest:
+        lines += ["", "## Also found", ""]
+        lines += [f"{p.rank}. [{p.title}]({p.link}) ({p.year})" for p in rest]
+    if report.vocabulary:
+        lines += ["", "## Words the literature uses that your text doesn't", ""]
+        lines += [f"- **{g.label}**: {', '.join(g.terms)}" for g in report.vocabulary]
+    models = ", ".join(f"{role} {name}" for role, name in report.models.items())
+    lines += [
+        "",
+        "---",
+        "",
+        (
+            f"Cost ${report.cost.method_cost:.4f} (spent ${report.cost.billed_cost:.4f}); "
+            f"{report.stages.total_s:.1f} s; {report.n_candidates} candidates from "
+            f"{report.n_searches} searches; models: {models}; "
+            f"{report.created_at.strftime('%Y-%m-%d %H:%M')} UTC."
+        ),
+    ]
     return "\n".join(lines) + "\n"

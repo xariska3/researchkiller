@@ -447,6 +447,22 @@ no fabricated citations.
    *Decided on 2026-10-15:* a failed or timed-out agent search is skipped with
    a warning instead of failing the whole check. Evaluation stays strict: there,
    a failed agent search is an error row.
+   *Built on 2026-10-15* (`rk.web`; `python -m rk serve`):
+   - **Checks**: the web app runs them through `rk.live.check.run_check`, as
+     `rk check` does, one at a time in a background thread.
+   - **Storage**: SQLite (`web.db_path`), tables `checks`, `candidates` and
+     `explanations`.
+   - **Reuse**: the same text, mode and date within `web.history_days` (7)
+     reuses the stored report at $0.
+   - **Daily cap**: `web.daily_cost_cap` ($1.00) counts money spent today
+     (UTC), plus $0.03 held for each check in progress.
+   - **Refusals**: OpenAlex's spent daily budget refuses new checks until it
+     resets.
+   - **Restarts**: unfinished checks are marked failed, never re-run.
+   - **Agent searches**: the tool (`skip_failed_searches`) skips a failed one
+     with a warning; `strict` runs (evaluation) raise.
+   - **Venues**: they come from the same list call as the keywords
+     (`LiveSearchClient.details`, now for all 20 papers).
 7. User README ("how to run, what it does, what it doesn't"), screenshots,
    demo. Optional: Dockerfile built and tested in GitHub Actions.
 

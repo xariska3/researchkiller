@@ -31,13 +31,14 @@ rk.live.check runs a whole check: one of these, then what it shows for its top p
 from __future__ import annotations
 
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date
 from typing import Any
 
 from rk.agent import AgentRetriever
 from rk.config import Config, LiveConfig, ModelConfig
+from rk.corpus import OpenAlexError
 from rk.live.fusion import (
     B5,
     L1_L5,
@@ -50,9 +51,9 @@ from rk.live.openalex_search import (
     KEYWORD,
     SEARCH_COST_USD,
     SEMANTIC,
-    KeywordLookup,
     LiveSearchClient,
     SearchResponse,
+    WorkDetails,
 )
 from rk.live.pool import CandidatePool, Hit, same_text
 from rk.live.reranker import LISTWISE, candidates, listwise_ranking, parse_order, render_prompt
@@ -76,6 +77,9 @@ DEFAULT_FUSION = PROPOSAL_EQUAL
 RERANKED = "reranked"  # the reply's order
 FALLBACK = "fallback"  # L5w's order, with a warning
 SKIPPED = "skipped"  # no candidates, so no call
+# Stages a check reports to its `progress` callback (the web app shows them).
+SEARCHING = "searching"  # the user's own search; then "agent query n of m"
+RERANKING = "reranking"
 
 
 class CheckCostCapExceeded(RuntimeError):
@@ -120,8 +124,8 @@ class CheckLedger:
         self.searches += 1
         self.searches_sent += not response.cached
 
-    def add_lookup(self, lookup: KeywordLookup) -> None:
-        """Another OpenAlex call that isn't a search (the vocabulary map's keywords)."""
+    def add_lookup(self, lookup: WorkDetails) -> None:
+        """Another OpenAlex call that isn't a search (the papers' keywords and venues)."""
         self.openalex_cost += lookup.cost_usd
         self.openalex_spent += lookup.money_spent
 
@@ -156,7 +160,12 @@ class CappedChatModel:
 
 
 class LiveRanker:
-    """The agent's search tool (an rk.retrieval Ranker): search OpenAlex, then rank the pool."""
+    """The agent's search tool (an rk.retrieval Ranker): search OpenAlex, then rank the pool.
+
+    With `skip_failed` (the tool, not evaluation), a failed agent search is skipped with
+    a warning (`warnings`) instead of failing the check; the user's own search (the
+    first query) still fails it. `progress` is told the stage of each query.
+    """
 
     def __init__(
         self,
@@ -165,14 +174,22 @@ class LiveRanker:
         ledger: CheckLedger,
         live: LiveConfig,
         before: date | None = None,
+        *,
+        skip_failed: bool = False,
+        progress: Callable[[str], None] | None = None,
+        max_queries: int = 0,
     ) -> None:
         self.search = search
         self.pool = pool
         self.ledger = ledger
         self.live = live
         self.before = before
+        self.skip_failed = skip_failed
+        self.progress = progress
+        self.max_queries = max_queries  # for the progress line only
         self.queries: list[str] = []
         self.searches: list[SearchResponse] = []
+        self.warnings: list[str] = []
 
     def kinds(self, query: str) -> list[str]:
         """The searches a query gets: keyword unless it's long, semantic if enabled."""
@@ -182,9 +199,21 @@ class LiveRanker:
     def rank(self, query: str) -> list[str]:
         query_index = len(self.queries)
         self.queries.append(query)
+        if self.progress is not None:
+            agent = f"agent query {query_index} of {max(self.max_queries - 1, query_index)}"
+            self.progress(SEARCHING if query_index == 0 else agent)
         for kind in self.kinds(query):
             self.ledger.require(SEARCH_COST_USD, f"a {kind} search")
-            response = self.search.search(query, kind, before=self.before)
+            try:
+                response = self.search.search(query, kind, before=self.before)
+            except OpenAlexError as exc:
+                if not self.skip_failed or query_index == 0:
+                    raise
+                self.warnings.append(
+                    f"An agent search failed and was skipped ({kind} search for "
+                    f"{query[:80]!r}: {str(exc)[:200]}); the results come from the others."
+                )
+                continue
             self.ledger.add_search(response)
             self.searches.append(response)
             self.pool.add(response.records, query_index=query_index, kind=kind)
@@ -338,6 +367,7 @@ def with_rerank(
     encoder: Encoder,
     *,
     strict: bool = False,
+    progress: Callable[[str], None] | None = None,
 ) -> LiveSearchResult:
     """L5r: the check's final pool reranked by one listwise LLM call (rk.live.reranker).
 
@@ -363,6 +393,8 @@ def with_rerank(
         seconds = time.perf_counter() - start
         step = RerankStep(SKIPPED, 0, seconds, Usage())
         return replace(result, ledger=ledger, latency_s=result.latency_s + seconds, rerank=step)
+    if progress is not None:
+        progress(RERANKING)
     by_id = {r["id"]: r for r in result.pool.records}
     prompt = load_prompt(LISTWISE)
     text = render_prompt(prompt, result.text, [by_id[d] for d in cands], rr.abstract_chars)
@@ -416,11 +448,16 @@ def live_search(
     agent: ChatModel,
     before: date | None = None,
     fusion: str = B5,
+    skip_failed_searches: bool = False,
+    progress: Callable[[str], None] | None = None,
 ) -> LiveSearchResult:
     """Run the B5 loop on live search for `text` and rerank the pool (no explainer yet).
 
     `before` restricts the search to works published before that date; `fusion`
-    is how the final pool is ranked (rk.live.fusion; B5's by default).
+    is how the final pool is ranked (rk.live.fusion; B5's by default). With
+    `skip_failed_searches` (the tool), a failed agent search is skipped with a warning
+    (LiveRanker); evaluation leaves it off, so the check fails. `progress` gets each
+    stage (SEARCHING, then "agent query n of m").
     """
     live = cfg.live
     if live is None:
@@ -428,7 +465,16 @@ def live_search(
     start = time.perf_counter()
     ledger = CheckLedger(live.cost_cap_per_check)
     pool = CandidatePool(encoder, max_size=live.max_pool_size)
-    ranker = LiveRanker(search, pool, ledger, live, before)
+    ranker = LiveRanker(
+        search,
+        pool,
+        ledger,
+        live,
+        before,
+        skip_failed=skip_failed_searches,
+        progress=progress,
+        max_queries=cfg.retrieval.max_queries,
+    )
     b5 = AgentRetriever(
         ranker,
         CappedChatModel(agent, cfg.agent, ledger),
@@ -455,6 +501,7 @@ def live_search(
         encoder_device=encoder.device,
         pool=pool,
         fusion=fusion,
+        warnings=tuple(ranker.warnings),
     )
 
 
@@ -477,8 +524,9 @@ def merge_versions(
             kept.append(candidate)
             continue
         first = kept[same]
-        later = candidate.record["publication_date"] < first.record["publication_date"]
-        main, other = (candidate.record, first.record) if later else (first.record, candidate.record)
+        main, other = first.record, candidate.record
+        if candidate.record["publication_date"] < first.record["publication_date"]:
+            main, other = other, main  # the later entry was published first
         ids = {*first.record["aliases"], other["id"], *candidate.record["aliases"]}
         kept[same] = Candidate(
             first.rank,
@@ -508,6 +556,7 @@ def quick_check(
     search: LiveSearchClient,
     encoder: Encoder,
     before: date | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> LiveSearchResult:
     """The quick check, L1: one OpenAlex semantic search of `text`, reranked locally. No LLM.
 
@@ -517,6 +566,8 @@ def quick_check(
     live = cfg.live
     if live is None:
         raise ValueError("the config has no live: section")
+    if progress is not None:
+        progress(SEARCHING)
     start = time.perf_counter()
     ledger = CheckLedger(live.cost_cap_per_check)
     pool = CandidatePool(encoder, max_size=live.max_pool_size)
@@ -550,11 +601,14 @@ def default_check(
     agent: ChatModel,
     reranker: ChatModel,
     before: date | None = None,
+    strict: bool = False,
+    progress: Callable[[str], None] | None = None,
 ) -> LiveSearchResult:
     """The tool's default check, L5r: live_search ranked by DEFAULT_FUSION, then with_rerank.
 
-    A rerank call that fails or can't be read leaves L5w's order, with a warning in
-    the result's `warnings`.
+    A failed agent search is skipped, and a rerank call that fails or can't be read
+    leaves L5w's order, each with a warning in the result's `warnings`. With `strict`
+    (evaluation), a failed agent search or rerank call raises instead.
     """
     if cfg.rerank is None:
         raise ValueError("the default check needs the config's rerank: section")
@@ -566,5 +620,7 @@ def default_check(
         agent=agent,
         before=before,
         fusion=DEFAULT_FUSION,
+        skip_failed_searches=not strict,
+        progress=progress,
     )
-    return with_rerank(result, cfg, reranker, encoder)
+    return with_rerank(result, cfg, reranker, encoder, strict=strict, progress=progress)

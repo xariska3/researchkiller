@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>ResearchKiller</h1>
+<p class="note">Check whether a research idea has already been published: it searches
+OpenAlex, ranks what it finds, and explains how the closest papers overlap with your idea.
+{{ header }}</p>
+
+<form id="check-form">
+  <label for="text">Your idea ({{ min_words }}–{{ max_words }} words)</label>
+  <textarea id="text" name="text" rows="9" required
+    placeholder="Describe the problem, the method and what you expect to show."></textarea>
+  <div id="count" class="muted">0 words</div>
+  <fieldset>
+    <legend>Check</legend>
+    <label><input type="radio" name="mode" value="full" checked> Full: an agent searches,
+      the results are reranked and the top 10 explained (about 30 s, at most $0.03)</label>
+    <label><input type="radio" name="mode" value="quick"> Quick: one search, no LLM
+      (a few seconds)</label>
+  </fieldset>
+  <label for="before">Only work published before (optional)</label>
+  <input type="date" id="before" name="before_date">
+  <div><button type="submit" id="submit">Check</button></div>
+</form>
+
+<section id="progress" hidden>
+  <p><span class="spinner"></span><span id="stage">Submitting</span></p>
+</section>
+<p id="error" class="error" hidden></p>
+
+<h2>Recent checks</h2>
+{% if recent %}
+<ul class="recent">
+  {% for row in recent %}
+  <li><a href="/checks/{{ row.id }}">{{ row.first_words }}</a><br>
+    <span class="muted">{{ row.mode }} · {{ row.status }} · ${{ '%.4f' | format(row.billed_cost) }}
+      · {{ row.created_at.strftime('%Y-%m-%d %H:%M') }} UTC{% if row.from_history_of %}
+      · from history{% endif %}</span></li>
+  {% endfor %}
+</ul>
+{% else %}
+<p class="muted">None yet.</p>
+{% endif %}
+{% endblock %}
+
+{% block script %}
+<script>
+const form = document.getElementById("check-form");
+const text = document.getElementById("text");
+const count = document.getElementById("count");
+const button = document.getElementById("submit");
+const progress = document.getElementById("progress");
+const stage = document.getElementById("stage");
+const error = document.getElementById("error");
+
+text.addEventListener("input", () => {
+  const n = text.value.trim() ? text.value.trim().split(/\s+/).length : 0;
+  count.textContent = n + (n === 1 ? " word" : " words");
+});
+
+function fail(message) {
+  progress.hidden = true;
+  error.textContent = message;
+  error.hidden = false;
+  button.disabled = false;
+}
+
+form.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  error.hidden = true;
+  button.disabled = true;
+  progress.hidden = false;
+  stage.textContent = "Submitting";
+  const body = {
+    text: text.value,
+    mode: form.elements.mode.value,
+    before_date: form.elements.before_date.value || null,
+  };
+  let response;
+  try {
+    response = await fetch("/api/checks", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(body),
+    });
+  } catch (exc) {
+    return fail("The server didn't answer: " + exc);
+  }
+  const accepted = await response.json();
+  if (!response.ok) return fail(accepted.detail || "The check was refused.");
+  const check = await pollCheck(accepted.check_id, (c) => {
+    stage.textContent = stageLabel(c.stage);
+  });
+  if (check.status === "failed") return fail(check.error || "The check failed.");
+  window.location.href = "/checks/" + encodeURIComponent(accepted.check_id);
+});
+</script>
+{% endblock %}

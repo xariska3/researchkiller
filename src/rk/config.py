@@ -406,6 +406,27 @@ class ExplainConfig:
 
 
 @dataclass(frozen=True)
+class WebConfig:
+    """Phase 2 Step 6: the web app (python -m rk serve; docs/phase2_spec.md).
+
+    `daily_cost_cap` is the money the web app's checks may spend in a UTC day (LLM calls
+    as billed, and OpenAlex calls); run.budget_cap stays the cap over every command.
+    """
+
+    db_path: Path = Path("data/web.sqlite")  # checks, candidates and explanations
+    daily_cost_cap: float = 1.0  # USD per UTC day
+    history_days: float = 7.0  # the same check within this many days reuses its report
+    host: str = "127.0.0.1"  # local only by default
+    port: int = 8000
+
+    def __post_init__(self) -> None:
+        _require(self.daily_cost_cap > 0, "daily_cost_cap must be > 0")
+        _require(self.history_days >= 0, "history_days must be >= 0")
+        _require(bool(self.host.strip()), "host must not be empty")
+        _require(1 <= self.port <= 65535, "port must be in [1, 65535]")
+
+
+@dataclass(frozen=True)
 class Config:
     corpus: CorpusConfig
     bench: BenchConfig
@@ -418,6 +439,7 @@ class Config:
     compete: CompeteConfig | None = None  # Phase 2 Step 3: python -m rk compete
     rerank: RerankConfig | None = None  # Phase 2 Step 4: python -m rk rerank
     explain: ExplainConfig | None = None  # Phase 2 Step 5: python -m rk check
+    web: WebConfig | None = None  # Phase 2 Step 6: python -m rk serve (defaults if absent)
 
     def models(self) -> dict[str, ModelConfig]:
         return {"paraphraser": self.paraphraser, "judge": self.judge, "agent": self.agent}

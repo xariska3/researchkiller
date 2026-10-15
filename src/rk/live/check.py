@@ -18,6 +18,7 @@ call raises instead.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -53,6 +54,8 @@ from rk.live.report import (
 )
 from rk.live.reranker import LISTWISE
 from rk.live.vocab import vocabulary
+
+EXPLAINING = "explaining"  # the stage `progress` is told before the explainer call
 from rk.llm import ChatModel, load_prompt
 from rk.retrieval import Encoder
 
@@ -85,7 +88,12 @@ class CheckRun:
     merged: list[tuple[str, str]]  # (kept id, merged id): versions merged in the final list
 
 
-def paper(candidate: Candidate, snippet: Snippet | None, explanation: Explanation | None) -> Paper:
+def paper(
+    candidate: Candidate,
+    snippet: Snippet | None,
+    explanation: Explanation | None,
+    venue: str | None = None,
+) -> Paper:
     record = candidate.record
     return Paper(
         rank=candidate.rank,
@@ -96,6 +104,7 @@ def paper(candidate: Candidate, snippet: Snippet | None, explanation: Explanatio
         title=record["title"],
         publication_date=record["publication_date"],
         type=record.get("type"),
+        venue=venue,
         authors=[a["name"] for a in record.get("authors") or [] if a.get("name")],
         snippet=snippet,
         explanation=explanation,
@@ -112,8 +121,14 @@ def run_check(
     reranker: ChatModel | None = None,
     explainer: ChatModel | None = None,
     strict: bool = False,
+    progress: Callable[[str], None] | None = None,
 ) -> CheckRun:
-    """Check one idea: the default check (agent, reranker, explainer) or the quick one."""
+    """Check one idea: the default check (agent, reranker, explainer) or the quick one.
+
+    `progress` is told each stage: SEARCHING, "agent query n of m", RERANKING,
+    EXPLAINING. With `strict` (evaluation), a failed agent search, rerank call or
+    explainer call raises instead of leaving a warning.
+    """
     live, ex = cfg.live, cfg.explain
     if live is None or ex is None:
         raise ValueError("a check needs the config's live: and explain: sections")
@@ -121,7 +136,12 @@ def run_check(
     start = time.perf_counter()
     if request.quick:
         result = quick_check(
-            request.text, capped, search=search, encoder=encoder, before=request.before
+            request.text,
+            capped,
+            search=search,
+            encoder=encoder,
+            before=request.before,
+            progress=progress,
         )
     else:
         if agent is None or reranker is None or explainer is None or cfg.rerank is None:
@@ -137,6 +157,8 @@ def run_check(
             agent=agent,
             reranker=reranker,
             before=request.before,
+            strict=strict,
+            progress=progress,
         )
     result, merged = merge_same_text(result)  # before the top papers are chosen
     warnings = list(result.warnings)
@@ -150,21 +172,24 @@ def run_check(
     mark = time.perf_counter()
     ledger = replace(result.ledger)
     keywords: dict[str, list[str]] = {}
+    venues: dict[str, str] = {}
     keywords_cached: bool | None = None
-    if records:
+    if result.candidates:
         try:
             ledger.require(LIST_CALL_USD, "the keyword lookup")
-            lookup = search.keywords([r["id"] for r in records])
+            lookup = search.details([c.record["id"] for c in result.candidates])
             ledger.add_lookup(lookup)
-            keywords, keywords_cached = lookup.keywords, lookup.cached
+            keywords, venues, keywords_cached = lookup.keywords, lookup.venues, lookup.cached
         except (CheckCostCapExceeded, OpenAlexError) as exc:
-            warnings.append(f"No OpenAlex keywords for the vocabulary map ({exc}).")
+            warnings.append(f"No OpenAlex keywords for the vocabulary map, or venues ({exc}).")
     keywords_s = time.perf_counter() - mark
 
     step: ExplainStep | None = None
     explanations: list[Explanation | None] = [None] * len(records)
     if not request.quick:
         assert explainer is not None
+        if progress is not None:
+            progress(EXPLAINING)
         step = explain(
             request.text,
             records,
@@ -204,6 +229,7 @@ def run_check(
             c,
             found[i] if i < len(found) else None,
             explanations[i] if i < len(explanations) else None,
+            venues.get(c.record["id"]),
         )
         for i, c in enumerate(result.candidates)
     ]

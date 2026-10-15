@@ -26,7 +26,7 @@ from rk.bench import (
 from rk.compete import evaluate as compete_eval
 from rk.compete.resolve import Resolver
 from rk.compete.systems import CompeteError, connect_store, make_system
-from rk.config import ConfigError, load_config
+from rk.config import ConfigError, WebConfig, load_config
 from rk.corpus import CorpusError, OpenAlexClient, OpenAlexError, build_corpus
 from rk.evaluate import CONFIG_ORDER, SUMMARY_MD, EvalError, _f, report, run_eval
 from rk.live import evaluate as live_eval
@@ -345,6 +345,26 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Step 4's rerank run on the same checks, to estimate live times from it",
     )
+
+    serve = sub.add_parser(
+        "serve", help="the web app: run checks in a browser (http://127.0.0.1:8000 by default)"
+    )
+    serve.add_argument(
+        "--config",
+        type=Path,
+        default=Path("configs/phase1.yaml"),
+        help="the config (default configs/phase1.yaml)",
+    )
+    serve.add_argument(
+        "--set",
+        dest="overrides",
+        action="append",
+        default=[],
+        metavar="SECTION.KEY=VALUE",
+        help="override one config value (repeatable)",
+    )
+    serve.add_argument("--host", help="address to listen on (default web.host, 127.0.0.1)")
+    serve.add_argument("--port", type=_positive_int, help="port (default web.port, 8000)")
 
     report_cmd = sub.add_parser("report", help="regenerate a run's summary from the database")
     report_cmd.add_argument("run_dir", type=Path, help="runs/<timestamp> or runs/live-<timestamp>")
@@ -785,6 +805,26 @@ def explain_eval_command(
     return 0
 
 
+def serve_command(
+    config_path: Path,
+    host: str | None,
+    port: int | None,
+    overrides: Sequence[str] = (),
+) -> int:
+    import uvicorn
+
+    from rk.web.app import create_app
+
+    cfg = load_config(config_path, overrides)
+    if cfg.live is None or cfg.rerank is None or cfg.explain is None:
+        raise ConfigError(f"{config_path} needs live:, rerank: and explain: sections")
+    web = cfg.web or WebConfig()
+    host, port = host or web.host, port or web.port
+    print(f"rk serve: http://{host}:{port} (Ctrl+C to stop); checks in {web.db_path}", flush=True)
+    uvicorn.run(create_app(cfg), host=host, port=port, log_level="info")
+    return 0
+
+
 def report_command(run_dir: Path) -> int:
     if live_eval.is_live_run(run_dir):
         summary = live_eval.report(run_dir)
@@ -855,6 +895,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         if args.command == "check":
             return check_command(args.config, args.file, args.quick, args.before, args.overrides)
+        if args.command == "serve":
+            return serve_command(args.config, args.host, args.port, args.overrides)
         if args.command == "explain-eval":
             return explain_eval_command(
                 args.config,

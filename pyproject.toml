@@ -17,6 +17,11 @@ dependencies = [
     "mlflow",
     "python-dotenv",
     "pydantic>=2",  # the check's report schema (docs/phase2_spec.md, Architecture)
+    # The web app (docs/phase2_spec.md, Architecture): all installed with mlflow already.
+    "fastapi",
+    "uvicorn",
+    "sqlalchemy>=2",
+    "jinja2",
 ]
 
 [project.optional-dependencies]
@@ -34,7 +39,7 @@ version = { attr = "rk.__version__" }
 where = ["src"]
 
 [tool.setuptools.package-data]
-rk = ["prompts/*.txt", "data/*.txt"]
+rk = ["prompts/*.txt", "data/*.txt", "web/templates/*.html"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

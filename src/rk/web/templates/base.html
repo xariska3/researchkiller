@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}ResearchKiller{% endblock %}</title>
+<style>
+:root {
+  --bg: #ffffff; --fg: #1b1f24; --muted: #5b6470; --line: #d9dee4; --card: #f6f7f9;
+  --accent: #2457c5; --error: #b42318;
+  --high: #a8261b; --high-bg: #fdecea; --partial: #8a5300; --partial-bg: #fff3dc;
+  --low: #2f6b3a; --low-bg: #e8f5eb;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14171b; --fg: #e7eaee; --muted: #9aa3ad; --line: #2c3238; --card: #1c2026;
+    --accent: #85a8ff; --error: #ff8a80;
+    --high: #ff9a8f; --high-bg: #3a1d1b; --partial: #ffc46b; --partial-bg: #35290f;
+    --low: #8fd19e; --low-bg: #17301d;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg);
+  font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+main { max-width: 860px; margin: 0 auto; padding: 16px 16px 48px; }
+h1 { font-size: 1.6rem; margin: 0.6em 0 0.2em; }
+h2 { font-size: 1.15rem; margin: 1.4em 0 0.4em; }
+a { color: var(--accent); }
+.muted { color: var(--muted); }
+.error { color: var(--error); }
+label { display: block; font-weight: 600; margin: 0.8em 0 0.3em; }
+textarea, input[type=date] { width: 100%; font: inherit; color: var(--fg); background: var(--card);
+  border: 1px solid var(--line); border-radius: 8px; padding: 10px; }
+input[type=date] { width: auto; }
+fieldset { border: 1px solid var(--line); border-radius: 8px; margin: 0.8em 0; padding: 8px 12px; }
+fieldset label { font-weight: normal; margin: 0.3em 0; }
+button, .button { display: inline-block; font: inherit; font-weight: 600; color: #fff;
+  background: var(--accent); border: 0; border-radius: 8px; padding: 10px 18px;
+  margin: 12px 8px 0 0; text-decoration: none; cursor: pointer; }
+button:disabled { opacity: 0.6; cursor: wait; }
+.note { color: var(--muted); }
+.paper { background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+  padding: 12px 16px; margin: 14px 0; }
+.paper h3 { font-size: 1.05rem; margin: 0 0 4px; }
+.meta { color: var(--muted); margin: 0 0 8px; }
+.badge { display: inline-block; font-size: 0.85rem; font-weight: 600; border-radius: 999px;
+  padding: 1px 10px; margin-left: 6px; }
+.badge.high { color: var(--high); background: var(--high-bg); }
+.badge.partial { color: var(--partial); background: var(--partial-bg); }
+.badge.low { color: var(--low); background: var(--low-bg); }
+blockquote { margin: 8px 0 2px; padding: 4px 12px; border-left: 3px solid var(--line); }
+.evidence-status { font-size: 0.85rem; color: var(--muted); margin: 0 0 8px; }
+.facets { list-style: none; padding: 0; margin: 8px 0; }
+.facets li { margin: 2px 0; }
+.verdict { font-weight: 600; }
+.verdict.same { color: var(--high); }
+.verdict.different { color: var(--low); }
+.term { display: inline-block; border: 1px solid var(--line); border-radius: 999px;
+  padding: 0 10px; margin: 2px 4px 2px 0; }
+.recent { padding-left: 1.2em; }
+.recent li { margin: 6px 0; }
+.history { background: var(--card); border: 1px solid var(--line); border-radius: 8px;
+  padding: 8px 12px; }
+footer { margin-top: 2em; border-top: 1px solid var(--line); padding-top: 12px;
+  color: var(--muted); font-size: 0.9rem; }
+.spinner { display: inline-block; width: 0.9em; height: 0.9em; border: 2px solid var(--line);
+  border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite;
+  vertical-align: -0.1em; margin-right: 6px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (max-width: 560px) { main { padding: 12px 12px 40px; } h1 { font-size: 1.35rem; } }
+</style>
+</head>
+<body>
+<main>
+{% block content %}{% endblock %}
+</main>
+<script>
+// Shared by the pages: the stage of a check in words, and polling its status.
+function stageLabel(stage) {
+  const words = {
+    queued: "Waiting for its turn",
+    running: "Starting",
+    searching: "Searching OpenAlex with your text",
+    reranking: "Reranking the candidates",
+    explaining: "Explaining the closest papers",
+  };
+  if (stage && stage.startsWith("agent query")) return "Searching: " + stage;
+  return words[stage] || stage || "Working";
+}
+async function pollCheck(id, onUpdate) {
+  for (;;) {
+    const response = await fetch("/api/checks/" + encodeURIComponent(id));
+    const check = await response.json();
+    onUpdate(check);
+    if (!response.ok || check.status === "done" || check.status === "failed") return check;
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+  }
+}
+</script>
+{% block script %}{% endblock %}
+</body>
+</html>

@@ -60,6 +60,43 @@ A run stores one row per configuration and query in `data/results.sqlite`
 pass `--run-dir runs/<timestamp>`; add `--retry-errors` to redo the rows that
 ended in an LLM error.
 
+## Run the web app
+
+Check a research idea in the browser:
+
+```
+python -m rk serve [--port 8000]
+```
+
+Then open http://127.0.0.1:8000.
+
+- **What you can do**: paste an idea of 40–500 words and pick a check.
+  - **Full** (about 30 s, at most $0.03): an agent searches OpenAlex, an LLM
+    reranks the results, and the top 10 are explained.
+  - **Quick** (a few seconds): one search, no LLM.
+  - **Optionally**, limit the search to work published before a date.
+- **What a result shows**:
+  - each paper with its overlap level (high, partial or low) and the four
+    facets: problem, method, domain and claim;
+  - a sentence from its abstract, marked as an exact quote, matched to the
+    abstract, or an unverified snippet;
+  - what differs, and the terms the literature uses that your text doesn't.
+- **Export**: a result can be downloaded as Markdown or JSON.
+- **Where checks are kept**: `data/web.sqlite`. The same idea, mode and date
+  within 7 days shows the stored result, at no cost.
+- **Limits** (`web:` in `configs/phase1.yaml`):
+  - **Address**: the server listens on 127.0.0.1 only (`--host` to change it),
+    and has no accounts.
+  - **Daily cap**: new checks are refused once the day's spending (UTC) could
+    pass `web.daily_cost_cap` ($1.00).
+  - **OpenAlex**: new checks are also refused while OpenAlex's daily budget is
+    spent.
+- **Restarts**: checks unfinished when the server stops are marked failed on
+  the next start, and never re-run on their own.
+
+The same check runs from the command line with
+`python -m rk check --config configs/phase1.yaml --file idea.txt [--quick]`.
+
 ## Experiment tracking
 
 Every run is logged to MLflow, one parent run per benchmark run and one child
