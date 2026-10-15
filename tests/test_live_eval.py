@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 import yaml
 from bench_data import GOOD, T1, T2, T3, TITLES, corpus_records, judge_reply, target_rows
@@ -800,6 +801,47 @@ def test_l5w_ranks_l5s_own_check_with_its_fusion(
     assert f"- L5w: {live_evaluate.CONFIG_LABELS['L5w']} {PROPOSAL_ONLY}" in (
         done.run_dir / SUMMARY_MD
     ).read_text(encoding="utf-8")
+
+
+class AgentSearchTimesOut(FakeLiveOpenAlex):
+    """FakeLiveOpenAlex whose first `n` keyword searches for AGENT_QUERY get OpenAlex's 504."""
+
+    def __init__(self, n: int) -> None:
+        super().__init__()
+        self.timeouts_left = n
+
+    def handle(self, request: httpx.Request) -> httpx.Response:
+        if self.timeouts_left and request.url.params.get("search") == AGENT_QUERY:
+            self.timeouts_left -= 1
+            self.requests.append(dict(request.url.params))
+            body = {"error": "Gateway timeout", "reason": "query_timeout"}
+            return httpx.Response(504, json=body)
+        return super().handle(request)
+
+
+def test_a_failed_l5_check_is_an_error_row_in_l5w_too(
+    cfg: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(live_evaluate, "L5W_FUSION", PROPOSAL_EQUAL)
+    fake = AgentSearchTimesOut(6)  # every attempt of the first query's agent search
+    llm = agent()
+    done = _run(cfg, fake, llm, configs=["L1", "L5", "L5w"])
+    assert done.budget_stop is None and done.n_done == 3 and fake.timeouts_left == 0
+    rows = _rows(cfg, done.run_dir)
+    first = next(t for t, q in _qids(cfg).items() if q == min(_qids(cfg).values()))
+    errors = {k: r["error"] for k, r in rows.items() if r["status"] == "error"}
+    assert set(errors) == {("L5", first), ("L5w", first)}
+    assert errors[("L5", first)] == errors[("L5w", first)]
+    assert errors[("L5", first)].startswith("OpenAlexError: giving up after 6 attempts")
+    # L5w took L5's failure: no second agent loop (1 call, then 2 per later query).
+    assert len(llm.calls) == 5
+    summary = _summary(done.run_dir)
+    assert summary["errors"]["L5"] == summary["errors"]["L5w"] == 1
+    assert [(p["a"], p["b"], p["n"]) for p in summary["paired"]] == [
+        ("L5", "L1", 2),
+        ("L5w", "L5", 2),
+        ("L5w", "L1", 2),
+    ]
 
 
 def test_live_fusion_and_live_misses_commands(
