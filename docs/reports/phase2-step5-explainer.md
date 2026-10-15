@@ -8,10 +8,23 @@ at a glance:
 - **a vocabulary map** of the terms the literature uses that the idea doesn't.
 
 `python -m rk check --config configs/phase1.yaml --file idea.txt [--quick]` prints
-the report and saves it as JSON under `runs/check-<timestamp>/`. The evaluation below
-is report only: nothing was tuned on it.
+the report and saves it as JSON under `runs/check-<timestamp>/`. The first evaluation
+below is report only: nothing was tuned on it.
 
-## Summary
+**Update (2026-10-15)**:
+- **Hand review** of 50 rows by Claude, not the author: 0 false alarms; correct 40
+  yes, 9 partly, 1 no; useful 31, 17, 2.
+- **Product fixes**: five, chosen after that review and the first 20 dev checks (see
+  Product fixes).
+- **Check of the fixes** on 20 other dev checks:
+  - **Quotes**: 95.5% exact, 4.0% matched, 0.5% unverified.
+  - **The original**: in the top 10 and rated high in all 20 checks.
+  - **Cost**: median $0.0136.
+  - **Duplicates**: 4 real duplicates merged.
+- **Most of the text below describes the first run.** "What a check does now" has
+  been updated for the fixes.
+
+## Summary of the first run
 
 - **Quotes**: 168 of 200 explained papers (84.0%) have an evidence sentence found
   verbatim in the abstract.
@@ -34,14 +47,15 @@ is report only: nothing was tuned on it.
 - **Robustness**: no step fell back in 20 checks. Every rerank reply and explainer
   reply was readable, no reply was cut off, every paper got an explanation, and no
   keyword lookup failed.
-- **Hand review**: [docs/evaluation/explainer_review.csv](../evaluation/explainer_review.csv)
-  has 50 rows to fill in: the top 5 papers of 10 checks.
+- **Hand review**: [docs/evaluation/explainer_review.csv](../evaluation/explainer_review.csv),
+  the top 5 papers of 10 checks. It is now filled in; see Hand review.
 
 ## What a check does now
 
 | Step | Default check | Quick check (`--quick`) |
 |---|---|---|
 | Retrieval | L5r (Step 4) | L1: one OpenAlex semantic search, reranked locally |
+| Versions of one paper merged in the final list (product fix) | yes | yes |
 | Snippets (top 10) | yes | yes |
 | Keyword lookup (top 10) | yes | yes |
 | Explainer call (top 10) | yes | no |
@@ -51,6 +65,8 @@ is report only: nothing was tuned on it.
 - **Snippet** (`rk.live.explain.snippets`): the abstract is split into sentences by
   rule (not after "et al.", "e.g." or an initial). Each sentence is scored against
   the idea with the check's Qwen3-Embedding encoder, the idea encoded as a query.
+  - **Product fixes**: a full stop followed directly by a capital ("datasets.We")
+    ends a sentence too, and a snippet is cut at 350 characters, at a word, with "…".
 - **Explainer** (`rk.live.explain.explain`): one call to Mistral Medium 3.1, the
   validated Phase 1 judge (`explain.model`: the judge's endpoint and settings, with
   `max_tokens` 3,500).
@@ -61,11 +77,19 @@ is report only: nothing was tuned on it.
   - **Answer**: strict JSON, enforced by the API's schema. Per paper: an overlap
     level (high, partial or low); same or different for each facet, with a reason;
     one evidence sentence; and one line on what differs.
-- **Quote check**: the evidence must be in the abstract verbatim, after normalising
-  only whitespace and the form of quotation marks. Quotation marks around the whole
-  quote are ignored, and a quote must be at least 5 words long.
+- **Quote check** (first run): the evidence must be in the abstract verbatim, after
+  normalising only whitespace and the form of quotation marks. Quotation marks around
+  the whole quote are ignored, and a quote must be at least 5 words long.
   - If it fails, the quote is dropped and the paper is marked unverified, and its
     snippet is shown.
+  - **Now** (product fix, `locate_quote`): the abstract's own sentence is always
+    shown, never the explainer's version.
+    - **verified-exact**: the quote is in that sentence verbatim.
+    - **verified-matched**: no verbatim match, but the sentence has at least 90% of
+      the quote's words.
+    - **unverified**: neither, or a quote under 5 words. The snippet is shown.
+- **"Differs"** (product fix): a substantive difference, or exactly "No substantive
+  difference found.". It is never publication status or "the proposal is a plan".
 - **Fallbacks**: if the explainer call fails, could cross the cap, or can't be read,
   the papers keep their snippets and the check carries a warning. The whole check
   never fails at this stage. A missing or invalid entry costs only its own paper.
@@ -75,6 +99,8 @@ is report only: nothing was tuned on it.
   - **Terms**: a phrase is a run of words between stopwords and punctuation. It
     counts if it has a content word the idea lacks, and at least one top paper uses
     it.
+  - **Product fix**: phrases also end at using, based, via, with, for, by and
+    through, and a phrase ending in one ("graph-based") is dropped.
   - **Ranking**: terms are ranked by how many top papers use them, then grouped by
     source, at most 10 in all.
   - **Keywords need one extra call**: the searches don't ask for keywords, and
@@ -190,20 +216,141 @@ abstract, edited:
 ## Hand review
 
 [docs/evaluation/explainer_review.csv](../evaluation/explainer_review.csv) has 50 rows:
-the first 10 checks (A0045 to A0058), the top 5 papers of each.
-- **Columns**: qid, idea, rank, title, overlap, verified, evidence, differs.
-- **Evidence**: the verified quote, or "[snippet] …" where the quote failed.
-- **Empty columns to fill in**: correct?, useful?, false alarm?.
+the first 10 checks of the first run (A0045 to A0058), the top 5 papers of each.
+- **Columns**: qid, idea, rank, title, overlap, verified, evidence and differs (from
+  the first run's code), then the review: correct?, useful?, false alarm?, notes and
+  reviewer.
+- **Reviewer**: Claude (an AI assistant), not the author.
+
+| 50 rows | yes | partly | no |
+|---|---|---|---|
+| Correct? (the overlap level and the explanation) | 40 | 9 | 1 |
+| Useful? (to a researcher checking the idea) | 31 | 17 | 2 |
+| False alarm? | 0 | – | 50 |
+
+- **No false alarms.** A0049's 5 papers rated high were the main worry, since its
+  original wasn't in the top 10.
+  - **Four are real prior art**: KV-cache reuse or sharing across agents.
+  - **One is "slightly generous"** (PReCache, multi-LoRA cache sharing; correct:
+    partly).
+- **What the 10 not-fully-correct rows got wrong**, from the notes:
+  - **5 overlap levels off by one step**, in both directions. The 1 "no" is A0054's
+    rank 2: rated partial, though it is the same metric and should be high.
+  - **4 "differs" lines**:
+    - 2 meta: "already published; proposal is a plan" (A0054 rank 1) and "proposal
+      is a plan without implementation" (A0058 rank 1);
+    - 2 inaccurate: A0049 rank 5, and A0051 rank 4 ("no dataset", where the
+      competition released data).
+  - **1 duplicate**: A0053's ranks 4 and 5 are two versions of one paper. Rank 5 is
+    also one of the 2 rows rated not useful.
+- **Snippets**: two were whole abstracts (A0056 rank 4, A0058 rank 4), because the
+  splitter missed a full stop with no space after it ("datasets.We").
+- **Fixed since**: the meta "differs", the duplicate and the whole-abstract snippets
+  (Product fixes, items 3–5).
+- **Not fixed**: the overlap level's calibration, off by one step in 5 of 50 rows.
+
+## Product fixes (chosen after the first run and the hand review)
+
+These were decided on 2026-10-15, after looking at the first 20 dev checks and their
+hand review, so they are product fixes, not results of a blind evaluation. They were
+checked on 20 other dev checks, as declared in docs/phase2_spec.md before the run.
+
+1. **Quotes** (`rk.live.explain.locate_quote`):
+   - **The prompt** asks for the sentence exactly, from its first word, keeping any
+     opening words, symbols, markup and capitals.
+   - **The code** shows the abstract's own sentence, never the explainer's version:
+     verified-exact if the quote is in it verbatim, verified-matched if it has at
+     least 90% of the quote's words, otherwise unverified and the snippet is shown.
+   - **The 5-word minimum** stays.
+2. **Vocabulary** (`rk.live.vocab`): phrases end at using, based, via, with, for, by
+   and through, keywords included, and a phrase ending in one ("graph-based") is
+   dropped.
+3. **"Differs"**: a substantive difference (in problem, method, domain or claim), or
+   exactly "No substantive difference found."; never publication status, the
+   proposal being a plan, or the proposal not specifying something yet.
+   - The code puts the fixed line into the prompt (`NO_DIFFERENCE`), and rewrites a
+     near-miss such as a missing full stop to it.
+4. **Sentences and snippets** (`rk.text.sentences`): a full stop followed directly
+   by a capital ends a sentence ("datasets.We"). A snippet is cut at 350
+   characters, at a word, with "…".
+5. **Versions of one paper in the final list** (`rk.live.pipeline.merge_same_text`):
+   two results merge when their titles' content stems have a Jaccard of at least 0.7
+   and their abstracts share most sentences, with or without a shared author. The
+   earlier in the list is kept, and the other becomes its alias.
+   - **Shared sentences**: more than half of the shorter abstract's sentences, where
+     a sentence is shared if the other abstract has one with a word-set Jaccard of at
+     least 0.5.
+   - **Why not identical sentences**: the example, A0053's ranks 4 and 5, is a
+     preprint and its journal version. Every sentence is reworded a little, so they
+     share 0 identical sentences, but 67% at a Jaccard of 0.5.
+   - **On the first run's lists**, the rule merges that pair and 3 exact duplicates.
+     It leaves apart the 4 other pairs whose titles reach 0.7: those share at most
+     33% of sentences.
+   - **The pool and live-eval are unchanged**, and the list can be shorter than 20
+     after a merge.
+
+### The check of the fixes: 20 other dev checks
+
+- **Run**: `runs/explain-20261015-215122`, at commit e0d40e0 with a clean tree:
+
+  ```
+  python -m rk explain-eval --config configs/phase1.yaml --from-qid A0071 --limit 20 --review 10 --review-out runs/explain-review-A0071.csv --timing-run runs/rerank-20261015-132644 --set run.budget_cap=6.46 --set live.work_types=[article,preprint,conference-paper,book-chapter,dissertation,review,book,report]
+  ```
+
+- **Queries**: the next 20 dev queries in seeded order, A0071 to A0094, none of
+  them in the first run.
+- **Setup**: the same replay and timing as the first run. All 20 explainer calls
+  were real.
+
+| | First run, A0045–A0070 (before the fixes) | Check, A0071–A0094 (after) |
+|---|---|---|
+| Quotes exact | 168 / 200 (84.0%) | **191 / 200 (95.5%)** |
+| Quotes matched (shown as the abstract's sentence) | – (no such rule; 28 of the 32 would have matched) | 8 (4.0%) |
+| Quotes unverified (snippet shown) | 32 (16.0%) | **1 (0.5%)** |
+| Original in the explained top 10 | 16 / 20 | 20 / 20 |
+| Original rated high | 16 / 16 | 20 / 20 (quote exact 19, matched 1) |
+| Whole check, median / p95 / max | $0.0133 / $0.0159 / $0.0161 | $0.0136 / $0.0159 / $0.0162 |
+| Explainer call, median | $0.0045 | $0.0047 |
+| Estimated live check, median / p95 / max | 31.1 / 38.1 / 40.1 s | 32.4 / 37.0 / 40.5 s |
+| Fallbacks | none | none |
+
+- **The two runs have different queries**, so this is not a controlled comparison.
+- **Most of the gain is the prompt**: 95.5% of quotes are now exact.
+- **The 8 matched quotes** are the abstract's sentences from which the explainer:
+  - dropped a lead-in ("Inspired by this observation, in this work we tackle" →
+    "in this work we tackle");
+  - changed the case of the first letter;
+  - mended "pro-pose", a non-ASCII hyphen or a stray "\n".
+- **The 1 unverified quote** (A0078 rank 2) shows its snippet.
+- **"Differs"**: 23 of the 200 say "No substantive difference found.", and none cites
+  publication status or "the proposal is a plan". One says "proposal does not
+  specify", which the prompt also asks it to avoid.
+- **Snippets**: 10 were cut at 350 characters; none is longer than 351 characters
+  with the "…".
+- **Vocabulary**: 10 terms per check, and none of the 200 ends in a function word.
+- **Merges**: 4, in 2 checks, all real versions of one paper. The pool's own rules
+  missed them, for one of three reasons: titles too short for its exact-title rule,
+  years too far apart, or author names written differently ("Alokaili, A."). The
+  four:
+  - "Automatic Generation of Topic Labels" (two records, same day);
+  - "Tagging and Tag Recommendation" (2019 and 2020);
+  - "Probabilistic models for semantic visualization…" (a 2020 dissertation and
+    its 2017 article);
+  - "3D-SE Viewer…" (2007 and 2012).
+- **"The earlier" means earlier in the list.** In the third pair, that kept the
+  2020 dissertation and made the 2017 article its alias.
+- **Cost**: the explainer call is $0.0002 more, from the longer prompt. Merging and
+  snippets cost nothing.
 
 ## Spend
 
 | Ledger | Spent | Total / cap |
 |---|---|---|
-| `data/cache/llm.sqlite` (OpenRouter: Mistral, and Qwen in the first pilot) | **$0.0942** | $6.17 of $12 |
-| OpenAlex (free daily budget) | $0.0071: 5 searches in the first pilot, 21 keyword lookups | – |
+| `data/cache/llm.sqlite` (OpenRouter: Mistral, and Qwen in the first pilot) | **$0.1855**: $0.0942 for the first run and its pilots, $0.0913 for the check of the fixes | $6.26 of $12 |
+| OpenAlex (free daily budget) | $0.0091: 5 searches in the first pilot, 41 keyword lookups | – |
 
-- **Within the declared $0.50 cap**: every run had `run.budget_cap` 6.57, the
-  ledger's $6.0745 plus $0.4955.
+- **Within the declared caps**: the first run's $0.50 (`run.budget_cap` 6.57, the
+  ledger's $6.0745 plus $0.4955), and the check's $0.30 (6.46).
 - **By run**:
   - the first pilot: $0.0064, including the agent and rerank calls its fresh
     searches needed;
@@ -235,19 +382,18 @@ the first 10 checks (A0045 to A0058), the top 5 papers of each.
 
 ## Open questions
 
-1. **Quote verification at 84%**: all 32 failures are lightly edited real sentences.
-   - **(a) Keep the rule as it is.** Those papers show their snippet.
-   - **(b) Change the prompt**: copy the sentence from its first word, keeping any
-     opening clause and markup. This would be measured on new dev queries, and
-     probably fixes some but not all.
-   - **(c) Match the quote to the abstract's sentences.** Find the sentence it comes
-     from (one that has at least 90% of the quote's words) and show that sentence,
-     verbatim. Every quote shown would still be the abstract's own text.
-     - **In this run** it would recover 28 of the 32, computed offline from the run's
-       reports.
-     - **But it relaxes your "verbatim substring" rule**, so it is your decision.
-2. **An independent check of "high"**: the 16 / 16 is expected, since Mistral built
-   the benchmark. The hand review's "correct?" and "false alarm?" columns are the real
-   test, especially A0049's 5 high papers.
-3. **Vocabulary noise**: should phrases end at "using", "based" and "via"? This would
-   be a later change, judged on new queries.
+**From the first run, answered on 2026-10-15:**
+1. **Quotes**: the prompt fix plus the 90% match, as options (b) and (c), keeping the
+   5-word minimum. Done: Product fixes, item 1.
+2. **An independent check of "high"**: the hand review found 0 false alarms in 50
+   rows, and 4 of A0049's 5 high papers are real prior art.
+3. **Vocabulary**: end phrases at function words. Done: item 2.
+
+**Now:**
+1. **Overlap calibration**: in 5 of the 50 reviewed rows, the level was one step off
+   (high, partial or low), in both directions. Is that acceptable, or should the
+   definitions in the prompt be tightened, checked on new dev queries?
+2. **"The earlier" in the merge** is the earlier in the list. Should it be the
+   earlier published version, as the pool's own dedupe keeps?
+3. **live-eval doesn't merge versions**, so a merged duplicate can't change Hit@k.
+   Should it, for the web app's numbers to match what users see?

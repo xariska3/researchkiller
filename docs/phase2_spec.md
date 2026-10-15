@@ -350,6 +350,15 @@ design live, and keeps the Phase 1 benchmark as a regression test.
       cost per check, with the first run's measures alongside.
     - **Review CSV**: under runs/, since the hand-reviewed one stays as it is.
     - **Spend cap**: $0.30, against an expected $0.10.
+    - **Result (2026-10-15)**, `runs/explain-20261015-215122`:
+      - **Quotes**: 95.5% exact, 4.0% matched, 0.5% unverified (191, 8 and 1
+        of 200).
+      - **The original**: in the top 10 and rated high in 20 of 20.
+      - **Cost**: median $0.0136 a check (max $0.0162).
+      - **Merges**: 4, all real versions of one paper.
+      - **"Differs"**: none cites publication status or "the proposal is a
+        plan".
+      - **Spend**: $0.091.
 - The Phase 1 frozen benchmark stays runnable as a regression test.
 
 ## Competitive evaluation: is it better than what researchers already use?
