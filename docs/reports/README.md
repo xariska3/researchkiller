@@ -30,3 +30,6 @@ In order (dates of the first commit of each):
 11. [phase2-step5-explainer.md](phase2-step5-explainer.md) (2026-10-15): Step 5, what a
     check shows (snippets, overlap explanations, vocabulary map), the hand review and
     the more detailed limitations.
+12. [phase2-two-lists.md](phase2-two-lists.md) (2026-10-16): issue #22, two lists from
+    one rerank call (closest in contribution, closest in methods), evaluated on the
+    dev set.

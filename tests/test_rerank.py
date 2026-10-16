@@ -40,8 +40,10 @@ from rk.live.rerank import (
     R1,
     R2,
     R3,
+    R4,
     RESULTS_FILE,
     RS,
+    TWO_LISTS_MIN_HIT_AT_5,
     UPPER_MODEL,
     fused_ranking,
     graded_ranking,
@@ -49,7 +51,13 @@ from rk.live.rerank import (
     run_rerank,
     select_rerank,
 )
-from rk.live.reranker import candidates, listwise_ranking, parse_order, render_candidates
+from rk.live.reranker import (
+    TWO_LISTS_RESPONSE_FORMAT,
+    candidates,
+    listwise_ranking,
+    parse_order,
+    render_candidates,
+)
 from rk.llm import BudgetExceeded, LLMError, load_prompt
 from rk.retrieval import rrf
 
@@ -251,6 +259,32 @@ def original_first(messages: list[dict[str, str]]) -> str:
     return json.dumps({"ranking": first + rest})
 
 
+TWO_LISTS_MARK = '"contribution_ranking":'  # only the two-list prompt's answer format has it
+CONTRIBUTION_LINE = "Sparse routing for long inputs."
+METHODS_LINE = "Clustered attention on arXiv and PubMed."
+
+
+def two_lists_reply(messages: list[dict[str, str]]) -> str:
+    """A two-list reply. List A is original_first's order; list B starts with list A's
+    second paper, then the others from the last, and the original last."""
+    order = json.loads(original_first(messages))["ranking"]
+    return json.dumps(
+        {
+            "contribution": " Sparse  routing\nfor long inputs. ",  # read as CONTRIBUTION_LINE
+            "methods": METHODS_LINE,
+            "contribution_ranking": order,
+            "methods_ranking": order[1:2] + order[:1:-1] + order[:1],
+        }
+    )
+
+
+def any_reranker(messages: list[dict[str, str]]) -> str:
+    """The two-list reply to the two-list prompt, original_first's to the others."""
+    if TWO_LISTS_MARK in messages[-1]["content"]:
+        return two_lists_reply(messages)
+    return original_first(messages)
+
+
 def run(cfg: Config, run_dir: Path, clients: dict[str, Any], **kwargs: Any) -> Any:
     return run_rerank(cfg, run_dir, encoder=FakeEncoder(), clients=clients, **kwargs)
 
@@ -416,5 +450,59 @@ def test_each_variant_reads_the_declared_call() -> None:
         R1: ("rerank_listwise", PRODUCT_MODEL),
         R2: ("rerank_listwise", PRODUCT_MODEL),
         R3: ("rerank_graded", PRODUCT_MODEL),
+        R4: ("rerank_two_lists", PRODUCT_MODEL),
         RS: ("rerank_listwise", UPPER_MODEL),
     }
+    assert live_rerank.STEP4 == (R1, R2, R3, RS)  # a run without --variants has no R4
+
+
+# --- R4, two lists (issue #22) -------------------------------------------------------------
+
+
+def test_r4_is_the_two_list_call_scored_on_list_a(
+    live_run: tuple[Config, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg, run_dir = live_run
+    monkeypatch.setattr(live_rerank, "RERANK_CHOICE", R1)
+    product = FakeLLM(any_reranker)
+    done = run(cfg, run_dir, {PRODUCT_MODEL: product}, variants=[R4, R1])
+    assert done.summary["variants"] == [R1, R4]
+    # One two-list call per check, with its strict schema; R1's stays plain text.
+    two_list_calls = [i for i, c in enumerate(product.calls) if TWO_LISTS_MARK in c[-1]["content"]]
+    assert len(product.calls) == 6 and len(two_list_calls) == 3
+    assert [product.response_formats[i] for i in two_list_calls] == [TWO_LISTS_RESPONSE_FORMAT] * 3
+    assert product.response_formats.count(None) == 3
+    by = {(r["config"], r["target_id"]): r for r in results(done)}
+    for target in (T1, T2, T3):
+        r4 = by[(R4, target)]
+        assert r4["status"] == "ok" and r4["readable"] and r4["methods_readable"]
+        assert r4["doc_ids"] == by[(R1, target)]["doc_ids"]  # list A is original_first's order
+    two = done.summary["two_lists"]
+    hit5 = done.summary["quality"][R4]["hit_at_5"]
+    assert two["min_hit_at_5"] == TWO_LISTS_MIN_HIT_AT_5 == 0.84
+    assert two["passes"] is (hit5 >= 0.84) and two["methods_unreadable"] == 0
+    assert (two["vs_choice"]["a"], two["vs_choice"]["b"], two["vs_choice"]["n"]) == (R4, R1, 3)
+    meta = json.loads((done.run_dir / RUN_FILE).read_text(encoding="utf-8"))
+    assert set(meta["prompts"]) == {"rerank_listwise", "rerank_two_lists", "two_lists_schema"}
+    markdown = (done.run_dir / SUMMARY_MD).read_text(encoding="utf-8")
+    assert "## Two lists (issue #22): list A (R4) against L5r" in markdown
+    assert f"it **{'passes' if two['passes'] else 'fails'}**" in markdown
+
+
+def test_r4_reads_list_a_alone_and_counts_unreadable_list_b(
+    live_run: tuple[Config, Path],
+) -> None:
+    cfg, run_dir = live_run
+
+    def original_last(messages: list[dict[str, str]]) -> str:
+        reply = json.loads(two_lists_reply(messages))
+        order = reply["contribution_ranking"]
+        reply["contribution_ranking"] = order[1:] + order[:1]
+        reply["methods_ranking"] = "none"
+        return json.dumps(reply)
+
+    done = run(cfg, run_dir, {PRODUCT_MODEL: FakeLLM(original_last)}, variants=[R4])
+    quality, two = done.summary["quality"][R4], done.summary["two_lists"]
+    assert quality["hit_at_1"] == 0 and quality["unreadable"] == 0
+    assert two["passes"] is (quality["hit_at_5"] >= TWO_LISTS_MIN_HIT_AT_5)
+    assert two["methods_unreadable"] == 3 and two["vs_choice"] is None  # no L5r in the run

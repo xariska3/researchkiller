@@ -368,6 +368,77 @@ design live, and keeps the Phase 1 benchmark as a regression test.
       - **"Differs"**: none cites publication status or "the proposal is a
         plan".
       - **Spend**: $0.091.
+- Two lists (issue #22; see Steps, 8).
+  *Pre-declared on 2026-10-16, before any call:*
+  - **Why**: in a real user's check (a satellite IoT performance study), the
+    top 10 were time-series database benchmarks that share the idea's tools,
+    while the papers that match its contribution ranked 11-20. All of them were
+    among the candidates, so the ranking missed them, not the retrieval.
+  - **The call**: one rerank call returns two rankings of the same candidates.
+    List A ranks by overlap with what the idea claims as new, and list B by
+    overlap in method, tools and data.
+    - **Same as R1**: the model and its settings, the candidates and the cut
+      abstracts.
+    - **New**: the prompt `src/rk/prompts/rerank_two_lists.txt` and a strict
+      JSON schema, committed with the code before any call.
+  - **R4**: the two-list call in `python -m rk rerank`, scored on list A. It is
+    replayed offline on the cached checks, as R1 was in Step 4. R1 (L5r) replays
+    from the cache at $0.
+  - **Pilot**: R1 and R4 on the first 3 checks of the Step 2 pilot run
+    (`runs/live-20261014-114302`: Phase 1 tuning targets, neither dev nor
+    test).
+    - **What it checks**: that the replies can be read, and what they cost.
+    - **If any reply can't be read**: stop and report.
+    - Nothing is changed after it.
+  - **List A, on the dev set** (the 120 checks of `runs/live-20261014-122144`):
+    Hit@1 and Hit@5 of list A against L5r (R1).
+    - **Also reported**: Hit@10, MRR@20, and the paired comparison (ΔHit@5,
+      exact McNemar test).
+    - **Pass**: list A's Hit@5 is at least 0.84, i.e. 101 of 120 (L5r has
+      0.850 on this set).
+    - **If it passes**: two lists become the default full check
+      (`rerank.two_lists: true`).
+    - **If it fails**: the single list stays the default
+      (`rerank.two_lists: false`), and the result is reported.
+  - **Cost and time per check, on the dev set**: `python -m rk explain-eval`
+    on the same 120 queries (from A0045), as whole two-list checks under the
+    tool's $0.03 cap.
+    - **Calls**: the searches and the agent and rerank calls replay from the
+      caches; the keyword lookups and the explainer calls are new.
+    - **Cost**: the whole check's method cost, median and max.
+    - **Time**: estimated as in Step 5, median and max. It is the sum of the
+      dev run's recorded check time, R4's rerank call time from the dev rerank
+      run, and this run's snippet, keyword, explainer and vocabulary stages.
+    - **Also reported**: rerank and explainer fallbacks, papers explained per
+      check, papers in both lists, and the quote rates.
+    - **Settings**: the dev run's work types, as in Step 5.
+    - **When**: after list A's run, whether or not list A passes.
+  - **Report only**: nothing is tuned on these queries, and the test set
+    (`runs/live-20261015-000815`) is not used.
+  - **Spend cap**: $2.00 of new LLM spend over the three runs, against an
+    expected $1.
+  - **Pilot result (2026-10-16)**, `runs/rerank-20261016-164025`: all 3 replies
+    were readable, with both lists complete. The call cost $0.0017 against R1's
+    $0.0015, and took 14-16 s.
+  - **List A result (2026-10-16)**, `runs/rerank-20261016-164915`: the replay
+    reproduced all 120 recorded L5 rankings.
+    - **Hit@5**: 0.850, as L5r's (R1), with Hit@1 0.833 for both. List A placed the
+      original exactly as L5r did in all 120 checks (0 / 0, McNemar p = 1).
+    - **So**: list A passes (0.850 against 0.84), and two lists are the default
+      full check (`rerank.two_lists: true`).
+    - **List B**: readable in 120 of 120 replies.
+    - **The call**: $0.0016 a check (median; max $0.0021) against R1's $0.0014,
+      and 11.9 s (median; max 20.2 s).
+  - **Cost and time result (2026-10-16)**, `runs/explain-20261016-171526`: 120 of
+    120 checks finished, with no fallback in any step.
+    - **Cost per check**: median $0.0133, max $0.0181, under the $0.03 cap.
+    - **Time per check, estimated**: median 40.1 s, max 57.3 s.
+    - **Papers explained per check**: median 9 (8 in 57 checks, 14 in 3); in both
+      shown lists, median 5 of list B's 6.
+    - **Quotes**: 91.6% exact, 7.3% matched, 1.1% unverified, of 1,142.
+    - **The original**: rated high in all 102 checks that explained it.
+  - **Spend**: $0.72 over the three runs.
+  - **Report**: docs/reports/phase2-two-lists.md.
 - The Phase 1 frozen benchmark stays runnable as a regression test.
 
 ## Competitive evaluation: is it better than what researchers already use?
@@ -473,6 +544,41 @@ automated head-to-head only.*
      (`LiveSearchClient.details`, now for all 20 papers).
 7. User README ("how to run, what it does, what it doesn't"), screenshots,
    demo. Optional: Dockerfile built and tested in GitHub Actions.
+8. Two lists (issue #22): every full check returns two ranked lists from the
+   same candidates. *Decided on 2026-10-16*; its evaluation is under
+   Evaluation, two lists. *Built on 2026-10-16, and the default full check since
+   that evaluation passed.*
+   - **The rerank call**: one call (`rk.live.pipeline.with_rerank`,
+     `two_lists`) returns strict JSON. It holds one line on what the idea claims
+     as new (its problem and claim), one line on its methods, and then list A
+     and list B, each an ordered list of candidate numbers.
+     - **List A, "Closest in contribution (possible prior art)"**: ranked by
+       overlap with the idea's claimed contribution. Papers that share only
+       tools, datasets or software rank lower. L5w's other works follow, as in
+       L5r. It is the check's main list (`papers`, the top 20).
+     - **List B, "Closest in methods (worth citing)"**: ranked by overlap in
+       method, tools and data. Candidates the reply leaves out follow in
+       presented order.
+     - **Fallback**: list A keeps the check's order (L5w's, as L5r's fallback
+       does) and list B is empty, with a warning, if the call fails, could cross
+       the cap, or list A can't be read. A readable list A with an unreadable
+       list B keeps list A, with a warning.
+   - **The explainer**: one call for the top 8 of list A and the top 6 of list B
+     (`explain.contribution_top_k`, `explain.methods_top_k`).
+     - **Shared papers**: a paper in both is explained once and shown in both.
+     - **Unchanged**: the quote checks, and the whole check's $0.03 cap.
+     - **The vocabulary map**: it uses every explained paper.
+   - **The report** (result page, Markdown export, terminal): section A, then
+     section B, each with its heading and a one-line description.
+     - **Section A**: it keeps the report's order (overlap level, then rank)
+       and its "Also found" list. A paper also in section B gets a small "also
+       in methods" note.
+     - **Section B**: it is in its own rank order.
+   - **The web app**: list B's papers are stored too (a `ranking` column in
+     `candidates` and `explanations`). A stored one-list report is not reused
+     for a two-list check.
+   - **The switch**: `rerank.two_lists` (false keeps the single list). The quick
+     check and live-eval's L5r are unchanged.
 
 **Backlog** (decided on 2026-10-15):
 - **Retrieval improvements** are deferred until after the explainer and the

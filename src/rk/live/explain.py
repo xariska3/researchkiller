@@ -290,12 +290,14 @@ def explain(
     *,
     abstract_chars: int,
     strict: bool = False,
+    ranks: Sequence[str] | None = None,
 ) -> ExplainStep:
     """One explainer call for every record, charged to a copy of the check's ledger.
 
     If the call could cross the check's cap, fails (LLMError), or its reply can't be
     read, no paper is explained and the step carries a warning; papers whose entry is
-    missing or invalid get a warning too. With `strict`, a failed call raises.
+    missing or invalid get a warning too, which names them by `ranks` (default: their
+    positions, 1 first). With `strict`, a failed call raises.
     """
     start = time.perf_counter()
     ledger = replace(ledger)  # the caller's stays as it was
@@ -328,7 +330,7 @@ def explain(
         status = EXPLAINED
         missing = [n for n, e in enumerate(explanations, start=1) if e is None]
         if missing:
-            listed = ", ".join(str(n) for n in missing)
+            listed = ", ".join(ranks[n - 1] if ranks else str(n) for n in missing)
             warning = (
                 f"No explanation for the paper(s) at rank {listed}; they show their snippets "
                 f"only."

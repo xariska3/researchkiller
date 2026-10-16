@@ -32,7 +32,7 @@ from test_live_eval import (
     _search,
 )
 from test_live_eval import agent as fake_agent
-from test_rerank import dated_corpus, original_first, rerank_dict
+from test_rerank import dated_corpus, original_first, rerank_dict, two_lists_reply
 
 from rk import cli
 from rk.bench import FACETS as JUDGE_FACETS
@@ -76,8 +76,8 @@ from rk.live.report import (
     Paper,
     render_text,
 )
-from rk.live.rerank import PRODUCT_MODEL, R1, run_rerank
-from rk.live.reranker import LISTWISE
+from rk.live.rerank import PRODUCT_MODEL, R1, R4, run_rerank
+from rk.live.reranker import LISTWISE, TWO_LISTS
 from rk.live.vocab import KEYWORDS, QUERIES, vocabulary
 from rk.live.vocab import TITLES as TITLE_GROUP
 from rk.llm import LLMError
@@ -840,12 +840,12 @@ def bench(tmp_path: Path) -> Config:
 def evaluate(cfg: Config, tmp_path: Path, **kwargs: Any) -> Any:
     kwargs.setdefault("review_out", tmp_path / "review.csv")
     kwargs.setdefault("explainer", FakeLLM(explainer_reply))
+    kwargs.setdefault("reranker", FakeLLM(original_first))
     return run_explain_eval(
         cfg,
         search=_search(cfg, FakeLiveOpenAlex(works())),
         encoder=FakeEncoder(),
         agent=fake_agent(),
-        reranker=FakeLLM(original_first),
         from_qid="A0000",
         **kwargs,
     )
@@ -927,6 +927,52 @@ def test_explain_eval_measures_quotes_overlap_cost_and_time(bench: Config, tmp_p
     assert all(r["evidence"] == r["verified"] == "" for r in review if r not in explained)
     with pytest.raises(EvalError, match="never overwritten"):
         evaluate(bench, tmp_path, limit=1)
+
+
+def test_explain_eval_counts_two_list_checks_and_times_r4(tmp_path: Path) -> None:
+    data = config_dict(tmp_path, contribution_top_k=3, methods_top_k=2)
+    data["rerank"]["two_lists"] = True
+    bench = config_from_dict(data)
+    freeze(bench.corpus.out_dir, dated_corpus(), target_rows(), {})
+    assert make_bench(bench, _paraphraser(), FakeLLM(lambda m: judge_reply()))["accepted"] == 3
+    _phase1_run(bench, B1_RANKS, B5_RANKS)
+    live = run_live_eval(
+        bench, fake_agent(), FakeEncoder(), _search(bench, FakeLiveOpenAlex(works())),
+        configs=["L5"], log_mlflow=False,
+    )
+    # The dev rerank run with R4 gives the rerank call's time; it has no R1 rows.
+    rerank = run_rerank(
+        bench, live.run_dir, encoder=FakeEncoder(),
+        clients={PRODUCT_MODEL: FakeLLM(two_lists_reply)}, variants=[R4],
+    )
+    times = recorded_times(rerank.run_dir, bench.run.results_db, R4)
+    assert len(times) == 3 and all(t["rerank_s"] for t in times.values())
+    r1_times = recorded_times(rerank.run_dir, bench.run.results_db).values()
+    assert all(t["rerank_s"] is None for t in r1_times)
+    done = evaluate(
+        bench, tmp_path, limit=3, review_n=1, timing_run=rerank.run_dir,
+        reranker=FakeLLM(two_lists_reply),
+    )
+    s = done.summary
+    assert (s["n_checks"], s["n_ok"]) == (3, 3)
+    two = s["two_lists"]
+    assert two["checks"] == 3
+    assert two["methods_list"] == {"reranked": 3, "fallback": 0, "skipped": 0}
+    lines = (done.run_dir / "results.jsonl").read_text(encoding="utf-8").splitlines()
+    rows = [json.loads(line) for line in lines]
+    for row in rows:
+        # list A's top 3 and list B's top 2, the first of which is list A's second
+        assert row["lists"] == 2 and row["n_methods"] == 2 and row["n_both"] == 1
+        assert row["n_top"] == 4 == row["n_explained"]
+        q = times[row["qid"]]
+        assert row["estimated_live_s"] == pytest.approx(
+            q["check_s"] + q["rerank_s"] + row["explainer_stage_s"]
+        )
+    assert s["quotes"]["papers"] == 12 and two["explained"]["max"] == 4
+    meta = json.loads((done.run_dir / "run.json").read_text(encoding="utf-8"))
+    assert meta["two_lists"] is True and meta["timing_config"] == R4
+    assert TWO_LISTS in meta["prompts"] and "rerank_schema" in meta["prompts"]
+    assert "## Two lists (issue #22)" in (done.run_dir / "summary.md").read_text(encoding="utf-8")
 
 
 def test_the_explain_eval_command(

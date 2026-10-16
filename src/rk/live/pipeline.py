@@ -22,8 +22,10 @@ check with its final pool ranked by L5w's fusion (DEFAULT_FUSION), then reranked
 one listwise LLM call (with_rerank, rk.live.reranker). The rerank call is charged to
 the check's ledger under the same cap. If it could cross the cap, fails, or its
 reply has no readable ranking, the check keeps L5w's order and carries a warning;
-in evaluation (strict), a failed call raises instead. The quick check (quick_check)
-is L1: one semantic search, reranked locally, with no LLM.
+in evaluation (strict), a failed call raises instead. With rerank.two_lists (issue
+#22), the same call returns two lists: the check's candidates are list A (closest in
+contribution) and its `methods` list B (closest in methods). The quick check
+(quick_check) is L1: one semantic search, reranked locally, with no LLM.
 
 rk.live.check runs a whole check: one of these, then what it shows for its top papers.
 """
@@ -56,7 +58,17 @@ from rk.live.openalex_search import (
     WorkDetails,
 )
 from rk.live.pool import CandidatePool, Hit, same_text
-from rk.live.reranker import LISTWISE, candidates, listwise_ranking, parse_order, render_prompt
+from rk.live.reranker import (
+    LISTWISE,
+    TWO_LISTS,
+    TWO_LISTS_RESPONSE_FORMAT,
+    TwoLists,
+    candidates,
+    listwise_ranking,
+    parse_order,
+    parse_two_lists,
+    render_prompt,
+)
 from rk.llm import (
     ChatModel,
     Completion,
@@ -238,6 +250,11 @@ class RerankStep:
     usage: Usage  # the call's, if it was answered
     finish_reason: str | None = None
     warning: str | None = None  # why the order is L5w's (FALLBACK only)
+    # Two lists only (None otherwise): list B's status (RERANKED, FALLBACK: empty, or
+    # SKIPPED), and the reply's one line each on the idea's contribution and methods.
+    methods_status: str | None = None
+    contribution_line: str | None = None
+    methods_line: str | None = None
 
 
 @dataclass(frozen=True)
@@ -259,6 +276,9 @@ class LiveSearchResult:
     fusion: str = B5  # how the final pool was ranked (rk.live.fusion)
     rerank: RerankStep | None = None  # set by with_rerank
     warnings: tuple[str, ...] = ()  # for the user, e.g. that the rerank step fell back
+    # Two lists (with_rerank's two_lists): list B, the top live.top_k closest in methods
+    # (empty if it couldn't be read). None for a one-list check.
+    methods: list[Candidate] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -286,19 +306,10 @@ class LiveSearchResult:
             ],
             "pool_size": self.pool_size,
             "pool_dropped": self.pool_dropped,
-            "candidates": [
-                {
-                    "rank": c.rank,
-                    "id": c.record["id"],
-                    "aliases": c.record["aliases"],
-                    "doi": c.record["doi"],
-                    "title": c.record["title"],
-                    "type": c.record.get("type"),
-                    "publication_date": c.record["publication_date"],
-                    "found_by": [asdict(h) for h in c.hits],
-                }
-                for c in self.candidates
-            ],
+            "candidates": [_candidate_dict(c) for c in self.candidates],
+            "methods": (
+                None if self.methods is None else [_candidate_dict(c) for c in self.methods]
+            ),
             "cost": {
                 "method_cost": self.ledger.method_cost,
                 "billed_cost": self.ledger.billed_cost,
@@ -311,6 +322,19 @@ class LiveSearchResult:
             "encoder": self.encoder,
             "encoder_device": self.encoder_device,
         }
+
+
+def _candidate_dict(c: Candidate) -> dict[str, Any]:
+    return {
+        "rank": c.rank,
+        "id": c.record["id"],
+        "aliases": c.record["aliases"],
+        "doi": c.record["doi"],
+        "title": c.record["title"],
+        "type": c.record.get("type"),
+        "publication_date": c.record["publication_date"],
+        "found_by": [asdict(h) for h in c.hits],
+    }
 
 
 def proposal_records(text: str, searches: Sequence[SearchResponse]) -> list[Record]:
@@ -368,6 +392,7 @@ def with_rerank(
     *,
     strict: bool = False,
     progress: Callable[[str], None] | None = None,
+    two_lists: bool = False,
 ) -> LiveSearchResult:
     """L5r: the check's final pool reranked by one listwise LLM call (rk.live.reranker).
 
@@ -379,6 +404,12 @@ def with_rerank(
     If the call could cross the cap, fails (LLMError), or its reply has no readable
     ranking, the result keeps L5w's order and gets a warning. With `strict`, for
     evaluation, a failed call raises instead: an API failure is an error, not L5w.
+
+    With `two_lists` (issue #22), the call is the two-list one: the result's candidates
+    are its list A (closest in contribution, then L5w's other works) and its `methods`
+    are list B (closest in methods, then the other candidates in presented order).
+    Where L5r would keep L5w's order (list A unreadable), list B is empty too, under
+    one warning; a readable list A without a readable list B gets a warning of its own.
     """
     rr, live = cfg.rerank, cfg.live
     if rr is None or live is None:
@@ -391,19 +422,30 @@ def with_rerank(
     ledger = replace(result.ledger)  # the check's own ledger stays as L5w had it
     if not cands:
         seconds = time.perf_counter() - start
-        step = RerankStep(SKIPPED, 0, seconds, Usage())
-        return replace(result, ledger=ledger, latency_s=result.latency_s + seconds, rerank=step)
+        methods_skipped = SKIPPED if two_lists else None
+        step = RerankStep(SKIPPED, 0, seconds, Usage(), methods_status=methods_skipped)
+        return replace(
+            result,
+            ledger=ledger,
+            latency_s=result.latency_s + seconds,
+            rerank=step,
+            methods=[] if two_lists else None,
+        )
     if progress is not None:
         progress(RERANKING)
     by_id = {r["id"]: r for r in result.pool.records}
-    prompt = load_prompt(LISTWISE)
+    prompt = load_prompt(TWO_LISTS if two_lists else LISTWISE)
     text = render_prompt(prompt, result.text, [by_id[d] for d in cands], rr.abstract_chars)
     capped = CappedChatModel(reranker, rr.model, ledger, what="the rerank call")
     completion: Completion | None = None
+    reply: TwoLists | None = None
     order: list[int] | None = None
     problem: str | None = None
     try:
-        completion = capped.complete([{"role": "user", "content": text}])
+        completion = capped.complete(
+            [{"role": "user", "content": text}],
+            response_format=TWO_LISTS_RESPONSE_FORMAT if two_lists else None,
+        )
     except CheckCostCapExceeded as exc:  # "the rerank call could cost $x, and the check ..."
         problem = str(exc)
     except LLMError as exc:
@@ -411,15 +453,41 @@ def with_rerank(
             raise
         problem = f"the rerank call failed: {exc}"
     if completion is not None:
-        order = parse_order(completion.text, len(cands))
+        if two_lists:
+            reply = parse_two_lists(completion.text, len(cands))
+            order = reply.contribution_order if reply else None
+        else:
+            order = parse_order(completion.text, len(cands))
         if order is None:
-            problem = "the rerank reply had no readable ranking"
+            which = " contribution" if two_lists else ""
+            problem = f"the rerank reply had no readable{which} ranking"
+    warnings = list(result.warnings)
+    warning: str | None = None
     if order is None:
         ranking = l5w
-        warning: str | None = f"Not reranked ({problem}); the results keep the check's order."
+        kept = (
+            "the contribution list keeps the check's order, and there is no methods list"
+            if two_lists
+            else "the results keep the check's order"
+        )
+        warning = f"Not reranked ({problem}); {kept}."
+        warnings.append(warning)
     else:
         ranking = list(dict.fromkeys([*listwise_ranking(cands, order), *l5w]))
-        warning = None
+    methods: list[Candidate] | None = None
+    methods_status: str | None = None
+    if two_lists:
+        methods_order = reply.methods_order if reply and order is not None else None
+        methods_status = FALLBACK if methods_order is None else RERANKED
+        if methods_order is None:
+            methods = []
+            if order is not None:
+                warnings.append(
+                    "No methods list (the rerank reply had no readable methods ranking)."
+                )
+        else:
+            by_methods = listwise_ranking(cands, methods_order)
+            methods = ranked_candidates(result.pool, by_methods, live.top_k)
     seconds = time.perf_counter() - start
     step = RerankStep(
         status=FALLBACK if warning else RERANKED,
@@ -428,6 +496,9 @@ def with_rerank(
         usage=completion.usage if completion else Usage(),
         finish_reason=completion.finish_reason if completion else None,
         warning=warning,
+        methods_status=methods_status,
+        contribution_line=reply.contribution if reply else None,
+        methods_line=reply.methods if reply else None,
     )
     return replace(
         result,
@@ -435,7 +506,8 @@ def with_rerank(
         ledger=ledger,
         latency_s=result.latency_s + seconds,
         rerank=step,
-        warnings=(*result.warnings, warning) if warning else result.warnings,
+        warnings=tuple(warnings),
+        methods=methods,
     )
 
 
@@ -541,12 +613,17 @@ def merge_versions(
 def merge_same_text(result: LiveSearchResult) -> tuple[LiveSearchResult, list[tuple[str, str]]]:
     """The check's final list with versions of one paper merged (merge_versions).
 
-    The pool and its ranking are unchanged; live-eval doesn't merge.
+    A two-list check's methods list is merged the same way. The pool and its ranking
+    are unchanged; live-eval doesn't merge.
     """
     candidates, merged = merge_versions(result.candidates)
+    methods = result.methods
+    if methods is not None:
+        methods, merged_methods = merge_versions(methods)
+        merged = list(dict.fromkeys([*merged, *merged_methods]))
     if not merged:
         return result, []
-    return replace(result, candidates=candidates), merged
+    return replace(result, candidates=candidates, methods=methods), merged
 
 
 def quick_check(
@@ -608,7 +685,8 @@ def default_check(
 
     A failed agent search is skipped, and a rerank call that fails or can't be read
     leaves L5w's order, each with a warning in the result's `warnings`. With `strict`
-    (evaluation), a failed agent search or rerank call raises instead.
+    (evaluation), a failed agent search or rerank call raises instead. With
+    rerank.two_lists, the rerank call returns two lists (with_rerank's `two_lists`).
     """
     if cfg.rerank is None:
         raise ValueError("the default check needs the config's rerank: section")
@@ -623,4 +701,12 @@ def default_check(
         skip_failed_searches=not strict,
         progress=progress,
     )
-    return with_rerank(result, cfg, reranker, encoder, strict=strict, progress=progress)
+    return with_rerank(
+        result,
+        cfg,
+        reranker,
+        encoder,
+        strict=strict,
+        progress=progress,
+        two_lists=cfg.rerank.two_lists,
+    )
