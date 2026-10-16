@@ -417,6 +417,28 @@ design live, and keeps the Phase 1 benchmark as a regression test.
     (`runs/live-20261015-000815`) is not used.
   - **Spend cap**: $2.00 of new LLM spend over the three runs, against an
     expected $1.
+  - **Pilot result (2026-10-16)**, `runs/rerank-20261016-164025`: all 3 replies
+    were readable, with both lists complete. The call cost $0.0017 against R1's
+    $0.0015, and took 14-16 s.
+  - **List A result (2026-10-16)**, `runs/rerank-20261016-164915`: the replay
+    reproduced all 120 recorded L5 rankings.
+    - **Hit@5**: 0.850, as L5r's (R1), with Hit@1 0.833 for both. List A placed the
+      original exactly as L5r did in all 120 checks (0 / 0, McNemar p = 1).
+    - **So**: list A passes (0.850 against 0.84), and two lists are the default
+      full check (`rerank.two_lists: true`).
+    - **List B**: readable in 120 of 120 replies.
+    - **The call**: $0.0016 a check (median; max $0.0021) against R1's $0.0014,
+      and 11.9 s (median; max 20.2 s).
+  - **Cost and time result (2026-10-16)**, `runs/explain-20261016-171526`: 120 of
+    120 checks finished, with no fallback in any step.
+    - **Cost per check**: median $0.0133, max $0.0181, under the $0.03 cap.
+    - **Time per check, estimated**: median 40.1 s, max 57.3 s.
+    - **Papers explained per check**: median 9 (8 in 57 checks, 14 in 3); in both
+      shown lists, median 5 of list B's 6.
+    - **Quotes**: 91.6% exact, 7.3% matched, 1.1% unverified, of 1,142.
+    - **The original**: rated high in all 102 checks that explained it.
+  - **Spend**: $0.72 over the three runs.
+  - **Report**: docs/reports/phase2-two-lists.md.
 - The Phase 1 frozen benchmark stays runnable as a regression test.
 
 ## Competitive evaluation: is it better than what researchers already use?
@@ -524,7 +546,8 @@ automated head-to-head only.*
    demo. Optional: Dockerfile built and tested in GitHub Actions.
 8. Two lists (issue #22): every full check returns two ranked lists from the
    same candidates. *Decided on 2026-10-16*; its evaluation is under
-   Evaluation, two lists.
+   Evaluation, two lists. *Built on 2026-10-16, and the default full check since
+   that evaluation passed.*
    - **The rerank call**: one call (`rk.live.pipeline.with_rerank`,
      `two_lists`) returns strict JSON. It holds one line on what the idea claims
      as new (its problem and claim), one line on its methods, and then list A
