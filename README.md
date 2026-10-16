@@ -8,7 +8,7 @@ who want to see the closest published work before they invest in an idea. It run
 your own machine with your own API keys, for about $0.015 a check. It never declares
 an idea novel: a missing match is not proof of novelty.
 
-Designed and evaluated by Charalampos Karatzas, built with Claude Code as the coding agent.
+Designed and evaluated by Charalampos Karatzas.
 
 ![The front page: describe an idea and choose a full or a quick check](docs/img/screenshot_home.png)
 
