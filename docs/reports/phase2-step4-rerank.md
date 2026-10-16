@@ -229,18 +229,19 @@ recognise the paraphrase by its meaning: the same problem, approach and claim.
 - **The cost is a 6 s call** that can be dropped if it doesn't help. Step 5's hand
   check of 10 real checks should look at whether L5r's top results are the most useful
   ones.
+  - *Later note (2026-10-16): the Step 5 hand check was done on 10 benchmark checks
+    (the top 5 papers of each, 50 rows), not on real ideas; see
+    [phase2-step5-explainer.md](phase2-step5-explainer.md).*
 
 ## Spend
 
 | Ledger | Pilot | Dev | Test | Total this step | Ledger total / cap |
 |---|---|---|---|---|---|
 | `data/cache/llm.sqlite` (Qwen via OpenRouter) | $0.0085 | $0.3424 | $0.2363 | **$0.587** | $6.07 / $12 |
-| `data/cache/rerank_sonnet.sqlite` (Anthropic credit) | $0.0919 | $3.8004 | $2.6350 | **$6.527** | $6.53 / $20 |
+| `data/cache/rerank_sonnet.sqlite` (Anthropic) | $0.0919 | $3.8004 | $2.6350 | **$6.527** | $6.53 / $20 |
 
-- **Anthropic credit**: by our count, $82.92 of the $100 credit is now spent (Step 3's
-  $76.39 plus this step's). The credit expires on 2026-10-18 UTC, and the workspace
-  spend limit is $95. Anthropic doesn't report a billed cost, so the console's figure
-  may differ slightly.
+- **Anthropic**: Anthropic doesn't report a billed cost, so the Sonnet figures are our
+  own count.
 - **OpenAlex**: none.
 
 ## Deviations from the plan
@@ -255,6 +256,9 @@ recognise the paraphrase by its meaning: the same problem, approach and claim.
    comparison with Opus on the 200) were not pre-declared, and are labelled as such.
 4. **Nothing in the live tool changed.** L5r is evaluated offline only: the live
    pipeline and live-eval still have L5w as their best config.
+   - *Later note (2026-10-16): L5r was then built into the live pipeline as the
+     default check, with an L5r config in live-eval; see
+     [The live L5r on the test set](#the-live-l5r-on-the-test-set-2026-10-15).*
 
 ## Open questions
 
@@ -269,10 +273,8 @@ recognise the paraphrase by its meaning: the same problem, approach and claim.
 3. **What remains is retrieval**: 24 of 27 remaining misses never came back from
    OpenAlex. Is that worth a later step (more or different agent queries), or is
    0.85–0.86 Hit@5 enough for Phase 2?
-4. **The remaining Anthropic credit**: about $17 by our count, expiring 2026-10-18.
-   The deep-check evaluation needs Sonnet with web search on new queries, about $0.17
-   a query, so about 100 queries would fit. Use it for that before it expires, or let
-   it go?
+4. **A deep-check evaluation**: it needs Sonnet with web search on new queries, about
+   $0.17 a query. Run it on about 100 queries, or not?
 
 ## Addendum: after the test (2026-10-15)
 
@@ -281,7 +283,7 @@ Your answers to the open questions above:
    with an L5r config in live-eval.
 2. **A failed rerank call falls back** to L5w's order, with a warning.
 3. **Retrieval**: not decided yet.
-4. **The Anthropic credit** goes to a deep-check preview on the test set, capped at $15.
+4. **A deep-check preview** runs on the test set, capped at $15.
 
 You also asked for L5r against Opus on the test set, as the number to quote publicly,
 and for the benchmark caveat in the README's limitations (done).
@@ -401,26 +403,25 @@ from.
 
 | Ledger | Spent | Total / cap |
 |---|---|---|
-| `data/cache/compete.sqlite`, Sonnet (Anthropic credit) | **$6.45** | Sonnet $23.06 of $40; the Anthropic group $82.84 of $88 (the config's $89, lowered on the command line for this run) |
+| `data/cache/compete.sqlite`, Sonnet (Anthropic) | **$6.45** | Sonnet $23.06 of $40; the Anthropic group $82.84 of $88 (the config's $89, lowered on the command line for this run) |
 | `data/cache/llm.sqlite` (Qwen) | 0 | $6.07 of $12 |
 | OpenAlex, Crossref | 0 (free singleton lookups) | – |
 
-- **The Anthropic credit**: by our count, $89.37 of the $100 is spent: the compete
-  group's $82.84 plus this step's $6.53 of reranking.
-  - **Left**: $10.63 of the credit, or $5.63 under the workspace's $95 spend limit.
-  - **Expires**: 2026-10-18 UTC.
+- **Anthropic in total**, by our count: $89.37, the compete group's $82.84 plus this
+  step's $6.53 of reranking.
 
 ### Deviations in this addendum
 
 1. **The cap**: you allowed $15. The run's cap was $11.61 of new spend (the group cap
-   at $88), so that the Anthropic total by our count couldn't cross the workspace's
-   $95 limit. The run spent $6.45.
+   at $88). The run spent $6.45.
 2. **The compete run's tree wasn't clean**: its `run.json` records uncommitted changes.
    The only change was this addendum's README edit, saved 12 s before the run started.
    No code differed from 81f425a.
 3. **One-off scripts**: the Opus comparison and the deep-check merge were computed by
    scripts outside the repository, since the deep check isn't built. Both read only the
    run files named above. The merge follows the spec's rule.
+   - *Later note (2026-10-16): both are now kept, as run, in `scripts/l5r_vs_opus.py`
+     and `scripts/deep_check_preview.py`; re-run, they reproduce the numbers above.*
 
 ## Every system on the 80 test queries (exploratory)
 
@@ -432,8 +433,7 @@ The chart data, requested on 2026-10-15 after PR #14:
   CSV, and prints the numbers of this section's two tables in Markdown.
 - **The whole table is exploratory**: it wasn't pre-declared, and the same 80 queries
   also confirmed L5r against L5w.
-- **The deep check isn't built**, and the rest of the Anthropic credit is left to
-  expire (your decision).
+- **The deep check isn't built** (your decision).
 
 Where each system's numbers come from:
 

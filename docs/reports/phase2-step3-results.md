@@ -33,6 +33,10 @@ The design and the analysis were fixed before any paid call, in
   query.
 - **Ours**: L5w, the tool's default check, replayed offline from the
   live-eval caches. Its list is the top 10.
+  - *Later note (2026-10-16): "ours" in this report is L5w, the check before
+    the reranker. The tool's default check is now L5r, which adds the
+    reranker and reaches Hit@5 0.863 on the 80 test queries (86%); see
+    [phase2-step4-rerank.md](phase2-step4-rerank.md).*
   - The replay reproduced all 39 recorded L5w rankings of the test run.
   - Its cost and latency are the live check's.
 - **Scoring**:
@@ -355,7 +359,7 @@ The pattern across the 15:
      - I stopped and reported before the full run.
 2. **Your decisions**, committed in 5a299ac (config only):
    - Both Claude systems get `max_searches` 10, keeping dynamic filtering.
-   - OpenAI's cap allows $5.05 of new spend, with no top-up.
+   - OpenAI's cap allows $5.05 of new spend.
 3. **Claude re-pilot, 3 queries** (`runs/compete-20261015-011624`):
    - Sonnet $0.153 a query (max $0.163; stop above $0.44), with 6–10 searches.
    - Opus $0.308 a query (max $0.467; stop above $0.80), with 5–10
@@ -370,8 +374,8 @@ The pattern across the 15:
 
 | Account | System | Pilot | Re-pilot | Full runs | Total | Cap |
 |---|---|---|---|---|---|---|
-| Anthropic (credit) | claude-sonnet | 0.1984 | 0.4596 | 15.9577 | 16.6157 | 40 |
-| Anthropic (credit) | claude-opus | 0.6255 | 0.9247 | 28.4120 | 29.9622 | 55 |
+| Anthropic | claude-sonnet | 0.1984 | 0.4596 | 15.9577 | 16.6157 | 40 |
+| Anthropic | claude-opus | 0.6255 | 0.9247 | 28.4120 | 29.9622 | 55 |
 | Anthropic group | both | | | | 46.5778 | 89 |
 | OpenAI | openai-luna | 0.1560 | – | 5.0213 | 5.1773 | 5.2059 (pilot + $5.05) |
 | OpenRouter | perplexity | 0.0169 | – | 0.5475 | 0.5644 | 1 |
@@ -381,8 +385,7 @@ The pattern across the 15:
 - **The first pilot's Claude answers** ($0.82) are not used in the results.
   The re-pilot changed the request, so they weren't reused.
 - **What's left**:
-  - Anthropic: $42.42 of the group cap, from the credit that expires on
-    2026-10-18 UTC.
+  - Anthropic: $42.42 of the group cap.
   - OpenAI: $0.03 of its cap.
 - **No LLM spend in `data/cache/llm.sqlite`**: compete keeps its own ledger
   in `data/cache/compete.sqlite`.
@@ -398,8 +401,8 @@ The pattern across the 15:
 3. **More than one run directory**: the pilot, the re-pilot and the early
    run of the unaffected systems are separate. The full run reused their
    cached answers, and every number above comes from the one full run.
-4. **Report name**: `phase2-step3-results.md`, as you asked; the plan said
-   `phase2-step3-competitive.md`.
+4. **Report name**: `phase2-step3-results.md`, as you asked; the plan named it
+   differently.
 5. **Extra exploratory analyses**, not pre-declared and labelled as such:
    - ours and each system together;
    - the title-route calibration of the unresolved share;
@@ -414,12 +417,11 @@ The pattern across the 15:
 1. **Power**: with 100 queries, ours' lead over Claude and gpt-6-luna doesn't
    survive Holm. The other 100 checked queries would double n.
    - **Cost**: about $16 for Sonnet and $29 for Opus, more than the $42.42
-     left on the Anthropic credit for both. One Claude model would fit.
-   - **Deadline**: the credit expires on 2026-10-18 UTC.
+     left under the Anthropic group cap for both. One Claude model would fit.
    - Run one?
 2. **Equal search budgets**: rerunning gpt-6-luna at 10 tool calls would
-   need an OpenAI top-up of roughly $8–10 (my estimate). Worth it, or report
-   the asymmetry as is?
+   cost roughly $8–10 more (my estimate). Worth it, or report the asymmetry
+   as is?
 3. **A combined mode**: ours plus one web-search LLM call would have put the
    original in the top 5 for 85–87 of 100 queries, against 72 for ours
    alone. It would cost about $0.17 (with Sonnet) instead of $0.0075.
@@ -433,7 +435,8 @@ The pattern across the 15:
 
 This addendum follows your answers of 2026-10-15 to the open questions above:
 1. Opus runs on the other 100 checked queries, which this addendum reports.
-2. There is no OpenAI top-up, so the search-budget asymmetry stays as reported.
+2. There is no more OpenAI spend, so the search-budget asymmetry stays as
+   reported.
 3. The "deep check" hybrid is pre-declared in
    [docs/phase2_spec.md](../phase2_spec.md) (Product ideas), not built.
 4. Improving the ranking comes next, before the explainer.
@@ -515,10 +518,8 @@ The analysis was pre-declared before any call, in
 
 - **This run**: $29.81 of the $40 allowed, for the 100 new Opus calls.
 - **Opus in total**: $59.77 of its $69.96 cap.
-- **Anthropic group**: $76.39 of the $89 cap.
-  - About $23.61 of the $100 credit is left, by our count. Anthropic doesn't
-    report a billed cost, so the console's figure may differ slightly.
-  - The credit expires on 2026-10-18 UTC.
+- **Anthropic group**: $76.39 of the $89 cap. Anthropic doesn't report a
+  billed cost, so this is our own count.
 - **All compete runs**: $82.13 in total.
 - **Nothing else**: no OpenAI, Perplexity or `llm.sqlite` spend.
 

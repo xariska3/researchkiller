@@ -23,8 +23,13 @@ design live, and keeps the Phase 1 benchmark as a regression test.
   substrings of the cited abstract (checked in code, not by the LLM).
 - **Hand check:** 10 real reports read by the author; record for each whether
   the top results and overlap explanations were useful.
+  - *Later note (2026-10-16): the hand check was done on 10 benchmark checks
+    (the top 5 papers of each, 50 rows), reviewed by Claude rather than the
+    author; see [the Step 5 report](reports/phase2-step5-explainer.md).*
 - **Cost and speed:** median under $0.03 and under 60 s per check; hard cap of
   $0.10 per check.
+  - *Later note (2026-10-16): the tool caps a whole check at $0.03
+    (`explain.cost_cap_per_check`); $0.10 stays the cap of live-eval's checks.*
 - **Competitive check:** on the same queries, compared with ChatGPT and Claude
   with web search, Perplexity and Semantic Scholar on recall, fabricated
   references, cost and speed (see "Competitive evaluation").
@@ -217,7 +222,7 @@ design live, and keeps the Phase 1 benchmark as a regression test.
     can't be selected.
     - **Settings**: temperature 1 (Claude 5 models refuse less), its default
       adaptive thinking, and at most 16,000 output tokens.
-    - **Cap**: $20 of the Anthropic credit, in its own ledger
+    - **Cap**: $20, in its own ledger
       (`data/cache/rerank_sonnet.sqlite`).
     - **Memorisation**: Sonnet 5.5's training data runs to June 2026, so it may
       have read originals published before July. Its results are therefore
@@ -395,7 +400,7 @@ tier allows. Record whether the original paper appears, time taken, and what
 each tool offers that ours doesn't. No scraping or automation of these tools.
 Before the automated run, check current prices and set a per-system cost cap.
 
-**Landscape doc** (docs/landscape.md): what each existing tool does (Elicit,
+**Landscape doc**: what each existing tool does (Elicit,
 Consensus, Undermind, Semantic Scholar, Google Scholar Labs, ChatGPT/Claude deep
 research, Perplexity; research systems: Idea Novelty Checker, OpenScholar,
 PaperQA2, AI Scientist's novelty check), price, speed, and where ResearchKiller
@@ -403,6 +408,9 @@ is different. Candidate differentiators to confirm or reject with the numbers:
 prior art found under different terminology, facet-level overlap with verified
 quotes, vocabulary map, measured recall, ~1 cent and under a minute per check,
 no fabricated citations.
+
+*Later note (2026-10-16): the landscape doc wasn't written; Step 3 ran the
+automated head-to-head only.*
 
 ## Steps (one Claude Code session each, each on its own branch + PR)
 1. Live retrieval: OpenAlex search client (checked against current docs),
@@ -477,6 +485,8 @@ no fabricated citations.
   mode is L1: one OpenAlex semantic call and the local rerank, with no LLM, in
   about 1–2 s. It would sit next to the "thorough check", L5, the full
   pipeline. In the pilot, L1 had Hit@5 0.700 against L5's 0.833.
+  - *Later note (2026-10-16): the quick check is now built, as a mode of its
+    own: `python -m rk check --quick`, and the web app's Quick option.*
   *Decided on 2026-10-15, after the L5w test run:*
   - **Default check**: L5w. The reranker joins it if it wins on the test set
     in the rerank evaluation that comes before the explainer. *(It did, on
@@ -485,10 +495,11 @@ no fabricated citations.
   - **Preview**: L1 is shown at once, as a first preview, while the full check
     runs. L1 alone is not the default: it trailed L5w by 8.7 points of Hit@5 on
     the test set and by 11.7 on the dev set.
+    - *Later note (2026-10-16): as built, the quick check is a separate mode the
+      user picks; the full check doesn't show L1 first.*
 - **Deep check** (pre-declared on 2026-10-15, after Step 3; not built yet): an
   opt-in mode that adds one web-search LLM call to the default check.
-  *Decided on 2026-10-15, after the preview below:* it isn't built for now,
-  and the rest of the Anthropic credit is left to expire.
+  *Decided on 2026-10-15, after the preview below:* it isn't built for now.
   - **Why**: in Step 3 the two kinds of system were complementary. Ours found
     39 of 41 originals in the easiest bucket, Opus 10 of 16 in the hardest.
     Ours' or the LLM's top 5 held the original on 87 of 100 queries with Opus
@@ -525,9 +536,8 @@ no fabricated citations.
       run (`runs/rerank-20261015-140923`, R1).
     - **Sonnet's answers**: from a compete run on the same 80 queries, with
       Step 3's settings. 39 are in Step 3's cache; 41 are new calls.
-    - **Cap**: $11.61 of new spend. This is the requested $15, lowered so that
-      the Anthropic total by our count stays under the workspace's $95
-      limit (the compete group cap set to $88).
+    - **Cap**: $11.61 of new spend, lower than the requested $15 (the compete
+      group cap set to $88).
     - **Reported**: the deep check against L5r alone, on Hit@1, Hit@5 (with
       the exact McNemar test), Hit@10, MRR@10, the unverified share of the
       merged top 10, and cost and latency per check.
