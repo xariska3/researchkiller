@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=64"]
+requires = ["setuptools>=77"]  # 77: an SPDX `license` string and `license-files`
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,6 +7,8 @@ name = "researchkiller"
 dynamic = ["version"]
 description = "Prior-art retrieval benchmark for terminology-shifted research proposals."
 readme = "README.md"
+license = "PolyForm-Noncommercial-1.0.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = [
     "httpx",

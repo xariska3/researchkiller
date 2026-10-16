@@ -8,6 +8,8 @@ who want to see the closest published work before they invest in an idea. It run
 your own machine with your own API keys, for about $0.015 a check. It never declares
 an idea novel: a missing match is not proof of novelty.
 
+Designed and evaluated by Charalampos Karatzas, built with Claude Code as the coding agent.
+
 ![The front page: describe an idea and choose a full or a quick check](docs/img/screenshot_home.png)
 
 ![A result: the closest papers, with their overlap ratings and quotes](docs/img/screenshot_result.png)
@@ -126,37 +128,14 @@ paper. ResearchKiller's settings were chosen on a separate development set.
   had at most 10 searches and gpt-6-luna 5 tool calls. On these 80 queries, the one
   test declared in advance was the reranker against the same check without it: +16
   points in the top 5 (13 queries gained, 0 lost, p = 0.00024).
-- **The remaining misses are retrieval misses.** The source paper missed the top 5 in
-  29 of the 200 development and test queries. In 24 of those, no OpenAlex search the
-  check ran returned it, and no ranking can fix that.
 - **Explanations come from an LLM.** Quotes are checked against the abstract; the
   overlap levels, facets and "differs" lines are not. In a review of 50 explained
   papers, 5 overlap levels were one step off; that was accepted, not tuned. The
   reviewer was Claude (an AI assistant), not the author or another person, and there
   is no independent human evaluation yet.
-- **A consistency check, not independent evidence**: the Mistral model that writes the
-  explanations also accepted each benchmark proposal as keeping its source paper's
-  problem, method, domain and claim. So "the source paper is rated high" is expected.
-- **Merged versions can be wrong.** Versions of one paper (a preprint and its article)
-  are merged by a text-similarity rule. On the 80 test checks, 1 of 9 merges was
-  probably two different papers (NTCIR-4 and NTCIR-5 runs by the same group).
-- **OpenAlex's records have errors**, which the tool shows as they are: one benchmark
-  record carries one paper's title and another paper's abstract.
-- **Times are partly estimated.** The evaluations replayed cached searches and calls,
-  so their check times are recorded times plus the measured new stages. Fully live
-  checks took 35 to 38 s.
-- **From the Phase 1 benchmark**:
-  - single-domain paraphrases don't test cross-domain mechanism matching;
-  - source papers published after the models' training cutoffs reduce, but don't
-    eliminate, memorisation;
-  - the LLM judge that accepted each paraphrase can still accept a subtly shifted
-    meaning;
-  - targets whose paraphrases were all rejected (86 of 586) aren't in the benchmark,
-    which may slightly under-represent papers with number-heavy abstracts (not
-    significant);
-  - its comparison of query-planning methods gave each the same number of queries,
-    not tokens; the agent spends more tokens by design, so cost is reported next to
-    quality.
+
+More limitations are listed in
+[the Step 5 report](docs/reports/phase2-step5-explainer.md#more-limitations).
 
 ## Details
 
@@ -177,7 +156,9 @@ paper. ResearchKiller's settings were chosen on a separate development set.
 - [docs/development.md](docs/development.md): tests, the benchmark commands and
   experiment tracking.
 
-## Copyright
+## Copyright and license
 
-Copyright (c) 2026 Charalampos Karatzas. All rights reserved. The code is public for
-transparency and evaluation; please contact me before reusing it.
+Copyright (c) 2026 Charalampos Karatzas. Free for non-commercial use, including
+academic research, under the PolyForm Noncommercial License 1.0.0 (see
+[LICENSE](LICENSE)). For commercial use, contact me:
+https://www.linkedin.com/in/charalampos-karatzas/

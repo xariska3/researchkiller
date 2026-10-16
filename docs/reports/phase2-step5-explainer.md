@@ -428,3 +428,35 @@ The replay reproduces every recorded L5r rank before the merge.
 3. **live-eval and the merge**: checked once, offline, on the test set, without
    changing live-eval. Hit@1 is 0.838 instead of 0.825, and Hit@5 is unchanged at
    0.863 (see above).
+
+## More limitations
+
+The README lists the main limitations of the tool and its evaluation; these are the
+others.
+
+- **The remaining misses are retrieval misses.** The source paper missed the top 5 in
+  29 of the 200 development and test queries. In 24 of those, no OpenAlex search the
+  check ran returned it, and no ranking can fix that.
+- **A consistency check, not independent evidence**: the Mistral model that writes the
+  explanations also accepted each benchmark proposal as keeping its source paper's
+  problem, method, domain and claim. So "the source paper is rated high" is expected.
+- **Merged versions can be wrong.** Versions of one paper (a preprint and its article)
+  are merged by a text-similarity rule. On the 80 test checks, 1 of 9 merges was
+  probably two different papers (NTCIR-4 and NTCIR-5 runs by the same group).
+- **OpenAlex's records have errors**, which the tool shows as they are: one benchmark
+  record carries one paper's title and another paper's abstract.
+- **Times are partly estimated.** The evaluations replayed cached searches and calls,
+  so their check times are recorded times plus the measured new stages. Fully live
+  checks took 35 to 38 s.
+- **From the Phase 1 benchmark**:
+  - single-domain paraphrases don't test cross-domain mechanism matching;
+  - source papers published after the models' training cutoffs reduce, but don't
+    eliminate, memorisation;
+  - the LLM judge that accepted each paraphrase can still accept a subtly shifted
+    meaning;
+  - targets whose paraphrases were all rejected (86 of 586) aren't in the benchmark,
+    which may slightly under-represent papers with number-heavy abstracts (not
+    significant);
+  - its comparison of query-planning methods gave each the same number of queries,
+    not tokens; the agent spends more tokens by design, so cost is reported next to
+    quality.
