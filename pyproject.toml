@@ -7,6 +7,7 @@ name = "researchkiller"
 dynamic = ["version"]
 description = "Prior-art retrieval benchmark for terminology-shifted research proposals."
 readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.10"
 dependencies = [
     "httpx",
