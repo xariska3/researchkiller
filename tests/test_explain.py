@@ -73,6 +73,7 @@ from rk.live.report import (
     VERIFIED_MATCHED,
     CheckReport,
     CheckRequest,
+    Paper,
     render_text,
 )
 from rk.live.rerank import PRODUCT_MODEL, R1, run_rerank
@@ -470,6 +471,19 @@ def test_keywords_and_venues_come_from_one_cached_list_call(cfg: Config) -> None
     assert search.details([]).keywords == {}
     with pytest.raises(ValueError, match="at most"):
         search.details([f"W{n}" for n in range(IDS_PER_CALL + 1)])
+
+
+@pytest.mark.parametrize(
+    ("venue", "shown"),
+    [("83", None), (" 2019 ", None), (VENUE_OF_T1, VENUE_OF_T1), ("3D Research", "3D Research")],
+)
+def test_a_bare_number_is_not_shown_as_a_venue(venue: str, shown: str | None) -> None:
+    paper = Paper(
+        rank=1, id=T1, aliases=[], url=f"https://openalex.org/{T1}", doi=None, title="A title",
+        publication_date="2020-01-01", type="article", authors=[], venue=venue,
+    )
+    assert paper.venue == shown
+    assert Paper.model_validate_json(paper.model_dump_json()).venue == shown
 
 
 # --- the whole check ------------------------------------------------------------------------

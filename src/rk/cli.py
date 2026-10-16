@@ -821,6 +821,7 @@ def serve_command(
     web = cfg.web or WebConfig()
     host, port = host or web.host, port or web.port
     print(f"rk serve: http://{host}:{port} (Ctrl+C to stop); checks in {web.db_path}", flush=True)
+    print("rk serve: loading the embedding model before taking checks", flush=True)
     uvicorn.run(create_app(cfg), host=host, port=port, log_level="info")
     return 0
 

@@ -3,7 +3,8 @@
 Each check runs through rk.live.check.run_check, the function `python -m rk check`
 calls, so the web app has no pipeline of its own. The worker thread builds the
 services it needs (LLM clients, OpenAlex search, the encoder) itself, through a
-factory: their SQLite connections belong to the thread that opened them.
+factory: their SQLite connections belong to the thread that opened them. `ready` is
+set once they are built, so the app can load the encoder before taking checks.
 
 A check's stage is written to the database as it runs. Errors become a short
 message on the check, with every configured API key's value removed (`Redactor`).
@@ -116,6 +117,7 @@ class Worker:
         self.queue: queue.Queue[str | None] = queue.Queue()
         self.thread = threading.Thread(target=self._run, name="rk-web-worker", daemon=True)
         self.startup_error: str | None = None
+        self.ready = threading.Event()  # set once the services are built, or failed to
 
     def start(self) -> None:
         self.thread.start()
@@ -135,11 +137,13 @@ class Worker:
             except Exception as exc:  # the services couldn't start: fail what comes
                 self.startup_error = self.redact(f"{type(exc).__name__}: {exc}")
                 log.exception("the check worker could not start: %s", self.startup_error)
+                self.ready.set()
                 while (check_id := self.queue.get()) is not None:
                     self.store.fail(
                         check_id, f"The server couldn't start its checks: {self.startup_error}"
                     )
                 return
+            self.ready.set()
             while (check_id := self.queue.get()) is not None:
                 try:
                     self.run_one(services, check_id)

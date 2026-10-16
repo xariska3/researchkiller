@@ -8,6 +8,9 @@ FakeEncoder; the tests poll the API until a check finishes.
 from __future__ import annotations
 
 import json
+import logging
+import re
+import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -32,7 +35,7 @@ from rk import cli
 from rk.config import Config, config_from_dict
 from rk.live.report import HEADER, CheckReport, CheckSubmission
 from rk.llm import LLMError
-from rk.web.app import RESTART_MESSAGE, create_app
+from rk.web.app import RESTART_MESSAGE, QuietPolls, create_app
 from rk.web.db import DONE, FAILED, CheckRow, Store, utc_now
 from rk.web.worker import Services
 
@@ -145,6 +148,8 @@ def test_a_full_check_is_submitted_polled_and_shown(client: TestClient, cfg: Con
     assert "No close match is not proof of novelty." in html
     assert TITLES[T1] in html and VENUE_OF_T1 in html and "high overlap" in html
     assert "exact quote" in html and "<b>Differs:</b>" in html
+    assert re.search(r"<b>Problem</b>: <span class=\"verdict \w+\">\w+</span>\.\s+\w", html)
+    assert "—" not in html  # a facet's verdict and reason are two sentences
     assert "Words the literature uses that your text doesn't" in html
     assert f'/api/checks/{accepted["check_id"]}/export?format=md' in html
     assert "Candidates searched:" in html and cfg.agent.name in html
@@ -154,6 +159,7 @@ def test_a_full_check_is_submitted_polled_and_shown(client: TestClient, cfg: Con
     assert GOOD[T1].startswith(recent["first_words"].removesuffix(" …"))
     front = client.get("/").text
     assert f'href="/checks/{accepted["check_id"]}"' in front and "Recent checks" in front
+    assert "It never declares an idea novel: a missing match is not proof of novelty." in front
 
 
 def test_a_quick_check_makes_no_llm_call(client: TestClient, fakes: Fakes) -> None:
@@ -182,6 +188,8 @@ def test_a_report_exports_as_markdown_and_json(client: TestClient) -> None:
     assert md.headers["content-disposition"].endswith('.md"')
     assert md.text.startswith(f"# {HEADER}") and TITLES[T1] in md.text
     assert "(high overlap)" in md.text and "**Differs**" in md.text
+    assert re.search(r"^- \*\*Problem\*\*: (same|different)\. \w", md.text, re.MULTILINE)
+    assert "—" not in md.text
     js = client.get(f"/api/checks/{check_id}/export", params={"format": "json"})
     assert js.headers["content-type"] == "application/json"
     report = CheckReport.model_validate_json(js.text)
@@ -313,6 +321,40 @@ def test_a_failed_agent_search_is_skipped_with_a_warning(cfg: Config) -> None:
         status = check(client)
     assert status["status"] == DONE
     assert any(w.startswith("An agent search failed and was skipped") for w in status["warnings"])
+
+
+def test_the_server_loads_the_encoder_before_taking_checks(cfg: Config, fakes: Fakes) -> None:
+    loaded = threading.Event()
+    build = services(cfg, fakes)
+
+    @contextmanager
+    def slow() -> Iterator[Services]:
+        time.sleep(0.3)  # loading the encoder
+        with build() as built:
+            loaded.set()
+            yield built
+
+    with TestClient(create_app(cfg, services=slow)) as client:
+        assert loaded.is_set()  # the start waited for it
+        assert check(client)["status"] == DONE
+
+
+def test_status_polls_are_left_out_of_the_access_log(client: TestClient) -> None:
+    def line(method: str, path: str, status: int) -> logging.LogRecord:
+        args = ("127.0.0.1:50000", method, path, "1.1", status)
+        return logging.LogRecord(
+            "uvicorn.access", logging.INFO, __file__, 0, '%s - "%s %s HTTP/%s" %d', args, None
+        )
+
+    quiet = QuietPolls()
+    assert not quiet.filter(line("GET", "/api/checks/0a1b2c", 200))
+    assert quiet.filter(line("POST", "/api/checks", 202))
+    assert quiet.filter(line("GET", "/api/checks", 200))
+    assert quiet.filter(line("GET", "/checks/0a1b2c", 200))
+    assert quiet.filter(line("GET", "/api/checks/0a1b2c/export?format=md", 200))
+    assert quiet.filter(line("GET", "/api/checks/nope", 404))
+    filters = logging.getLogger("uvicorn.access").filters
+    assert [type(f) for f in filters].count(QuietPolls) == 1  # installed once by the start
 
 
 # --- the command ----------------------------------------------------------------------------
