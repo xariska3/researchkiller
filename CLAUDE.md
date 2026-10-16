@@ -1,7 +1,8 @@
 # ResearchKiller: working rules for Claude Code
 
-ResearchKiller is a prior-art retrieval benchmark and, later, an adversarial
-research-proposal reviewer. The full Phase 1 design is in
+ResearchKiller checks whether a research idea has already been published: a live
+prior-art search over OpenAlex with an LLM reranker and explanations (web app and
+CLI), evaluated on its own prior-art retrieval benchmark. The full Phase 1 design is in
 `docs/phase1_spec.md`. Read it before any work.
 
 ## How we work

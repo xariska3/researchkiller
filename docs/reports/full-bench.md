@@ -119,6 +119,8 @@ exhausted vs accepted) is part of the full-run report,
   ledger every 5 s while `make-bench` ran. Had spend passed $10, it would have
   stopped the command once the attempt in progress was written. It never
   triggered.
+  - *Later note (2026-10-16): the watcher is now kept, as run, in
+    `scripts/spend_guard.py`.*
 - **The pilot run's report**: `test_a.jsonl` has changed, so regenerating
   `runs/20261013-121507` now shows its exhaustion check as not computed. Its
   `summary.md` from before the bench was finished keeps the pilot-bench

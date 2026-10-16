@@ -25,6 +25,10 @@ All counts are as of 2026-10-12 and will grow until the corpus is built.
 | Cost, 300 queries | bench ≤ $0.71 + run ≤ $1.01 (worst case) |
 | `budget_cap` | 12 |
 
+*Later note (2026-10-16): the judge is now Mistral Medium 3.1
+(`mistralai/mistral-medium-3.1`), chosen on 2026-10-13 after `validate-judge`, where
+gpt-4.1-mini caught 40% of the generalised corruptions; see `configs/phase1.yaml`.*
+
 ## 1. Topics
 
 ### Largest topics since 2025-01-01 (works with abstracts)
@@ -181,6 +185,10 @@ key in `OPENROUTER_API_KEY`):
 | Judge | `openai/gpt-4.1-mini` | openai | 0.40 | 1.60 | 2024-06-01 | [OpenAI docs](https://developers.openai.com/api/docs/models/gpt-4.1-mini): "Jun 01, 2024 knowledge cutoff"; not a reasoning model |
 | Paraphraser | `meta-llama/llama-4-maverick` | llama | 0.188 | 0.652 | August 2024 (config 2024-08-31) | [Model card](https://huggingface.co/meta-llama/Llama-4-Maverick-17B-128E-Instruct): "The pretraining data has a cutoff of August 2024"; released 2025-04-05 |
 | Agent | `qwen/qwen3-235b-a22b-2507` | qwen | 0.09 | 0.55 | **none published**; release date 2025-07-21 used | [Model card](https://huggingface.co/Qwen/Qwen3-235B-A22B-Instruct-2507): "supports only non-thinking mode", no cutoff; release date from the [Hugging Face API](https://huggingface.co/api/models/Qwen/Qwen3-235B-A22B-Instruct-2507) (`createdAt` 2025-07-21) |
+
+*Later note (2026-10-16): the judge is now Mistral Medium 3.1
+(`mistralai/mistral-medium-3.1`, family mistral, $0.40 / $2.00 per 1M); see the note
+under Key numbers.*
 
 All three list `temperature`, `max_tokens` and `seed` among OpenRouter's
 supported parameters, and none lists `reasoning`. Prices are OpenRouter's
@@ -487,6 +495,9 @@ The proposal was approved with changes, and `configs/phase1.yaml` now holds:
 | Paraphraser | `novita/fp8` | 0.27 / 0.85 | Cheapest endpoint that lists `seed`. DigitalOcean ($0.188 / $0.652) doesn't list it; Parasail fp8 and Google Vertex cost more. |
 | Judge | `openai` | 0.40 / 1.60 | First party. Azure has the same price. |
 | Agent | `parasail/fp8` | 0.14 / 0.80 | 100% uptime over the last 30 minutes. DeepInfra fp8 ($0.09 / $0.55) was degraded (status −5, 53% uptime). GMICloud ($0.087 / $0.35) had no uptime data. |
+
+*Later note (2026-10-16): the judge, now Mistral Medium 3.1, is pinned to the `mistral`
+endpoint (first party).*
 
 The proposal's estimate assumed the cheapest endpoints. Here it is again with the pinned prices and the same token counts:
 

@@ -223,6 +223,8 @@ Per check (mean / p50 / p95). Method cost counts every call, cached or not.
   00:07 UTC):
   - $1.0000 of $1 was left.
   - N = min(80, floor((1.0000 − 0.05) / 0.0067)) = 80.
+  - *Later note (2026-10-16): the script is now kept, as run, in
+    `scripts/budget_test.py`.*
 - **OpenAlex**: $0.580 used, from $1.0000 to $0.5020 at the crash and
   $0.4200 after the resume. That is 580 searches:
   - 80 proposal searches (L1);

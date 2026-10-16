@@ -27,18 +27,19 @@ This section supersedes the Summary and Decisions below where they differ.
 | `perplexity` | Sonar on OpenRouter | $1 |
 | `s2-search`, `s2-snippets` | Semantic Scholar, with the key, at 0.5 requests/s | free |
 
+*Later note (2026-10-16): after the pilot, both Claude systems got up to 10 searches
+(`max_searches` 10), not 5; gpt-6-luna kept `max_tool_calls: 5`. See
+[phase2-step3-results.md](phase2-step3-results.md).*
+
 - **Combined Anthropic cap**: both Claude systems belong to the spend group `anthropic`,
   capped in code at $89. A call that could take their combined spend past it is refused,
-  so Opus gets at most min($55, $89 − Sonnet's spend). The workspace's $95 spend limit
-  is a second guard.
+  so Opus gets at most min($55, $89 − Sonnet's spend).
 
 **Free key checks** (no tokens):
 - **Anthropic**: the workspace-scoped key is accepted (Models API HTTP 200). It reports
   web search and code execution as supported for `claude-sonnet-5-5` and
   `claude-opus-5-5`.
-- **OpenAI**: the key is accepted and `gpt-6-luna` is available. OpenAI has no balance
-  endpoint for API keys; the balance is $5.33 as you reported.
-- **OpenRouter**: $6.64 left.
+- **OpenAI**: the key is accepted and `gpt-6-luna` is available.
 - **Semantic Scholar**:
   - The key works (HTTP 200 after a pause). Keyless requests are still refused with 429,
     and the first keyed request got one too, so the client's backoff on 429 matters.
@@ -71,7 +72,6 @@ This section supersedes the Summary and Decisions below where they differ.
   100 queries.
 - **The pilot** costs about $2. Sonnet and Opus together are about $62 at the central
   estimates.
-- **OpenRouter** keeps at least $5.60 for our own agent calls.
 
 **Sample**: `--save-sample docs/evaluation/compete_sample.csv` writes the sample in its
 seeded order. The step-1 dry run will use it once tonight's test run is in
@@ -89,18 +89,19 @@ seeded order. The step-1 dry run will use it once tonight's test run is in
   | Semantic Scholar | free | – | – |
   | Ours | free | – | – |
 
-  The Sonnet cap is 40% of the $100 promotional credit. Ours is replayed from the
-  live-eval caches.
-- **OpenAI doesn't fit the OpenRouter balance.** The balance is $6.64 on 2026-10-14
-  ($25.00 total, $18.36 used). With a cap of $4.50, about 35–40 of the 100 queries would
-  run. A top-up of about $15 runs all 100. The alternative is a cheaper model:
+  The Sonnet cap is $40. Ours is replayed from the live-eval caches.
+
+  *Later note (2026-10-16): GPT-6.1 Sol was replaced by gpt-6-luna, called directly
+  through OpenAI's Responses API (see the update above and
+  [phase2-step3-results.md](phase2-step3-results.md)).*
+- **OpenAI doesn't fit its cap.** With a cap of $4.50, about 35–40 of the 100 queries
+  would run. All 100 need about $15 more. The alternative is a cheaper model:
   `openai/gpt-6-luna`, about $3.50 per 100 queries.
 - **The Anthropic key in `.env` is refused.** A free Models API call (no tokens) returned
   HTTP 400: "This API key is not scoped to a workspace, so this request must include the
   anthropic-workspace-id header…". I expect the Messages API to refuse it the same way,
   so Claude can't run until this is fixed. I haven't changed any code for it. Proposed
-  fix: create a key inside a workspace (ideally a dedicated one with a spend limit of
-  about $95, as a second guard on the credit) and put it in `.env`. The alternative is
+  fix: create a key inside a workspace and put it in `.env`. The alternative is
   for me to add an optional `ANTHROPIC_WORKSPACE_ID` that the client sends as the
   `anthropic-workspace-id` header.
 - **Semantic Scholar's paper search finds nothing for a whole proposal.** A free probe
@@ -131,16 +132,11 @@ seeded order. The step-1 dry run will use it once tonight's test run is in
   - Code execution is free with `web_search_20260209` and later.
   - Opus 5.5 $4/$20 per million input/output tokens; Sonnet 5.5 $2/$10; Haiku 5.5
     $0.10/$0.50. The 4.7+ tokenizer makes about 30% more tokens for the same text.
-- **Promotional credits**:
-  - [API credits for Max and Team plans](https://platform.claude.com/docs/en/about-claude/api-credits-for-subscribers)
-    cover the Claude API, Managed Agents, the Agent SDK and the playground. They don't
-    cover Claude Code. They are drawn first, then any purchased credits.
-  - When none are left, requests fail with "credit balance is too low".
-  - Neither that page nor the [credit terms](https://www.anthropic.com/legal/credit-terms)
-    list an exclusion for server tools such as web search. I can't confirm coverage
-    for your particular offer. The Console's Cost page will show it after the pilot.
 
 **OpenAI with web search, via OpenRouter**:
+
+*Later note (2026-10-16): this route wasn't used. gpt-6-luna was called directly through
+OpenAI's Responses API (see "OpenAI web search, direct" above).*
 - **Sources**: [server tool](https://openrouter.ai/docs/guides/features/server-tools/web-search.md),
   [usage accounting](https://openrouter.ai/docs/guides/guides/usage-accounting),
   [OpenAI pricing](https://developers.openai.com/api/docs/pricing).
@@ -278,6 +274,10 @@ the full run.
 | ours | L5w, replayed | free (the checks were paid in Step 2: $0.0071 mean on the dev set) | free | – |
 | resolver | OpenAlex singleton, Crossref | free | free | – |
 
+*Later note (2026-10-16): the runs used gpt-6-luna directly instead of GPT-6.1 Sol, and
+Claude had up to 10 searches, not 5 (see
+[phase2-step3-results.md](phase2-step3-results.md)).*
+
 **Assumptions** per query:
 - **Claude**:
   - 3–5 searches.
@@ -297,19 +297,17 @@ the full run.
 
 | Option | Low / central / high per query | 100 queries | Cap needed |
 |---|---|---|---|
-| Opus 5.5 instead of, or as well as, Sonnet 5.5 | $0.19 / $0.40 / $0.65 | about $40 ($19–65) | about $55, so both Claude models fit under $95 of the credit |
+| Opus 5.5 instead of, or as well as, Sonnet 5.5 | $0.19 / $0.40 / $0.65 | about $40 ($19–65) | about $55 |
 | `openai/gpt-6-luna`, mostly search fees | – | about $3.50 ($2–6) | – |
 | `openai/gpt-5.4-mini` | – | about $7 | – |
 
 **Budgets**:
-- **Anthropic** (promotional credit, $100, expires 2026-10-18 UTC): Sonnet 5.5 at most
-  $40.
-- **OpenRouter** ($6.64):
+- **Anthropic**: Sonnet 5.5 at most $40.
+- **OpenRouter**:
   - tonight's test run: about $0.03 (the Qwen agent cost $0.06 for the 150 live queries
     so far);
   - Perplexity: at most $1;
-  - OpenAI: at most $4.50;
-  - that leaves at least $1.10.
+  - OpenAI: at most $4.50.
 - **Ledger**: the compete caps are kept apart from `run.budget_cap` and
   `data/cache/llm.sqlite`, which this command never writes.
 
@@ -345,7 +343,7 @@ These are fixed before any paid call.
    per query with the estimates and check that the answers parse. If a system costs
    more than twice its central estimate, stop and report.
 3. Full run of 100 queries (cached pilot answers cost nothing again). Then a short
-   report, `docs/reports/phase2-step3-competitive.md`.
+   report, [phase2-step3-results.md](phase2-step3-results.md).
 4. The landscape doc and the manual comparison sheet (also Step 3 in the spec) are not
    part of this step.
 
@@ -353,9 +351,9 @@ These are fixed before any paid call.
 
 1. **Anthropic key**: a workspace-scoped key, or the optional workspace-id header?
 2. **Claude model**: Sonnet 5.5 only (default; the same token prices as GPT-6.1 Sol), or
-   Opus 5.5 as well with the rest of the credit?
+   Opus 5.5 as well?
 3. **OpenAI**: one of
-   - top up OpenRouter by about $15 for GPT-6.1 Sol on all 100 queries;
+   - spend about $15 more for GPT-6.1 Sol on all 100 queries;
    - switch to `openai/gpt-6-luna`;
    - keep GPT-6.1 Sol and let the $4.50 cap stop it after about 35–40 queries.
 4. **Semantic Scholar**: will you request a free API key? Keep both variants?

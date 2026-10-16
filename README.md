@@ -8,7 +8,7 @@ who want to see the closest published work before they invest in an idea. It run
 your own machine with your own API keys, for about $0.015 a check. It never declares
 an idea novel: a missing match is not proof of novelty.
 
-Designed and evaluated by Charalampos Karatzas.
+Designed and evaluated by Charalampos Karatzas, built with Claude Code as the coding agent.
 
 ![The front page: describe an idea and choose a full or a quick check](docs/img/screenshot_home.png)
 
@@ -42,7 +42,7 @@ python -m rk serve
 ```
 
 What a check costs:
-- **Full check**: about $0.015, capped at $0.03. In the live check we timed, $0.007
+- **Full check**: about $0.015, capped at $0.03. In the live check I timed, $0.007
   went to LLM calls on OpenRouter and $0.009 to OpenAlex searches. Those come out of
   OpenAlex's free daily allowance: about 10 full checks a day without an OpenAlex key,
   about 100 with one. That check took 38 s on a GPU.
@@ -54,7 +54,7 @@ Good to know:
   GB), and every start loads it before taking checks. It runs on a GPU when PyTorch
   sees one; on Windows, install a CUDA build of torch first
   (`pip install torch --index-url https://download.pytorch.org/whl/cu128`). It also
-  runs on a CPU, but we haven't timed that.
+  runs on a CPU, but I haven't timed that.
 - **Access**: the server listens on 127.0.0.1 only (`--host` to change it) and has
   no accounts.
 - **Stored checks**: checks are kept in `data/web.sqlite`. The same idea, mode and
