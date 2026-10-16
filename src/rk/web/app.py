@@ -15,11 +15,16 @@ from Jinja2 templates with autoescaping; plain JavaScript polls the API.
 
 Checks run one at a time in a background thread (rk.web.worker). On start, checks
 left queued or running by a previous server are marked failed, never re-run, so a
-restart can't spend money unasked.
+restart can't spend money unasked. The start waits until the worker has loaded the
+encoder, and uvicorn only listens after that, so no check waits for it. Uvicorn's
+access log leaves out the pages' status polls (QuietPolls).
 """
 
 from __future__ import annotations
 
+import asyncio
+import logging
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -49,6 +54,24 @@ RESTART_MESSAGE = (
     "The server stopped before this check finished. It was not re-run, so that a restart "
     "never spends money unasked: submit it again."
 )
+STATUS_POLL = re.compile(r"/api/checks/[^/?]+")
+
+
+class QuietPolls(logging.Filter):
+    """Leaves a status poll (GET /api/checks/{id}, 200) out of uvicorn's access log."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args  # uvicorn's: client, method, path, HTTP version, status
+        if isinstance(args, tuple) and len(args) == 5:
+            _, method, path, _, status = args
+            return not (method == "GET" and status == 200 and STATUS_POLL.fullmatch(str(path)))
+        return True
+
+
+def quiet_polls() -> None:
+    access = logging.getLogger("uvicorn.access")
+    if not any(isinstance(f, QuietPolls) for f in access.filters):
+        access.addFilter(QuietPolls())
 
 
 class Accepted(BaseModel):
@@ -143,7 +166,9 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         store.fail_unfinished(RESTART_MESSAGE)
+        quiet_polls()
         worker.start()
+        await asyncio.to_thread(worker.ready.wait)  # the encoder loads before any check
         yield
         worker.stop()
 

@@ -125,6 +125,12 @@ class Paper(_Model):
     snippet: Snippet | None = None  # the top live.explain_top_k only
     explanation: Explanation | None = None  # the top live.explain_top_k, default check only
 
+    @field_validator("venue")
+    @classmethod
+    def _named_venue(cls, venue: str | None) -> str | None:
+        """No venue for a bare number: OpenAlex sometimes names a source "83"."""
+        return None if venue is not None and venue.strip().isdecimal() else venue
+
     @property
     def status(self) -> str:
         if self.explanation is None:

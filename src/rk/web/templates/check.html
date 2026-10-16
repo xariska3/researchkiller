@@ -31,8 +31,8 @@
   <ul class="facets">
     {% for f in facets %}
     {% set v = p.explanation.facets[f] %}
-    <li><b>{{ facet_labels[f] }}</b>: <span class="verdict {{ v.verdict }}">{{ v.verdict }}</span>
-      — {{ v.reason }}</li>
+    <li><b>{{ facet_labels[f] }}</b>: <span class="verdict {{ v.verdict }}">{{ v.verdict }}</span>.
+      {{ v.reason }}</li>
     {% endfor %}
   </ul>
   <p><b>Differs:</b> {{ p.explanation.differs }}</p>
