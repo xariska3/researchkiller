@@ -174,6 +174,9 @@ compete:
 rerank:
   depth: 30                       # candidates: the union of L5w's and L5's top 30
   abstract_chars: 2000            # 6.6% of corpus abstracts are longer
+  # Issue #22: the default check's rerank call returns two lists (closest in contribution,
+  # closest in methods). Set by the dev evaluation declared in docs/phase2_spec.md.
+  two_lists: false
   model:                          # R1-R3: the agent model, on the agent's pinned endpoint
     name: qwen/qwen3-235b-a22b-2507
     family: qwen
@@ -210,6 +213,8 @@ explain:
   abstract_chars: 2000            # as the rerank call's
   cost_cap_per_check: 0.03        # USD, the whole check (live-eval keeps live's $0.10)
   vocabulary_terms: 10
+  contribution_top_k: 8           # two lists: list A's papers explained (one list: live's 10)
+  methods_top_k: 6                # and list B's, in the same call; a paper in both once
   model:                          # the judge (validated in Phase 1), room for 10 answers
     name: mistralai/mistral-medium-3.1
     family: mistral

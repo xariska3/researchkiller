@@ -368,6 +368,9 @@ class RerankConfig:
     and not a product candidate: its training cutoff may be after the originals, so it
     is exempt from the cutoff check, and it has its own cache and ledger file
     (`upper_cache_path`), capped at `upper_cost_cap`.
+
+    With `two_lists` (issue #22), the default check's rerank call returns two lists:
+    closest in contribution and closest in methods (rk.live.pipeline.with_rerank).
     """
 
     model: ModelConfig
@@ -376,6 +379,7 @@ class RerankConfig:
     upper_cost_cap: float  # USD, cumulative over every rerank run of upper_model
     depth: int = 30  # the candidates are the union of L5w's and L5's top `depth`
     abstract_chars: int = 2000  # each candidate's abstract is cut at this many characters
+    two_lists: bool = False  # the default check: two lists from one call, or L5r's one
 
     def __post_init__(self) -> None:
         _require(self.upper_cost_cap > 0, "upper_cost_cap must be > 0")
@@ -391,18 +395,24 @@ class ExplainConfig:
     (validated in Phase 1), with room for one answer per paper. Its calls share
     run.cache_path and run.budget_cap with every other command. `cost_cap_per_check`
     caps a whole check of `python -m rk check` (searches, agent, rerank and explainer);
-    live-eval keeps live.cost_cap_per_check.
+    live-eval keeps live.cost_cap_per_check. A two-list check (rerank.two_lists)
+    explains the top `contribution_top_k` of its first list and the top
+    `methods_top_k` of its second, in the same call.
     """
 
     model: ModelConfig
     abstract_chars: int = 2000  # each paper's abstract is cut at this many characters
     cost_cap_per_check: float = 0.03  # USD, method cost of the whole check; hard cap
     vocabulary_terms: int = 10  # the vocabulary map's terms, over all its groups
+    contribution_top_k: int = 8  # two lists: papers explained in list A
+    methods_top_k: int = 6  # two lists: papers explained (and shown) in list B
 
     def __post_init__(self) -> None:
         _require(self.abstract_chars >= 1, "abstract_chars must be >= 1")
         _require(self.cost_cap_per_check > 0, "cost_cap_per_check must be > 0")
         _require(self.vocabulary_terms >= 1, "vocabulary_terms must be >= 1")
+        _require(self.contribution_top_k >= 1, "contribution_top_k must be >= 1")
+        _require(self.methods_top_k >= 1, "methods_top_k must be >= 1")
 
 
 @dataclass(frozen=True)
@@ -451,6 +461,12 @@ class Config:
             check_training_cutoffs(self.bench.target_from_date, {"rerank": self.rerank.model})
         if self.explain is not None:  # nor the explainer, which grades them
             check_training_cutoffs(self.bench.target_from_date, {"explain": self.explain.model})
+        if self.explain is not None and self.live is not None:
+            top_k = self.live.top_k
+            _require(
+                max(self.explain.contribution_top_k, self.explain.methods_top_k) <= top_k,
+                f"explain.contribution_top_k and methods_top_k must be <= live.top_k ({top_k})",
+            )
 
 
 def check_model_independence(models: dict[str, ModelConfig]) -> None:
