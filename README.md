@@ -5,7 +5,7 @@ describe your idea in 40 to 500 words; it searches OpenAlex, ranks what it finds
 with an LLM, and shows the closest papers, each with an overlap rating, a sentence
 from its abstract and what it does differently. It is for researchers and students
 who want to see the closest published work before they invest in an idea. It runs on
-your own machine with your own API keys, for about $0.015 a check. It never declares
+your own machine with your own API keys, for about $0.016 a check. It never declares
 an idea novel: a missing match is not proof of novelty.
 
 Designed and evaluated by Charalampos Karatzas, built with Claude Code as the coding agent.
@@ -42,10 +42,11 @@ python -m rk serve
 ```
 
 What a check costs:
-- **Full check**: about $0.015, capped at $0.03. In the live check I timed, $0.007
-  went to LLM calls on OpenRouter and $0.009 to OpenAlex searches. Those come out of
-  OpenAlex's free daily allowance: about 10 full checks a day without an OpenAlex key,
-  about 100 with one. That check took 38 s on a GPU.
+- **Full check**: about $0.016, capped at $0.03. On 120 development checks (medians),
+  about $0.0085 went to LLM calls on OpenRouter and $0.007 to OpenAlex searches. Those
+  come out of OpenAlex's free daily allowance: about 10 full checks a day without an
+  OpenAlex key, about 100 with one. A check takes about 45 s on a GPU (the estimated
+  median on those checks; at most about 61 s).
 - **Quick check**: one OpenAlex search and no LLM call, about $0.001 of the OpenAlex
   allowance, in a few seconds.
 
@@ -69,10 +70,17 @@ Good to know:
 1. Your idea goes to OpenAlex's semantic search, and an LLM agent (Qwen3 235B) writes
    up to 4 shorter queries in the field's own terms, each run as a keyword and a
    semantic search.
-2. The results are pooled and ranked locally with BM25 and the Qwen3-Embedding model,
-   and the same Qwen LLM reranks the top candidates by reading their abstracts.
-3. For the top 10, one call to Mistral Medium 3.1 rates the overlap (high, partial or
-   low) on problem, method, domain and claim, and says what differs.
+2. The results are pooled and ranked locally with BM25 and the Qwen3-Embedding model.
+   The same Qwen LLM then reads the top candidates' abstracts, states in one line each
+   what your idea claims as new and what methods it uses, and ranks the candidates
+   twice: by overlap with that contribution (list A, "closest in contribution:
+   possible prior art") and by overlap in methods, tools and data (list B, "closest in
+   methods: worth citing").
+3. One call to Mistral Medium 3.1 explains the top 8 of list A and the top 6 of list B
+   that aren't among them: it rates the overlap (high, partial or low) on problem,
+   method, domain and claim, and says what differs. The result opens with how the tool
+   read your idea, then shows the two lists; list B names the list A papers that also
+   rank high in methods instead of showing them twice.
 4. The code checks each quote the LLM gives against the abstract and shows the
    abstract's own sentence; a quote it can't find is marked unverified.
 5. A vocabulary map, built without an LLM, lists terms these papers use that your text
@@ -97,6 +105,10 @@ paper. ResearchKiller's settings were chosen on a separate development set.
 | Semantic Scholar snippet search | 80 | 23.8% | 32.5% | free | 5 s |
 | Perplexity Sonar | 80 | 17.5% | 17.5% | $0.006 | 5 s |
 
+The table is the single-list check's; list A of the two-list check, now the default, was
+scored only on the 120 development queries, where it put the source paper first in 83.3%
+and in the top 5 in 85.0%, exactly as the single list did on every query.
+
 ![Share of 80 held-out proposals where the source paper appears in the top 5](docs/img/recall_bar.png)
 
 - **Significance**: ResearchKiller's lead in the top 5 is significant against every
@@ -104,9 +116,9 @@ paper. ResearchKiller's settings were chosen on a separate development set.
   run on only 33 of the queries, where ResearchKiller found 88% against its 70%
   (p = 0.18).
 - **Semantic Scholar's paper search** found none of the 80 and isn't shown.
-- **The full check's cost and time** in the table cover finding the papers. The
-  explanations add about $0.005 and 9 s, so a whole check costs about $0.014 and takes
-  about 32 s (medians, estimated on 20 development checks).
+- **The full check's cost and time** in the table cover finding the papers with the
+  single list. A whole two-list check, with its explanations, costs about $0.016 and
+  takes about 45 s (medians, estimated on 120 development checks).
 - **The explanations**: on 20 development checks, 95.5% of quotes were found verbatim
   in the abstract, 4.0% matched an abstract sentence, and 0.5% were unverified. The
   source paper was in the top 10, rated high, in all 20.

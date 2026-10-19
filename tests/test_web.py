@@ -10,10 +10,11 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sqlite3
 import threading
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
@@ -25,18 +26,38 @@ from bench_data import GOOD, T1, T2, TITLES
 from conftest import TEST_API_KEY_ENV, FakeEncoder, FakeLLM
 from fastapi.testclient import TestClient
 from live_fakes import FakeLiveOpenAlex
+from markupsafe import escape
 from sqlalchemy import update
 from test_explain import VENUE_OF_T1, config_dict, explainer_reply, works
 from test_live_eval import AGENT_QUERY, _search
 from test_live_eval import agent as fake_agent
-from test_rerank import original_first
+from test_rerank import CONTRIBUTION_LINE, METHODS_LINE, original_first, two_lists_reply
 
 from rk import cli
 from rk.config import Config, config_from_dict
-from rk.live.report import HEADER, CheckReport, CheckSubmission
+from rk.live.report import (
+    ALSO_CLOSE,
+    ALSO_IN_METHODS,
+    CONTRIBUTION_HEADING,
+    CONTRIBUTION_NOTE,
+    HEADER,
+    IDEA_HEADING,
+    METHODS_HEADING,
+    METHODS_NOTE,
+    CheckReport,
+    CheckSubmission,
+)
 from rk.llm import LLMError
 from rk.web.app import RESTART_MESSAGE, QuietPolls, create_app
-from rk.web.db import DONE, FAILED, CheckRow, Store, utc_now
+from rk.web.db import (
+    DONE,
+    FAILED,
+    TWO_LISTS_METHOD,
+    CheckRow,
+    Store,
+    history_key,
+    utc_now,
+)
 from rk.web.worker import Services
 
 
@@ -224,6 +245,107 @@ def test_the_same_check_within_7_days_is_reused_at_no_cost(
     with Store(cfg.web.db_path).session() as session:
         session.execute(update(CheckRow).values(created_at=utc_now() - timedelta(days=8)))
     assert submit(client).json()["from_history"] is False
+
+
+def two_lists_cfg(tmp_path: Path) -> Config:
+    """The web config with two lists: list A's top 3 and list B's top 2 explained."""
+    data = config_dict(tmp_path, contribution_top_k=3, methods_top_k=2)
+    data["rerank"]["two_lists"] = True
+    data["web"] = {"db_path": str(tmp_path / "web.sqlite")}
+    return config_from_dict(data)
+
+
+def test_a_two_list_check_shows_both_sections_and_stores_both_lists(tmp_path: Path) -> None:
+    cfg = two_lists_cfg(tmp_path)
+    with serving(cfg, Fakes(reranker=FakeLLM(two_lists_reply))) as client:
+        status = check(client)
+        assert status["status"] == DONE
+        report = CheckReport.model_validate(status["report"])
+        assert report.methods is not None and len(report.methods) == 2
+        assert report.also_in_methods == [2]  # list B's first is list A's #2
+        html = client.get(f"/checks/{status['id']}").text
+        # How the tool read the idea, section A and its "also found", then section B,
+        # each with its description, and section B's line.
+        parts = [
+            f"<h2>{escape(IDEA_HEADING)}</h2>",
+            f"<p><b>Contribution:</b> {escape(CONTRIBUTION_LINE)}</p>",
+            f"<p><b>Methods:</b> {escape(METHODS_LINE)}</p>",
+            f"<h2>{escape(CONTRIBUTION_HEADING)}</h2>",
+            f'<p class="note">{escape(CONTRIBUTION_NOTE)}</p>',
+            "<h3>Also found</h3>",
+            f"<h2>{escape(METHODS_HEADING)}</h2>",
+            f'<p class="note">{escape(METHODS_NOTE)}</p>',
+            f'<p class="also-close">{ALSO_CLOSE}: #2 above.</p>',
+        ]
+        assert [html.index(p) for p in parts] == sorted(html.index(p) for p in parts)
+        # List A's #2 has the note in section A and is not shown again in section B.
+        assert html.count(f'<span class="also">{ALSO_IN_METHODS}</span>') == 1
+        assert html.index('<span class="also">') < html.index(parts[6])
+        assert html.count(f">{escape(report.papers[1].title)}</a></h3>") == 1
+        for p in report.methods:
+            assert html.count(f">{escape(p.title)}</a></h3>") == 1 and p.explanation is not None
+        md = client.get(f"/api/checks/{status['id']}/export", params={"format": "md"}).text
+        assert md.index(IDEA_HEADING) < md.index(CONTRIBUTION_HEADING) < md.index(METHODS_HEADING)
+        assert md.count(f"*{ALSO_IN_METHODS}*") == 1 and f"{ALSO_CLOSE}: #2 above." in md
+    assert cfg.web is not None
+    store = Store(cfg.web.db_path)
+    rows = [(c.ranking, c.rank, c.paper_id) for c in store.candidates(status["id"])]
+    assert rows == [
+        *(("contribution", p.rank, p.id) for p in report.papers),
+        *(("methods", p.rank, p.id) for p in report.methods),
+    ]
+    explained = [(e.ranking, e.rank) for e in store.explanations(status["id"])]
+    assert explained == [("contribution", 1), ("contribution", 2), ("contribution", 3),
+                         ("methods", 2), ("methods", 3)]
+
+
+def test_a_report_with_other_lists_is_not_reused(tmp_path: Path) -> None:
+    one = web_cfg(tmp_path)
+    assert one.rerank is not None and one.rerank.two_lists is False
+    with serving(one) as client:
+        first = check(client)
+        assert CheckReport.model_validate(first["report"]).methods is None
+    two = two_lists_cfg(tmp_path)
+    with serving(two, Fakes(reranker=FakeLLM(two_lists_reply))) as client:
+        again = submit(client).json()
+        assert again["from_history"] is False  # the stored report has one list
+        done = wait(client, again["check_id"])
+        assert CheckReport.model_validate(done["report"]).methods is not None
+        assert submit(client).json()["from_history"] is True  # a two-list one is reused
+    with serving(one) as client:
+        assert submit(client).json()["from_history"] is True  # and the one-list one still
+    submission = CheckSubmission(text=GOOD[T1])
+    assert history_key(submission) == history_key(submission, "")  # one-list keys as before
+    assert history_key(submission, TWO_LISTS_METHOD) != history_key(submission)
+
+
+def test_a_database_from_before_two_lists_gets_the_ranking_column(tmp_path: Path) -> None:
+    path = tmp_path / "old.sqlite"
+    with closing(sqlite3.connect(path)) as conn:  # the two tables as Step 6 made them
+        conn.execute(
+            "CREATE TABLE candidates (id INTEGER PRIMARY KEY, check_id VARCHAR(32), "
+            "rank INTEGER, paper_id VARCHAR(32), aliases JSON, title TEXT, doi VARCHAR(256), "
+            "publication_date VARCHAR(10), venue TEXT, snippet TEXT, snippet_similarity FLOAT)"
+        )
+        conn.execute(
+            "CREATE TABLE explanations (id INTEGER PRIMARY KEY, check_id VARCHAR(32), "
+            "rank INTEGER, paper_id VARCHAR(32), overlap VARCHAR(8), facets JSON, "
+            "match VARCHAR(16), evidence TEXT, quote TEXT, differs TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO candidates (check_id, rank, paper_id, aliases, title, "
+            "publication_date) VALUES ('old', 1, 'W1', '[]', 'An old paper', '2025-01-01')"
+        )
+        conn.commit()
+    store = Store(path)
+    (old,) = store.candidates("old")
+    assert (old.ranking, old.title) == (None, "An old paper")
+    Store(path).close()  # a second start finds the column there
+    with closing(sqlite3.connect(path)) as conn:
+        for table in ("candidates", "explanations"):
+            columns = [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
+            assert columns.count("ranking") == 1
+    store.close()
 
 
 def test_a_check_that_could_cross_the_daily_cap_is_refused(tmp_path: Path) -> None:

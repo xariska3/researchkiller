@@ -4,7 +4,8 @@ API:
 - POST /api/checks {text, mode: "full"|"quick", before_date?} -> {check_id, status,
   from_history}. The idea must be 40-500 words (422 with a plain message otherwise).
   The same text, mode and date within web.history_days reuses the stored report at
-  $0. A check is refused (429) when it could take the day's spend over
+  $0, if it has as many lists as a full check now has (rerank.two_lists). A check is
+  refused (429) when it could take the day's spend over
   web.daily_cost_cap, and (503) while OpenAlex's daily budget is spent.
 - GET /api/checks/{id}: status, stage, warnings, error, and the report when done.
 - GET /api/checks: the recent checks.
@@ -38,16 +39,32 @@ from pydantic import BaseModel
 
 from rk.config import Config, WebConfig
 from rk.live.report import (
+    ALSO_IN_METHODS,
+    CONTRIBUTION_HEADING,
+    CONTRIBUTION_NOTE,
     FACET_LABELS,
     FACETS,
     HEADER,
+    IDEA_HEADING,
     MAX_WORDS,
+    METHODS_HEADING,
+    METHODS_NOTE,
     MIN_WORDS,
+    NO_METHODS,
     CheckReport,
     CheckSubmission,
     render_markdown,
 )
-from rk.web.db import DONE, FAILED, CheckRow, Store, history_key, start_of_day, utc_now
+from rk.web.db import (
+    DONE,
+    FAILED,
+    TWO_LISTS_METHOD,
+    CheckRow,
+    Store,
+    history_key,
+    start_of_day,
+    utc_now,
+)
 from rk.web.worker import Redactor, ServicesFactory, Worker, api_key_names, live_services
 
 RESTART_MESSAGE = (
@@ -186,9 +203,21 @@ def create_app(
             max_words=MAX_WORDS,
             facets=FACETS,
             facet_labels=FACET_LABELS,
+            sections={
+                "contribution": (CONTRIBUTION_HEADING, CONTRIBUTION_NOTE),
+                "methods": (METHODS_HEADING, METHODS_NOTE),
+            },
+            also_note=ALSO_IN_METHODS,
+            no_methods=NO_METHODS,
+            idea_heading=IDEA_HEADING,
             **values,
         )
         return HTMLResponse(html)
+
+    def method(submission: CheckSubmission) -> str:
+        """What a full check's history key adds: two lists or one (rerank.two_lists)."""
+        two_lists = cfg.rerank is not None and cfg.rerank.two_lists
+        return TWO_LISTS_METHOD if submission.mode == "full" and two_lists else ""
 
     def refusal(now: datetime) -> HTTPException | None:
         """Why a new check can't start now, if it can't."""
@@ -217,14 +246,14 @@ def create_app(
     def submit(submission: CheckSubmission) -> Accepted:
         now = utc_now()
         since = now - timedelta(days=web.history_days)
-        previous = store.history(history_key(submission), since)
+        previous = store.history(history_key(submission, method(submission)), since)
         if previous is not None:
             row = store.from_history(previous)
             return Accepted(check_id=row.id, status=row.status, from_history=True)
         problem = refusal(now)
         if problem is not None:
             raise problem
-        row = store.create(submission)
+        row = store.create(submission, method(submission))
         worker.submit(row.id)
         return Accepted(check_id=row.id, status=row.status, from_history=False)
 
@@ -271,6 +300,10 @@ def create_app(
             report=report,
             shown=shown,
             rest=[p for p in report.papers if p not in shown] if report else [],
+            methods=report.methods if report else None,
+            also={p.id for p in shown if report.in_methods(p)} if report else set(),
+            also_close=report.also_close() if report else None,
+            idea=report.idea_lines() if report else [],
             source=store.get(row.from_history_of) if row.from_history_of else None,
             failed=row.status == FAILED,
         )

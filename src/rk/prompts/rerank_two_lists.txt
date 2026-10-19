@@ -1,0 +1,19 @@
+You are helping a researcher find out whether the idea in their research proposal has already been published, and which published work they should know about. Below are the proposal and $n candidate papers from a literature search, each with a number, its title and its abstract.
+
+First, state in one line each:
+- contribution: what the proposal claims as new, that is, its research problem and its main claimed contribution or finding;
+- methods: the methods, tools, datasets and software it plans to use.
+
+Then rank all $n candidates twice.
+
+contribution_ranking: by how closely each paper matches the proposal's claimed contribution. A paper that describes the same research idea as the proposal (the same problem, the same approach and the same main claim) comes first, even if it uses different terminology. Then come papers that share the problem and the claim, whatever their approach, then papers that share the problem, then papers on the same broad topic, and unrelated papers last. A paper that shares only tools, datasets or software with the proposal, but not its problem or claim, ranks low.
+
+methods_ranking: by how closely each paper's method, tools and data match the proposal's, whatever problem the paper addresses. Papers that use the same method or approach come first, then papers that use the same tools, datasets or software, and unrelated papers last.
+
+Proposal: $proposal
+
+Candidate papers:
+$candidates
+
+Answer with JSON only, listing every candidate number exactly once in each ranking, the closest first:
+{"contribution": "...", "methods": "...", "contribution_ranking": [3, 1, 2], "methods_ranking": [2, 3, 1]}

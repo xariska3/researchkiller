@@ -265,7 +265,10 @@ def build_parser() -> argparse.ArgumentParser:
     rerank.add_argument(
         "--variants",
         type=_rerank_list,
-        help=f"comma-separated (default {','.join(live_rerank.VARIANTS)})",
+        help=(
+            f"comma-separated, from {','.join(live_rerank.VARIANTS)} "
+            f"(default {','.join(live_rerank.STEP4)})"
+        ),
     )
     rerank.add_argument(
         "--limit", type=_positive_int, help="only the run's first N checks, in qid order"
@@ -602,7 +605,7 @@ def rerank_command(
     cfg = load_config(config_path, overrides)
     if cfg.rerank is None:
         raise ConfigError(f"{config_path} has no rerank: section")
-    chosen = variants or list(live_rerank.VARIANTS)
+    chosen = variants or list(live_rerank.STEP4)
     needed = {live_rerank.CALLS[v][1] for v in chosen}
     _, run_cfg, _ = live_replay.load_run(run_dir)
     with ExitStack() as stack:

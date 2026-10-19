@@ -18,9 +18,13 @@ Variants:
   and a missing score counts as 0.
 - RS, the upper bound: R1 with `rerank.upper_model` (Claude Sonnet 5.5). It is not a
   product candidate.
+- R4, two lists (issue #22; added on 2026-10-16, after Step 4): `rerank.model`
+  returns two rankings in one call (strict JSON), and R4 is its list A, closest in
+  contribution, read as R1's order is. It is not a candidate for Step 4's selection:
+  it passes if its Hit@5 on the dev set is at least TWO_LISTS_MIN_HIT_AT_5.
 
-R1's candidates, prompt and reply parsing are in rk.live.reranker, which the live
-pipeline's L5r (rk.live.pipeline.with_rerank) calls too.
+R1's and R4's candidates, prompts and reply parsing are in rk.live.reranker, which
+the live pipeline (rk.live.pipeline.with_rerank) calls too.
 
 A reply with no readable JSON leaves the presented order and is counted. L5w's
 works outside the candidates follow the reranked ones, and ranks count within
@@ -69,10 +73,14 @@ from rk.live.fusion import B5, final_ranking
 from rk.live.replay import Replay, _originals, _rows, _scored, load_run, replay_run
 from rk.live.reranker import (
     LISTWISE,
+    TWO_LISTS,
+    TWO_LISTS_RESPONSE_FORMAT,
+    TWO_LISTS_SCHEMA_SHA256,
     as_number,
     candidates,
     listwise_ranking,
     parse_order,
+    parse_two_lists,
     render_prompt,
 )
 from rk.llm import BudgetExceeded, ChatModel, Completion, LLMError, Prompt, load_prompt, parse_json
@@ -83,16 +91,20 @@ KIND = "rerank"
 RUN_PREFIX = "rerank-"
 RESULTS_FILE = "results.jsonl"
 L5, L5W = "L5", "L5w"
-R1, R2, R3, RS = "R1", "R2", "R3", "RS"
+R1, R2, R3, R4, RS = "R1", "R2", "R3", "R4", "RS"
 PRODUCT = (R1, R2, R3)  # the candidates for L5r, in declared order
-VARIANTS = (*PRODUCT, RS)
+VARIANTS = (*PRODUCT, R4, RS)
+STEP4 = (*PRODUCT, RS)  # the variants a run has unless it names others: Step 4's
 GRADED = "rerank_graded"  # R3's prompt; LISTWISE (R1, R2, RS) is rk.live.reranker's
+PROMPTS = (LISTWISE, GRADED, TWO_LISTS)
+RESPONSE_FORMATS = {TWO_LISTS: TWO_LISTS_RESPONSE_FORMAT}  # the others are plain text
 PRODUCT_MODEL, UPPER_MODEL = "model", "upper_model"  # rerank: config keys
 # Which call each variant reads: (prompt, model). R1 and R2 read the same reply.
 CALLS = {
     R1: (LISTWISE, PRODUCT_MODEL),
     R2: (LISTWISE, PRODUCT_MODEL),
     R3: (GRADED, PRODUCT_MODEL),
+    R4: (TWO_LISTS, PRODUCT_MODEL),
     RS: (LISTWISE, UPPER_MODEL),
 }
 LABELS = {
@@ -101,8 +113,12 @@ LABELS = {
     R1: "R1 listwise (product model)",
     R2: "R2 listwise + first stage (RRF)",
     R3: "R3 graded 0-3 (product model)",
+    R4: "R4 two lists: list A, closest in contribution (product model)",
     RS: "RS listwise, upper bound (upper model)",
 }
+# Issue #22, pre-declared on 2026-10-16 (docs/phase2_spec.md, Evaluation, two lists):
+# two lists become the default check if list A's Hit@5 on the dev set is at least this.
+TWO_LISTS_MIN_HIT_AT_5 = 0.84
 MAX_SCORE = 3
 UPPER_TIMEOUT_S = 600.0  # adaptive thinking can make an upper-model reply slow
 REPLY_CHARS = 4000  # of each reply kept in results.jsonl
@@ -155,6 +171,10 @@ def rerank(variant: str, cands: Sequence[str], text: str) -> tuple[list[str], bo
     if variant == R3:
         scores = parse_scores(text, len(cands))
         return graded_ranking(cands, scores), scores is not None
+    if variant == R4:
+        reply = parse_two_lists(text, len(cands))
+        order = reply.contribution_order if reply else None
+        return listwise_ranking(cands, order), order is not None
     order = parse_order(text, len(cands))
     if variant == R2:
         return fused_ranking(cands, order), order is not None
@@ -183,10 +203,13 @@ class Reply:
     error: str | None = None
 
 
-def ask(client: ChatModel, text: str) -> Reply:
+def ask(
+    client: ChatModel, text: str, response_format: Mapping[str, Any] | None = None
+) -> Reply:
     start = time.perf_counter()
     try:
-        completion = client.complete([{"role": "user", "content": text}])
+        messages = [{"role": "user", "content": text}]
+        completion = client.complete(messages, response_format=response_format)
     except BudgetExceeded as exc:
         return Reply("capped", error=str(exc))
     except LLMError as exc:
@@ -216,7 +239,10 @@ def _new_run(
     out_dir = cfg.run.out_dir / run_id
     out_dir.mkdir(parents=True)
     commit, dirty, untracked = git_state()
-    prompts = {name: load_prompt(name).sha256 for name in (LISTWISE, GRADED)}
+    used = {CALLS[v][0] for v in variants}  # the prompts this run's variants read
+    prompts = {name: load_prompt(name).sha256 for name in PROMPTS if name in used}
+    if TWO_LISTS in used:
+        prompts["two_lists_schema"] = TWO_LISTS_SCHEMA_SHA256
     run_meta: dict[str, Any] = {
         "run_id": run_id,
         "kind": KIND,
@@ -257,7 +283,7 @@ class Calls:
         if model_key in self.capped:  # one refusal stops the model for the rest of the run
             return Reply("capped", error=self.capped[model_key])
         text = render_prompt(self.prompts[prompt_name], proposal, records, self.abstract_chars)
-        reply = ask(self.clients[model_key], text)
+        reply = ask(self.clients[model_key], text, RESPONSE_FORMATS.get(prompt_name))
         if reply.status == "capped":
             self.capped[model_key] = reply.error or "capped"
         if reply.completion is not None:
@@ -333,10 +359,15 @@ def rerank_check(
         completion = reply.completion
         reranked, readable = rerank(variant, cands, completion.text)
         cost = completion.usage.method_cost
+        extra: dict[str, Any] = {}
+        if variant == R4:  # list B has no target to score; whether it was read is kept
+            two = parse_two_lists(completion.text, len(cands))
+            extra["methods_readable"] = two is not None and two.methods_order is not None
         rows.append(
             scored(
                 variant,
                 list(dict.fromkeys([*reranked, *l5w])),  # L5w's other works follow
+                **extra,
                 readable=readable,
                 cost=cost,
                 total_cost=check_cost + cost,
@@ -361,7 +392,7 @@ def run_rerank(
     *,
     encoder: Encoder,
     clients: Mapping[str, ChatModel],
-    variants: Sequence[str] = VARIANTS,
+    variants: Sequence[str] = STEP4,
     limit: int | None = None,
     progress: Callable[[str], None] = lambda line: None,
 ) -> RerankRun:
@@ -387,7 +418,7 @@ def run_rerank(
     top_k = meta["config"]["live"]["top_k"]
     cost_cap = meta["config"]["live"]["cost_cap_per_check"]
     originals = _originals(run_cfg, {rp.target_id for rp in replays})
-    prompts = {name: load_prompt(name) for name in (LISTWISE, GRADED)}
+    prompts = {name: load_prompt(name) for name in PROMPTS}
     calls = Calls(clients, prompts, cfg.rerank.abstract_chars)
     out_dir, run_meta = _new_run(cfg, run_dir, meta, variants, qids)
     rows: list[dict[str, Any]] = []
@@ -520,6 +551,25 @@ def summarize(
             if RS in variants and choice in variants and choice != RS
             else None
         ),
+        "two_lists": (
+            {
+                "vs_choice": (
+                    _paired(R4, choice, ok[R4], ok[choice], seed=seed)
+                    if choice in variants
+                    else None
+                ),
+                "min_hit_at_5": TWO_LISTS_MIN_HIT_AT_5,
+                "passes": (
+                    qualities[R4]["hit_at_5"] is not None
+                    and qualities[R4]["hit_at_5"] >= TWO_LISTS_MIN_HIT_AT_5
+                ),
+                "methods_unreadable": sum(
+                    not r.get("methods_readable", True) for r in ok[R4].values()
+                ),
+            }
+            if R4 in variants
+            else None
+        ),
         "cost": {
             v: {
                 "rerank": _stats([r["cost"] for r in ok[v].values()]),
@@ -598,6 +648,38 @@ def render_markdown(summary: Mapping[str, Any]) -> str:
         lines.append(_pair_row(p, " (L5r: decides)" if p["a"] == choice else ""))
     if summary["upper_vs_choice"] is not None:
         lines.append(_pair_row(summary["upper_vs_choice"]))
+    two = summary.get("two_lists")
+    if two is not None:
+        a, quality = summary["quality"][R4], summary["quality"]
+        l5r = quality.get(choice) if choice else None
+        against = (
+            f" against L5r's ({choice}) Hit@1 {_f(l5r['hit_at_1'])} and Hit@5 "
+            f"{_f(l5r['hit_at_5'])}"
+            if l5r
+            else ""
+        )
+        verdict = "passes" if two["passes"] else "fails"
+        lines += [
+            "",
+            f"## Two lists (issue #22): list A ({R4}) against L5r",
+            "",
+            (
+                f"List A has Hit@1 {_f(a['hit_at_1'])} and Hit@5 {_f(a['hit_at_5'])}{against}. "
+                f"Pre-declared on the dev set: list A passes if its Hit@5 is at least "
+                f"{two['min_hit_at_5']:.2f}; it **{verdict}**. List B couldn't be read in "
+                f"{two['methods_unreadable']} of {a['n']} replies."
+            ),
+        ]
+        if two["vs_choice"] is not None:
+            lines += [
+                "",
+                (
+                    "| Comparison | n | ΔHit@5 [95% CI] | ΔMRR [95% CI] | Only A / only B "
+                    "| McNemar p |"
+                ),
+                "|---|---|---|---|---|---|",
+                _pair_row(two["vs_choice"]),
+            ]
     selected = summary["selected"]
     verdict = f"**{selected}**." if selected else "none beats L5w."
     lines += [

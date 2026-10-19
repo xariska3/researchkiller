@@ -18,6 +18,11 @@ each check's live time is estimated as its recorded check time (the live run's L
 row, or L5's), plus its recorded rerank call, plus this run's snippet, keyword,
 explainer and vocabulary stages.
 
+With rerank.two_lists (issue #22), the checks have two lists; the recorded rerank call
+is then R4's, every explained paper is counted once, and the summary adds the lists'
+measures (papers explained, section B's papers and its "Also close in methods" line,
+list B's fallbacks).
+
 Writes runs/explain-<timestamp>/ (run.json, results.jsonl with one row per check,
 reports/<qid>.json, summary.json, summary.md) and a CSV for hand review: the first
 `review_n` checks, one row per top-REVIEW_TOP paper, never overwritten.
@@ -64,8 +69,8 @@ from rk.live.report import (
     CheckRequest,
     Paper,
 )
-from rk.live.rerank import _stats
-from rk.live.reranker import LISTWISE
+from rk.live.rerank import R1, R4, _stats
+from rk.live.reranker import LISTWISE, TWO_LISTS, TWO_LISTS_SCHEMA_SHA256
 from rk.llm import ChatModel, load_prompt
 from rk.retrieval import Encoder
 from rk.targets import Record
@@ -100,13 +105,16 @@ class ExplainEvalRun:
     review_rows: int  # rows written to the review CSV
 
 
-def recorded_times(timing_run: Path, results_db: Path) -> dict[str, dict[str, float | None]]:
-    """Per qid: the live run's recorded check time and Step 4's R1 rerank call time.
+def recorded_times(
+    timing_run: Path, results_db: Path, rerank_config: str = R1
+) -> dict[str, dict[str, float | None]]:
+    """Per qid: the live run's recorded check time and the rerank run's call time.
 
     `timing_run` is a rerank run (runs/rerank-<timestamp>); its run.json names the live
     run, whose rows are in `results_db`. The check time is its L5w row's, or its L5
     row's in a run from before L5w (the same check: L5w only ranks its pool another
-    way). A cached rerank call has no time (None).
+    way). The call time is `rerank_config`'s (R1, or R4 for two lists); a cached call
+    has no time (None).
     """
     meta = json.loads((timing_run / RUN_FILE).read_text(encoding="utf-8"))
     if meta.get("kind") != "rerank":
@@ -123,7 +131,7 @@ def recorded_times(timing_run: Path, results_db: Path) -> dict[str, dict[str, fl
             times[qid] = {"check_s": latency, "rerank_s": None}
     lines = (timing_run / "results.jsonl").read_text(encoding="utf-8").splitlines()
     for row in map(json.loads, lines):
-        if row["config"] == "R1" and row["qid"] in times:
+        if row["config"] == rerank_config and row["qid"] in times:
             times[row["qid"]]["rerank_s"] = row.get("latency_s")
     return times
 
@@ -156,12 +164,13 @@ def check_row(
     run: CheckRun,
     times: Mapping[str, float | None] | None,
 ) -> dict[str, Any]:
-    """One check's measures."""
+    """One check's measures; a two-list check's explained papers count once each."""
     report = run.report
-    explained_top = [p for p in report.papers if p.snippet is not None]
+    explained_top = report.explained()
     explained = [p for p in explained_top if p.explanation is not None]
     found = _original_paper(report.papers, original)
-    in_top = found is not None and found in explained_top
+    in_top = found is not None and found in report.shown()
+    in_methods = _original_paper(report.methods or [], original)
     overlaps = {level: 0 for level in OVERLAPS}
     for p in explained:
         assert p.explanation is not None
@@ -183,7 +192,9 @@ def check_row(
         "n_unverified": sum(p.status == UNVERIFIED for p in explained),
         "overlaps": overlaps,
         "high_not_original": sum(
-            p.explanation is not None and p.explanation.overlap == HIGH and p is not found
+            p.explanation is not None
+            and p.explanation.overlap == HIGH
+            and not (found is not None and p.same_work(found))
             for p in explained
         ),
         "original_rank": found.rank if found else None,
@@ -192,6 +203,12 @@ def check_row(
             found.explanation.overlap if in_top and found and found.explanation else None
         ),
         "original_status": found.status if in_top and found else None,
+        "lists": 1 if report.methods is None else 2,
+        "n_methods": len(report.methods) if report.methods is not None else None,
+        "n_also_close": len(report.also_in_methods or []),  # section B's line
+        "original_methods_rank": in_methods.rank if in_methods else None,  # in section B
+        "original_also_close": in_top and found is not None and report.in_methods(found),
+        "methods_status": run.result.rerank.methods_status if run.result.rerank else None,
         "rerank": report.rerank,
         "explainer": report.explainer,
         "warnings": report.warnings,
@@ -281,7 +298,17 @@ def run_explain_eval(
         raise EvalError(f"no benchmark queries from {from_qid}")
     originals = {q["qid"]: by_id[q["target_id"]] for q in queries}
     del corpus, by_id
-    times = recorded_times(timing_run, cfg.run.results_db) if timing_run else None
+    two_lists = cfg.rerank.two_lists
+    rerank_config = R4 if two_lists else R1
+    times = (
+        recorded_times(timing_run, cfg.run.results_db, rerank_config) if timing_run else None
+    )
+    rerank_prompt = TWO_LISTS if two_lists else LISTWISE
+    prompts = {name: load_prompt(name).sha256 for name in (AGENT_PROMPT, rerank_prompt)}
+    prompts[EXPLAIN_PROMPT] = load_prompt(EXPLAIN_PROMPT).sha256
+    prompts["explain_schema"] = EXPLAIN_SCHEMA_SHA256
+    if two_lists:
+        prompts["rerank_schema"] = TWO_LISTS_SCHEMA_SHA256
 
     commit, dirty, untracked = git_state()
     explain_cfg = _jsonable(dataclasses.asdict(cfg.explain))
@@ -300,6 +327,8 @@ def run_explain_eval(
             "qids": [q["qid"] for q in queries],
             "review": {"file": str(review_out), "checks": review_n, "papers": REVIEW_TOP},
             "timing_run": str(timing_run) if timing_run else None,
+            "timing_config": rerank_config if timing_run else None,
+            "two_lists": two_lists,
             "models": {
                 "agent": cfg.agent.name,
                 "rerank": cfg.rerank.model.name,
@@ -307,10 +336,7 @@ def run_explain_eval(
                 "encoder": encoder.name,
             },
             "encoder_device": encoder.device,
-            "prompts": {
-                name: load_prompt(name).sha256 for name in (AGENT_PROMPT, LISTWISE, EXPLAIN_PROMPT)
-            }
-            | {"explain_schema": EXPLAIN_SCHEMA_SHA256},
+            "prompts": prompts,
             "explain_top_k": cfg.live.explain_top_k,
             "config": {"explain": explain_cfg, "live": _jsonable(dataclasses.asdict(cfg.live))},
             "seed": cfg.run.seed,
@@ -383,9 +409,10 @@ def summarize(
         original_levels[r["original_overlap"] or NOT_EXPLAINED] += 1
     overlaps = {level: sum(r["overlaps"][level] for r in ok) for level in OVERLAPS}
     real = [r for r in ok if r["explain_cached"] is False]
+    two = [r for r in ok if r.get("lists") == 2]
 
     def count(key: str, value: str) -> int:
-        return sum(r[key] == value for r in ok)
+        return sum(r.get(key) == value for r in ok)
 
     return {
         "run_id": meta["run_id"],
@@ -413,6 +440,21 @@ def summarize(
         "overlaps": overlaps,
         "high_not_original": sum(r["high_not_original"] for r in ok),
         "merged": [f"{r['qid']}: {a} + {b}" for r in ok for a, b in r["merged"]],
+        "two_lists": (
+            {
+                "checks": len(two),
+                "explained": _stats([r["n_top"] for r in two]),
+                "section_b": _stats([r["n_methods"] for r in two]),
+                "also_close": _stats([r["n_also_close"] for r in two]),
+                "methods_list": {
+                    s: count("methods_status", s) for s in (RERANKED, FALLBACK, SKIPPED)
+                },
+                "original_in_methods": sum(r["original_methods_rank"] is not None for r in two),
+                "original_also_close": sum(bool(r["original_also_close"]) for r in two),
+            }
+            if two
+            else None
+        ),
         "steps": {
             "rerank": {s: count("rerank", s) for s in (RERANKED, FALLBACK, SKIPPED)},
             "explainer": {s: count("explainer", s) for s in (EXPLAINED, FALLBACK, SKIPPED)},
@@ -507,6 +549,26 @@ def render_markdown(summary: Mapping[str, Any]) -> str:
         ),
     ]
     lines += [f"  - {w}" for w in steps["warnings"]]
+    two = summary.get("two_lists")
+    if two is not None:
+        methods = ", ".join(f"{k} {v}" for k, v in two["methods_list"].items())
+        lines += [
+            "",
+            "## Two lists (issue #22)",
+            "",
+            f"- Two-list checks: {two['checks']}.",
+            (
+                f"- Papers explained per check, each once (median / p95 / max): "
+                f"{_spread(two['explained'], 0)}; in section B: "
+                f"{_spread(two['section_b'], 0)}; section A papers on section B's \"Also "
+                f"close in methods\" line: {_spread(two['also_close'], 0)}."
+            ),
+            f"- List B: {methods} (fallback: empty).",
+            (
+                f"- The original in section B: {two['original_in_methods']} checks; on its "
+                f"\"Also close in methods\" line: {two['original_also_close']} checks."
+            ),
+        ]
     lines += [
         "",
         "## Cost and time per check (median / p95 / max)",

@@ -4,6 +4,13 @@ CheckRequest is what a user sends (the API's POST body); CheckReport is everythi
 check returns, as `python -m rk check` saves it and as the API will serve it. The
 header is always HEADER: a check lists the closest work it found, and finding nothing
 close doesn't prove an idea new. `render_text` prints a report for the terminal.
+
+A two-list check (issue #22) opens with how the rerank call read the idea
+(IDEA_HEADING: its contribution and its methods), then has two sections: its `papers`
+are list A, closest in contribution, and its `methods` are section B, list B's
+closest in methods that section A doesn't explain. Each section has a heading and a
+one-line description. Section B's ALSO_CLOSE line names the section A papers that list
+B ranks among section B's, and those get the ALSO_IN_METHODS note in section A.
 """
 
 from __future__ import annotations
@@ -30,6 +37,22 @@ VERIFIED_EXACT = "verified-exact"  # an explanation; evidence: the sentence the 
 VERIFIED_MATCHED = "verified-matched"  # an explanation; evidence: the sentence it matched
 UNVERIFIED = "unverified"  # an explanation without evidence: the snippet is shown
 NOT_EXPLAINED = "not explained"  # the snippet only
+# A two-list check's sections, in this order, each with its one-line description.
+CONTRIBUTION_HEADING = "Closest in contribution (possible prior art)"
+CONTRIBUTION_NOTE = (
+    "Ranked by overlap with what your idea claims as new (its problem and claim); papers "
+    "that share only tools, datasets or software rank lower."
+)
+METHODS_HEADING = "Closest in methods (worth citing)"
+METHODS_NOTE = (
+    "Ranked by overlap with your idea's methods, tools and data, whatever problem the "
+    "paper addresses."
+)
+ALSO_IN_METHODS = "also in methods"  # the note on a section A paper on the ALSO_CLOSE line
+ALSO_CLOSE = "Also close in methods"  # section B's line: "Also close in methods: #1 to #8 above."
+NO_METHODS = "No methods list for this check; see the warnings."
+IDEA_HEADING = "How the tool read your idea"  # the rerank reply's lines, as LABEL: line
+CONTRIBUTION_LABEL, METHODS_LABEL = "Contribution", "Methods"
 
 
 class _Model(BaseModel):
@@ -158,6 +181,17 @@ class Paper(_Model):
             return self.snippet.sentence, label
         return None
 
+    def same_work(self, other: Paper) -> bool:
+        """Whether the two are one work: they share an OpenAlex id (their own or an alias)."""
+        return bool({self.id, *self.aliases} & {other.id, *other.aliases})
+
+
+class IdeaSummary(_Model):
+    """A two-list rerank reply's one line each on the idea (None where it gave none)."""
+
+    contribution: str | None  # what the idea claims as new: its problem and claim
+    methods: str | None  # its methods, tools, datasets and software
+
 
 class VocabularyGroup(_Model):
     source: Literal["keywords", "titles", "queries"]
@@ -192,7 +226,17 @@ class CheckReport(_Model):
     coverage: str  # how much was searched
     mode: Literal["default", "quick"]
     request: CheckRequest
-    papers: list[Paper]  # the top live.top_k, in rank order
+    papers: list[Paper]  # the top live.top_k, in rank order (two lists: list A)
+    # Two lists only (None otherwise):
+    # - methods: section B, list B's first explain.methods_top_k papers that aren't
+    #   among section A's explained ones, ranked (`rank`) as in list B (empty if list B
+    #   couldn't be read);
+    # - also_in_methods: the list A ranks of section A's papers that list B ranks among
+    #   section B's (rk.live.check.methods_section), in rank order;
+    # - idea: the rerank reply's lines on the idea.
+    methods: list[Paper] | None = None
+    also_in_methods: list[int] | None = None
+    idea: IdeaSummary | None = None
     vocabulary: list[VocabularyGroup]
     warnings: list[str]  # for the user: a step that fell back, a lookup that failed
     queries: list[str]  # the agent's own queries (not the idea)
@@ -218,13 +262,77 @@ class CheckReport(_Model):
 
         return sorted(top, key=key)
 
+    def in_methods(self, paper: Paper) -> bool:
+        """Whether a paper of section A is on section B's ALSO_CLOSE line (two lists)."""
+        return paper in self.papers and paper.rank in (self.also_in_methods or [])
+
+    def also_close(self) -> str | None:
+        """Section B's line naming section A's papers close in methods, if there are any."""
+        if not self.also_in_methods:
+            return None
+        return f"{ALSO_CLOSE}: {rank_list(self.also_in_methods)} above."
+
+    def idea_lines(self) -> list[tuple[str, str]]:
+        """How the tool read the idea, as (label, line) pairs (two lists; may be empty)."""
+        if self.idea is None:
+            return []
+        lines = [(CONTRIBUTION_LABEL, self.idea.contribution), (METHODS_LABEL, self.idea.methods)]
+        return [(label, line) for label, line in lines if line]
+
+    def explained(self) -> list[Paper]:
+        """Every paper shown with a snippet or explanation, once: shown(), then section B's."""
+        papers = self.shown()
+        for m in self.methods or []:
+            if not any(m.same_work(p) for p in papers):
+                papers.append(m)
+        return papers
+
+
+def rank_list(ranks: list[int]) -> str:
+    """Ranks in order as "#1 to #8" for a run of three or more consecutive ranks, else
+    one by one: [1, 2, 3, 5] -> "#1 to #3, #5"; [1, 2] -> "#1, #2"."""
+    runs: list[list[int]] = []
+    for r in ranks:
+        if runs and r == runs[-1][-1] + 1:
+            runs[-1].append(r)
+        else:
+            runs.append([r])
+    parts: list[str] = []
+    for run in runs:
+        parts += [f"#{run[0]} to #{run[-1]}"] if len(run) >= 3 else [f"#{r}" for r in run]
+    return ", ".join(parts)
+
 
 def _year(paper: Paper) -> str:
     return paper.publication_date[:4]
 
 
+def _paper_text(paper: Paper, also_in_methods: bool = False) -> list[str]:
+    explanation = paper.explanation
+    level = f"[{explanation.overlap} overlap] " if explanation else ""
+    note = f" [{ALSO_IN_METHODS}]" if also_in_methods else ""
+    lines = ["", f"#{paper.rank} {level}{paper.title} ({_year(paper)}){note}"]
+    lines.append(f"   {paper.url}" + (f"  doi:{paper.doi}" if paper.doi else ""))
+    if explanation is not None and explanation.evidence is not None:
+        label = "Evidence" if explanation.match == EXACT else "Evidence (matched)"
+        lines.append(f'   {label}: "{explanation.evidence}"')
+    elif paper.snippet is not None:
+        label = "Snippet, quote unverified" if explanation is not None else "Snippet"
+        lines.append(f'   {label}: "{paper.snippet.sentence}"')
+    if explanation is not None:
+        for facet in FACETS:
+            verdict = getattr(explanation.facets, facet)
+            lines.append(f"   {FACET_LABELS[facet]}: {verdict.verdict}. {verdict.reason}")
+        lines.append(f"   Differs: {explanation.differs}")
+    return lines
+
+
 def render_text(report: CheckReport) -> str:
-    """The report for a terminal: the explained papers by overlap, then the rest by rank."""
+    """The report for a terminal: the explained papers by overlap, then the rest by rank.
+
+    A two-list check first says how the tool read the idea, then shows section A that
+    way, then section B in its rank order.
+    """
     lines = [report.header, report.coverage]
     mode = "Quick check (no LLM)" if report.mode == QUICK else "Default check"
     lines.append(
@@ -233,36 +341,59 @@ def render_text(report: CheckReport) -> str:
     )
     for warning in report.warnings:
         lines.append(f"Warning: {warning}")
+    idea = report.idea_lines()
+    if idea:
+        lines += ["", IDEA_HEADING] + [f"   {label}: {line}" for label, line in idea]
+    two_lists = report.methods is not None
+    if two_lists:
+        lines += ["", CONTRIBUTION_HEADING, CONTRIBUTION_NOTE]
     shown = report.shown()
     for paper in shown:
-        lines.append("")
-        explanation = paper.explanation
-        level = f"[{explanation.overlap} overlap] " if explanation else ""
-        lines.append(f"#{paper.rank} {level}{paper.title} ({_year(paper)})")
-        lines.append(f"   {paper.url}" + (f"  doi:{paper.doi}" if paper.doi else ""))
-        if explanation is not None and explanation.evidence is not None:
-            label = "Evidence" if explanation.match == EXACT else "Evidence (matched)"
-            lines.append(f'   {label}: "{explanation.evidence}"')
-        elif paper.snippet is not None:
-            label = "Snippet, quote unverified" if explanation is not None else "Snippet"
-            lines.append(f'   {label}: "{paper.snippet.sentence}"')
-        if explanation is not None:
-            for facet in FACETS:
-                verdict = getattr(explanation.facets, facet)
-                lines.append(f"   {FACET_LABELS[facet]}: {verdict.verdict}. {verdict.reason}")
-            lines.append(f"   Differs: {explanation.differs}")
+        lines += _paper_text(paper, two_lists and report.in_methods(paper))
     rest = [p for p in report.papers if p not in shown]
     if rest:
         lines += ["", f"Also found (ranks {rest[0].rank}-{rest[-1].rank}):"]
         lines += [f"#{p.rank} {p.title} ({_year(p)})" for p in rest]
+    if report.methods is not None:
+        lines += ["", METHODS_HEADING, METHODS_NOTE]
+        also = report.also_close()
+        if also:
+            lines += ["", also]
+        for paper in report.methods:
+            lines += _paper_text(paper)
+        if not report.methods and not also:
+            lines += ["", NO_METHODS]
     if report.vocabulary:
         lines += ["", "Words the literature uses that your text doesn't:"]
         lines += [f"   {g.label}: {', '.join(g.terms)}" for g in report.vocabulary]
     return "\n".join(lines) + "\n"
 
 
+def _paper_markdown(paper: Paper, heading: str, also_in_methods: bool = False) -> list[str]:
+    e = paper.explanation
+    level = f" ({e.overlap} overlap)" if e else ""
+    venue = f", {paper.venue}" if paper.venue else ""
+    note = f" · *{ALSO_IN_METHODS}*" if also_in_methods else ""
+    lines = ["", f"{heading} {paper.rank}. [{paper.title}]({paper.link}){level}", ""]
+    lines.append(f"{paper.year}{venue}{note}")
+    evidence = paper.evidence()
+    if evidence is not None:
+        lines += ["", f"> {evidence[0]}", "", f"*{evidence[1]}*"]
+    if e is not None:
+        lines.append("")
+        for facet in FACETS:
+            verdict = getattr(e.facets, facet)
+            lines.append(f"- **{FACET_LABELS[facet]}**: {verdict.verdict}. {verdict.reason}")
+        lines += ["", f"**Differs**: {e.differs}"]
+    return lines
+
+
 def render_markdown(report: CheckReport) -> str:
-    """The report as Markdown (the web app's export): the same order as the result page."""
+    """The report as Markdown (the web app's export): the same order as the result page.
+
+    A two-list check says how the tool read the idea, then has a section per list, A
+    first, so its papers are third-level.
+    """
     mode = "Quick check (no LLM)" if report.mode == QUICK else "Full check"
     lines = [
         f"# {report.header}",
@@ -275,26 +406,30 @@ def render_markdown(report: CheckReport) -> str:
     ]
     if report.warnings:
         lines += ["", "**Warnings**", ""] + [f"- {w}" for w in report.warnings]
+    idea = report.idea_lines()
+    if idea:
+        lines += ["", f"## {IDEA_HEADING}", ""]
+        lines += [f"- **{label}**: {line}" for label, line in idea]
+    two_lists = report.methods is not None
+    heading = "###" if two_lists else "##"
+    if two_lists:
+        lines += ["", f"## {CONTRIBUTION_HEADING}", "", CONTRIBUTION_NOTE]
     shown = report.shown()
     for paper in shown:
-        e = paper.explanation
-        level = f" ({e.overlap} overlap)" if e else ""
-        venue = f", {paper.venue}" if paper.venue else ""
-        lines += ["", f"## {paper.rank}. [{paper.title}]({paper.link}){level}", ""]
-        lines.append(f"{paper.year}{venue}")
-        evidence = paper.evidence()
-        if evidence is not None:
-            lines += ["", f"> {evidence[0]}", "", f"*{evidence[1]}*"]
-        if e is not None:
-            lines.append("")
-            for facet in FACETS:
-                verdict = getattr(e.facets, facet)
-                lines.append(f"- **{FACET_LABELS[facet]}**: {verdict.verdict}. {verdict.reason}")
-            lines += ["", f"**Differs**: {e.differs}"]
+        lines += _paper_markdown(paper, heading, two_lists and report.in_methods(paper))
     rest = [p for p in report.papers if p not in shown]
     if rest:
-        lines += ["", "## Also found", ""]
+        lines += ["", f"{heading} Also found", ""]
         lines += [f"{p.rank}. [{p.title}]({p.link}) ({p.year})" for p in rest]
+    if report.methods is not None:
+        lines += ["", f"## {METHODS_HEADING}", "", METHODS_NOTE]
+        also = report.also_close()
+        if also:
+            lines += ["", also]
+        for paper in report.methods:
+            lines += _paper_markdown(paper, "###")
+        if not report.methods and not also:
+            lines += ["", NO_METHODS]
     if report.vocabulary:
         lines += ["", "## Words the literature uses that your text doesn't", ""]
         lines += [f"- **{g.label}**: {', '.join(g.terms)}" for g in report.vocabulary]

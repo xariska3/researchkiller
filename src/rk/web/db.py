@@ -9,6 +9,10 @@ Three tables:
 - `explanations`: one row per explained paper (overlap level, facets, evidence and
   how it was found, the explainer's own quote, "differs").
 
+In a two-list check (issue #22), each row of `candidates` and `explanations` says which
+list it is from (`ranking`: CONTRIBUTION or METHODS; None for a one-list check), and a
+paper in both lists has a row in each. A database from before has the column added.
+
 A check reused from history is a new `checks` row with the stored report, marked
 `from_history_of`, and costs nothing. Times are UTC, stored without a time zone.
 """
@@ -28,6 +32,7 @@ from sqlalchemy import (
     JSON,
     Date,
     DateTime,
+    Engine,
     Float,
     ForeignKey,
     Integer,
@@ -35,25 +40,35 @@ from sqlalchemy import (
     Text,
     create_engine,
     func,
+    inspect,
     select,
     update,
 )
+from sqlalchemy import text as sql_text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
-from rk.live.report import CheckReport, CheckSubmission
+from rk.live.report import CheckReport, CheckSubmission, Paper
+from rk.live.reranker import CONTRIBUTION, METHODS
 
 QUEUED, RUNNING, DONE, FAILED = "queued", "running", "done", "failed"
 UNFINISHED = (QUEUED, RUNNING)
 OPENALEX_BUDGET = "openalex_budget"  # checks.error_code when OpenAlex's daily budget ran out
+TWO_LISTS_METHOD = "two-lists"  # in the history key of a full check with two lists
 
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-def history_key(submission: CheckSubmission) -> str:
-    """What makes two checks the same: the text (whitespace collapsed), mode and date."""
+def history_key(submission: CheckSubmission, method: str = "") -> str:
+    """What makes two checks the same: the text (whitespace collapsed), mode and date.
+
+    `method` (TWO_LISTS_METHOD for a two-list full check) is added to the key when set,
+    so a report with another number of lists is never reused; one-list keys are as before.
+    """
     key = [" ".join(submission.text.split()), submission.mode, str(submission.before_date)]
+    if method:
+        key.append(method)
     return hashlib.sha256(json.dumps(key).encode("utf-8")).hexdigest()
 
 
@@ -101,6 +116,7 @@ class CandidateRow(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     check_id: Mapped[str] = mapped_column(ForeignKey("checks.id"), index=True)
+    ranking: Mapped[str | None] = mapped_column(String(16))  # two lists: which; else None
     rank: Mapped[int] = mapped_column(Integer)
     paper_id: Mapped[str] = mapped_column(String(32))
     aliases: Mapped[list[str]] = mapped_column(JSON, default=list)
@@ -117,6 +133,7 @@ class ExplanationRow(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     check_id: Mapped[str] = mapped_column(ForeignKey("checks.id"), index=True)
+    ranking: Mapped[str | None] = mapped_column(String(16))  # two lists: which; else None
     rank: Mapped[int] = mapped_column(Integer)
     paper_id: Mapped[str] = mapped_column(String(32))
     overlap: Mapped[str] = mapped_column(String(8))
@@ -125,6 +142,14 @@ class ExplanationRow(Base):
     evidence: Mapped[str | None] = mapped_column(Text)  # the abstract's sentence shown
     quote: Mapped[str] = mapped_column(Text)  # the explainer's own version
     differs: Mapped[str] = mapped_column(Text)
+
+
+def add_ranking_columns(engine: Engine) -> None:
+    """Add the `ranking` column to tables made before two-list checks (None in old rows)."""
+    with engine.begin() as conn:
+        for table in (CandidateRow.__tablename__, ExplanationRow.__tablename__):
+            if "ranking" not in {c["name"] for c in inspect(conn).get_columns(table)}:
+                conn.execute(sql_text(f"ALTER TABLE {table} ADD COLUMN ranking VARCHAR(16)"))
 
 
 class Store:
@@ -137,6 +162,7 @@ class Store:
             f"sqlite:///{path}", connect_args={"check_same_thread": False, "timeout": 30}
         )
         Base.metadata.create_all(self.engine)
+        add_ranking_columns(self.engine)
         self._sessions = sessionmaker(self.engine, expire_on_commit=False)
 
     @contextmanager
@@ -149,7 +175,7 @@ class Store:
 
     # --- writing ---------------------------------------------------------------------------
 
-    def create(self, submission: CheckSubmission) -> CheckRow:
+    def create(self, submission: CheckSubmission, method: str = "") -> CheckRow:
         row = CheckRow(
             id=uuid.uuid4().hex,
             created_at=utc_now(),
@@ -157,7 +183,7 @@ class Store:
             stage=QUEUED,
             mode=submission.mode,
             text=submission.text,
-            text_hash=history_key(submission),
+            text_hash=history_key(submission, method),
             before_date=submission.before_date,
             warnings=[],
             billed_cost=0.0,
@@ -224,36 +250,12 @@ class Store:
                     prompt_hashes=report.prompt_hashes,
                 )
             )
-            for paper in report.papers:
-                session.add(
-                    CandidateRow(
-                        check_id=check_id,
-                        rank=paper.rank,
-                        paper_id=paper.id,
-                        aliases=paper.aliases,
-                        title=paper.title,
-                        doi=paper.doi,
-                        publication_date=paper.publication_date,
-                        venue=paper.venue,
-                        snippet=paper.snippet.sentence if paper.snippet else None,
-                        snippet_similarity=paper.snippet.similarity if paper.snippet else None,
-                    )
-                )
-                e = paper.explanation
-                if e is not None:
-                    session.add(
-                        ExplanationRow(
-                            check_id=check_id,
-                            rank=paper.rank,
-                            paper_id=paper.id,
-                            overlap=e.overlap,
-                            facets=e.facets.model_dump(),
-                            match=e.match,
-                            evidence=e.evidence,
-                            quote=e.quote,
-                            differs=e.differs,
-                        )
-                    )
+            lists: list[tuple[str | None, list[Paper]]] = [(None, report.papers)]
+            if report.methods is not None:
+                lists = [(CONTRIBUTION, report.papers), (METHODS, report.methods)]
+            for ranking, papers in lists:
+                for paper in papers:
+                    session.add_all(_rows(check_id, ranking, paper))
 
     def fail(
         self,
@@ -337,14 +339,53 @@ class Store:
             return session.scalars(query).first()
 
     def candidates(self, check_id: str) -> list[CandidateRow]:
+        """A check's listed papers: by list (contribution, then methods), then rank."""
         with self.session() as session:
             query = select(CandidateRow).where(CandidateRow.check_id == check_id)
-            return list(session.scalars(query.order_by(CandidateRow.rank)))
+            return list(session.scalars(query.order_by(CandidateRow.ranking, CandidateRow.rank)))
 
     def explanations(self, check_id: str) -> list[ExplanationRow]:
+        """A check's explained papers, ordered as candidates() orders them."""
         with self.session() as session:
             query = select(ExplanationRow).where(ExplanationRow.check_id == check_id)
-            return list(session.scalars(query.order_by(ExplanationRow.rank)))
+            order = (ExplanationRow.ranking, ExplanationRow.rank)
+            return list(session.scalars(query.order_by(*order)))
+
+
+def _rows(check_id: str, ranking: str | None, paper: Paper) -> list[Base]:
+    """A listed paper's `candidates` row, and its `explanations` row if it is explained."""
+    rows: list[Base] = [
+        CandidateRow(
+            check_id=check_id,
+            ranking=ranking,
+            rank=paper.rank,
+            paper_id=paper.id,
+            aliases=paper.aliases,
+            title=paper.title,
+            doi=paper.doi,
+            publication_date=paper.publication_date,
+            venue=paper.venue,
+            snippet=paper.snippet.sentence if paper.snippet else None,
+            snippet_similarity=paper.snippet.similarity if paper.snippet else None,
+        )
+    ]
+    e = paper.explanation
+    if e is not None:
+        rows.append(
+            ExplanationRow(
+                check_id=check_id,
+                ranking=ranking,
+                rank=paper.rank,
+                paper_id=paper.id,
+                overlap=e.overlap,
+                facets=e.facets.model_dump(),
+                match=e.match,
+                evidence=e.evidence,
+                quote=e.quote,
+                differs=e.differs,
+            )
+        )
+    return rows
 
 
 def start_of_day(now: datetime) -> datetime:
