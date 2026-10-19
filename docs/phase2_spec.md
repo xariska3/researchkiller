@@ -439,6 +439,27 @@ design live, and keeps the Phase 1 benchmark as a regression test.
     - **The original**: rated high in all 102 checks that explained it.
   - **Spend**: $0.72 over the three runs.
   - **Report**: docs/reports/phase2-two-lists.md.
+  - **Section B without repeats** (the author's review of PR #23).
+    *Pre-declared on 2026-10-19, before any call:*
+    - **The change**: section B shows list B's first 6 papers that aren't in
+      section A's top 8, each fully explained, and one line names the section A
+      papers that list B ranks among them ("Also close in methods: #1, #3
+      above"). The report opens with the rerank reply's two lines ("How the tool
+      read your idea"). The rerank call and list A are unchanged, so list A's
+      result above stands.
+    - **The run**: `python -m rk explain-eval` on the same 120 dev queries, with
+      the same settings and timing run as the cost and time run above. The
+      searches and the agent and rerank calls replay from the caches; the
+      keyword lookups and the explainer calls are new (14 papers a check).
+    - **Pass**: every check costs under the $0.03 cap, with no explainer call
+      refused at the cap.
+    - **If it fails**: stop and report; nothing is tuned on these queries.
+    - **Reported**: the whole check's cost and the explainer call's (median and
+      max), the estimated time (median and max), papers explained, the quote
+      rates, fallbacks and cut-off replies.
+    - **The time**: report only; the author accepted the 57.3 s max above.
+    - **Report only**: the test set is not used.
+    - **Spend cap**: $1.50 of new LLM spend, against an expected $0.80.
 - The Phase 1 frozen benchmark stays runnable as a regression test.
 
 ## Competitive evaluation: is it better than what researchers already use?
@@ -565,7 +586,12 @@ automated head-to-head only.*
        list B keeps list A, with a warning.
    - **The explainer**: one call for the top 8 of list A and the top 6 of list B
      (`explain.contribution_top_k`, `explain.methods_top_k`).
+     - *Later note (2026-10-19): list B's 6 are now its first 6 that aren't in
+       list A's top 8, so a check explains 14 papers (the author's review of PR
+       #23). The two counts must add up to at most `live.top_k`.*
      - **Shared papers**: a paper in both is explained once and shown in both.
+       - *Later note (2026-10-19): a paper is no longer shown in both; see
+         Section B below.*
      - **Unchanged**: the quote checks, and the whole check's $0.03 cap.
      - **The vocabulary map**: it uses every explained paper.
    - **The report** (result page, Markdown export, terminal): section A, then
@@ -573,7 +599,17 @@ automated head-to-head only.*
      - **Section A**: it keeps the report's order (overlap level, then rank)
        and its "Also found" list. A paper also in section B gets a small "also
        in methods" note.
+       - *Later note (2026-10-19): the note now marks the section A papers named
+         on section B's "Also close in methods" line.*
      - **Section B**: it is in its own rank order.
+       - *Later note (2026-10-19): section B shows list B's first 6 papers that
+         aren't in section A's top 8, each fully explained and numbered by its
+         rank in list B. One line names the section A papers that list B ranks
+         among them ("Also close in methods: #1, #3 above"), by their numbers in
+         section A.*
+     - *Later note (2026-10-19): the report (page, export and terminal) opens
+       with the rerank reply's two lines, under "How the tool read your idea":
+       "Contribution: ..." and "Methods: ...".*
    - **The web app**: list B's papers are stored too (a `ranking` column in
      `candidates` and `explanations`). A stored one-list report is not reused
      for a two-list check.

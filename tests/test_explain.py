@@ -961,14 +961,18 @@ def test_explain_eval_counts_two_list_checks_and_times_r4(tmp_path: Path) -> Non
     lines = (done.run_dir / "results.jsonl").read_text(encoding="utf-8").splitlines()
     rows = [json.loads(line) for line in lines]
     for row in rows:
-        # list A's top 3 and list B's top 2, the first of which is list A's second
-        assert row["lists"] == 2 and row["n_methods"] == 2 and row["n_both"] == 1
-        assert row["n_top"] == 4 == row["n_explained"]
+        # List A's top 3, and section B: list B's first 2 not among them, after list A's
+        # second (on the "Also close in methods" line). The original is list B's last.
+        assert row["lists"] == 2 and row["n_methods"] == 2 and row["n_also_close"] == 1
+        assert row["n_top"] == 5 == row["n_explained"]
+        assert row["original_in_top"] and row["original_also_close"] is False
         q = times[row["qid"]]
         assert row["estimated_live_s"] == pytest.approx(
             q["check_s"] + q["rerank_s"] + row["explainer_stage_s"]
         )
-    assert s["quotes"]["papers"] == 12 and two["explained"]["max"] == 4
+    assert s["quotes"]["papers"] == 15 and two["explained"]["max"] == 5
+    assert two["section_b"]["max"] == 2 and two["also_close"]["max"] == 1
+    assert (two["original_in_methods"], two["original_also_close"]) == (0, 0)
     meta = json.loads((done.run_dir / "run.json").read_text(encoding="utf-8"))
     assert meta["two_lists"] is True and meta["timing_config"] == R4
     assert TWO_LISTS in meta["prompts"] and "rerank_schema" in meta["prompts"]

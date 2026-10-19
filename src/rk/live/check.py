@@ -14,10 +14,11 @@ fail it: a keyword lookup or an explainer call that fails or could cross the cap
 the papers as they are, with a warning. With `strict` (evaluation), a failed explainer
 call raises instead.
 
-A two-list check (rerank.two_lists, issue #22) explains the top
-explain.contribution_top_k of list A and the top explain.methods_top_k of list B in
-the same call, each paper once: list A's first, then list B's others. A paper in both
-shows the same snippet and explanation in both.
+A two-list check (rerank.two_lists, issue #22) explains, in the same call, the top
+explain.contribution_top_k of list A (section A) and section B: the first
+explain.methods_top_k papers of list B that aren't in section A (`methods_section`).
+The section A papers that list B ranks among section B's are named on its "Also close
+in methods" line instead of being shown twice.
 """
 
 from __future__ import annotations
@@ -104,6 +105,30 @@ def _position(candidates: list[Candidate], record: Record) -> int | None:
     return None
 
 
+def methods_section(
+    top: list[Candidate], methods: list[Candidate], k: int
+) -> tuple[list[Candidate], list[int]]:
+    """Section B, and the list A ranks of the `top` papers that list B ranks among it.
+
+    Section B is the first k papers of list B (`methods`) that aren't among `top`
+    (section A's explained papers). The ranks are those of the `top` papers list B
+    ranks before section B is complete, in rank order: down to section B's last paper,
+    every paper of list B is in section B or among them (all of `top` that list B
+    has, if it runs out first).
+    """
+    section: list[Candidate] = []
+    also: list[int] = []
+    for c in methods:
+        if len(section) == k:
+            break
+        i = _position(top, c.record)
+        if i is None:
+            section.append(c)
+        else:
+            also.append(top[i].rank)
+    return section, sorted(also)
+
+
 def paper(
     candidate: Candidate,
     snippet: Snippet | None,
@@ -179,15 +204,12 @@ def run_check(
     result, merged = merge_same_text(result)  # before the top papers are chosen
     warnings = list(result.warnings)
     top = result.candidates[: live.explain_top_k]
-    top_methods: list[Candidate] = []
+    top_methods: list[Candidate] = []  # two lists: section B
+    also: list[int] | None = None  # two lists: section B's "Also close in methods" line
     if result.methods is not None:
         top = result.candidates[: ex.contribution_top_k]
-        top_methods = result.methods[: ex.methods_top_k]
-    # The papers to explain, each once: list A's top, then list B's others.
-    explained = list(top)
-    for c in top_methods:
-        if _position(explained, c.record) is None:
-            explained.append(c)
+        top_methods, also = methods_section(top, result.methods, ex.methods_top_k)
+    explained = [*top, *top_methods]  # the papers to explain, each once
     records = [c.record for c in explained]
 
     mark = time.perf_counter()
@@ -269,7 +291,7 @@ def run_check(
     methods = None
     idea = None
     if result.methods is not None:
-        methods = [as_paper(c, _position(explained, c.record)) for c in top_methods]
+        methods = [as_paper(c, len(top) + i) for i, c in enumerate(top_methods)]
         r = result.rerank
         if r is not None and (r.contribution_line or r.methods_line):
             idea = IdeaSummary(contribution=r.contribution_line, methods=r.methods_line)
@@ -282,6 +304,7 @@ def run_check(
         request=request,
         papers=papers,
         methods=methods,
+        also_in_methods=also,
         idea=idea,
         vocabulary=vocab,
         warnings=warnings,

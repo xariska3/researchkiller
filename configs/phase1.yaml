@@ -215,7 +215,7 @@ explain:
   cost_cap_per_check: 0.03        # USD, the whole check (live-eval keeps live's $0.10)
   vocabulary_terms: 10
   contribution_top_k: 8           # two lists: list A's papers explained (one list: live's 10)
-  methods_top_k: 6                # and list B's, in the same call; a paper in both once
+  methods_top_k: 6                # and list B's first 6 not among them, in the same call
   model:                          # the judge (validated in Phase 1), room for 10 answers
     name: mistralai/mistral-medium-3.1
     family: mistral

@@ -45,6 +45,7 @@ from rk.live.report import (
     FACET_LABELS,
     FACETS,
     HEADER,
+    IDEA_HEADING,
     MAX_WORDS,
     METHODS_HEADING,
     METHODS_NOTE,
@@ -208,6 +209,7 @@ def create_app(
             },
             also_note=ALSO_IN_METHODS,
             no_methods=NO_METHODS,
+            idea_heading=IDEA_HEADING,
             **values,
         )
         return HTMLResponse(html)
@@ -300,6 +302,8 @@ def create_app(
             rest=[p for p in report.papers if p not in shown] if report else [],
             methods=report.methods if report else None,
             also={p.id for p in shown if report.in_methods(p)} if report else set(),
+            also_close=report.also_close() if report else None,
+            idea=report.idea_lines() if report else [],
             source=store.get(row.from_history_of) if row.from_history_of else None,
             failed=row.status == FAILED,
         )

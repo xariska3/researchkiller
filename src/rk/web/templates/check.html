@@ -41,6 +41,15 @@
 </article>
 {% endmacro %}
 
+{% if idea %}
+<section class="idea-read">
+  <h2>{{ idea_heading }}</h2>
+  {% for label, line in idea %}
+  <p><b>{{ label }}:</b> {{ line }}</p>
+  {% endfor %}
+</section>
+{% endif %}
+
 {% if methods is not none %}
 <h2>{{ sections.contribution[0] }}</h2>
 <p class="note">{{ sections.contribution[1] }}</p>
@@ -65,10 +74,13 @@
 {% if methods is not none %}
 <h2>{{ sections.methods[0] }}</h2>
 <p class="note">{{ sections.methods[1] }}</p>
+{% if also_close %}
+<p class="also-close">{{ also_close }}</p>
+{% endif %}
 {% for p in methods %}
 {{ paper_card(p) }}
 {% endfor %}
-{% if not methods %}
+{% if not methods and not also_close %}
 <p>{{ no_methods }}</p>
 {% endif %}
 {% endif %}

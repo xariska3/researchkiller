@@ -20,7 +20,8 @@ explainer and vocabulary stages.
 
 With rerank.two_lists (issue #22), the checks have two lists; the recorded rerank call
 is then R4's, every explained paper is counted once, and the summary adds the lists'
-measures (papers explained, papers in both lists, list B's fallbacks).
+measures (papers explained, section B's papers and its "Also close in methods" line,
+list B's fallbacks).
 
 Writes runs/explain-<timestamp>/ (run.json, results.jsonl with one row per check,
 reports/<qid>.json, summary.json, summary.md) and a CSV for hand review: the first
@@ -204,8 +205,9 @@ def check_row(
         "original_status": found.status if in_top and found else None,
         "lists": 1 if report.methods is None else 2,
         "n_methods": len(report.methods) if report.methods is not None else None,
-        "n_both": sum(report.in_methods(p) for p in report.shown()),
-        "original_methods_rank": in_methods.rank if in_methods else None,
+        "n_also_close": len(report.also_in_methods or []),  # section B's line
+        "original_methods_rank": in_methods.rank if in_methods else None,  # in section B
+        "original_also_close": in_top and found is not None and report.in_methods(found),
         "methods_status": run.result.rerank.methods_status if run.result.rerank else None,
         "rerank": report.rerank,
         "explainer": report.explainer,
@@ -442,11 +444,13 @@ def summarize(
             {
                 "checks": len(two),
                 "explained": _stats([r["n_top"] for r in two]),
-                "in_both": _stats([r["n_both"] for r in two]),
+                "section_b": _stats([r["n_methods"] for r in two]),
+                "also_close": _stats([r["n_also_close"] for r in two]),
                 "methods_list": {
                     s: count("methods_status", s) for s in (RERANKED, FALLBACK, SKIPPED)
                 },
                 "original_in_methods": sum(r["original_methods_rank"] is not None for r in two),
+                "original_also_close": sum(bool(r["original_also_close"]) for r in two),
             }
             if two
             else None
@@ -555,11 +559,15 @@ def render_markdown(summary: Mapping[str, Any]) -> str:
             f"- Two-list checks: {two['checks']}.",
             (
                 f"- Papers explained per check, each once (median / p95 / max): "
-                f"{_spread(two['explained'], 0)}; in both shown lists: "
-                f"{_spread(two['in_both'], 0)}."
+                f"{_spread(two['explained'], 0)}; in section B: "
+                f"{_spread(two['section_b'], 0)}; section A papers on section B's \"Also "
+                f"close in methods\" line: {_spread(two['also_close'], 0)}."
             ),
             f"- List B: {methods} (fallback: empty).",
-            f"- The original in list B's shown papers: {two['original_in_methods']} checks.",
+            (
+                f"- The original in section B: {two['original_in_methods']} checks; on its "
+                f"\"Also close in methods\" line: {two['original_also_close']} checks."
+            ),
         ]
     lines += [
         "",

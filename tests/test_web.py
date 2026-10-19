@@ -31,15 +31,17 @@ from sqlalchemy import update
 from test_explain import VENUE_OF_T1, config_dict, explainer_reply, works
 from test_live_eval import AGENT_QUERY, _search
 from test_live_eval import agent as fake_agent
-from test_rerank import original_first, two_lists_reply
+from test_rerank import CONTRIBUTION_LINE, METHODS_LINE, original_first, two_lists_reply
 
 from rk import cli
 from rk.config import Config, config_from_dict
 from rk.live.report import (
+    ALSO_CLOSE,
     ALSO_IN_METHODS,
     CONTRIBUTION_HEADING,
     CONTRIBUTION_NOTE,
     HEADER,
+    IDEA_HEADING,
     METHODS_HEADING,
     METHODS_NOTE,
     CheckReport,
@@ -260,24 +262,31 @@ def test_a_two_list_check_shows_both_sections_and_stores_both_lists(tmp_path: Pa
         assert status["status"] == DONE
         report = CheckReport.model_validate(status["report"])
         assert report.methods is not None and len(report.methods) == 2
+        assert report.also_in_methods == [2]  # list B's first is list A's #2
         html = client.get(f"/checks/{status['id']}").text
-        # Section A, its "also found", then section B, each with its description.
+        # How the tool read the idea, section A and its "also found", then section B,
+        # each with its description, and section B's line.
         parts = [
+            f"<h2>{escape(IDEA_HEADING)}</h2>",
+            f"<p><b>Contribution:</b> {escape(CONTRIBUTION_LINE)}</p>",
+            f"<p><b>Methods:</b> {escape(METHODS_LINE)}</p>",
             f"<h2>{escape(CONTRIBUTION_HEADING)}</h2>",
             f'<p class="note">{escape(CONTRIBUTION_NOTE)}</p>',
             "<h3>Also found</h3>",
             f"<h2>{escape(METHODS_HEADING)}</h2>",
             f'<p class="note">{escape(METHODS_NOTE)}</p>',
+            f'<p class="also-close">{ALSO_CLOSE}: #2 above.</p>',
         ]
         assert [html.index(p) for p in parts] == sorted(html.index(p) for p in parts)
-        # The paper in both lists has the note in section A only.
+        # List A's #2 has the note in section A and is not shown again in section B.
         assert html.count(f'<span class="also">{ALSO_IN_METHODS}</span>') == 1
-        assert html.index('<span class="also">') < html.index(parts[3])
-        shared = report.methods[0]
-        assert html.count(f">{escape(shared.title)}</a></h3>") == 2  # shown in both
+        assert html.index('<span class="also">') < html.index(parts[6])
+        assert html.count(f">{escape(report.papers[1].title)}</a></h3>") == 1
+        for p in report.methods:
+            assert html.count(f">{escape(p.title)}</a></h3>") == 1 and p.explanation is not None
         md = client.get(f"/api/checks/{status['id']}/export", params={"format": "md"}).text
-        assert md.index(CONTRIBUTION_HEADING) < md.index(METHODS_HEADING)
-        assert md.count(f"*{ALSO_IN_METHODS}*") == 1
+        assert md.index(IDEA_HEADING) < md.index(CONTRIBUTION_HEADING) < md.index(METHODS_HEADING)
+        assert md.count(f"*{ALSO_IN_METHODS}*") == 1 and f"{ALSO_CLOSE}: #2 above." in md
     assert cfg.web is not None
     store = Store(cfg.web.db_path)
     rows = [(c.ranking, c.rank, c.paper_id) for c in store.candidates(status["id"])]
@@ -287,7 +296,7 @@ def test_a_two_list_check_shows_both_sections_and_stores_both_lists(tmp_path: Pa
     ]
     explained = [(e.ranking, e.rank) for e in store.explanations(status["id"])]
     assert explained == [("contribution", 1), ("contribution", 2), ("contribution", 3),
-                         ("methods", 1), ("methods", 2)]
+                         ("methods", 2), ("methods", 3)]
 
 
 def test_a_report_with_other_lists_is_not_reused(tmp_path: Path) -> None:

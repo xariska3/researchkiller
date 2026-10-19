@@ -23,7 +23,7 @@ from test_live_eval import agent as fake_agent
 from test_rerank import CONTRIBUTION_LINE, METHODS_LINE, original_first, two_lists_reply
 
 from rk.config import Config, ConfigError, config_from_dict
-from rk.live.check import CheckRun, run_check
+from rk.live.check import CheckRun, methods_section, run_check
 from rk.live.explain import render_prompt as explain_prompt
 from rk.live.fusion import B5, final_ranking
 from rk.live.pipeline import (
@@ -31,13 +31,16 @@ from rk.live.pipeline import (
     FALLBACK,
     RERANKED,
     SKIPPED,
+    Candidate,
     default_check,
     with_rerank,
 )
 from rk.live.report import (
+    ALSO_CLOSE,
     ALSO_IN_METHODS,
     CONTRIBUTION_HEADING,
     CONTRIBUTION_NOTE,
+    IDEA_HEADING,
     METHODS_HEADING,
     METHODS_NOTE,
     NO_METHODS,
@@ -247,51 +250,105 @@ def test_the_default_check_has_two_lists_when_the_config_says_so(cfg: Config) ->
 # --- the whole check ---------------------------------------------------------------------------
 
 
-def test_a_two_list_check_explains_both_tops_in_one_call(cfg: Config) -> None:
+def test_a_two_list_check_explains_section_a_and_section_b_in_one_call(cfg: Config) -> None:
     assert cfg.explain is not None
     explainer = FakeLLM(explainer_reply)
     run = check(cfg, explainer=explainer)
     report, list_a, list_b = run.report, run.result.candidates, run.result.methods
     assert list_b is not None
-    # One call: list A's top 3, then list B's top 2 not already among them (its first is
-    # list A's second), each once.
+    # Section B: list B's first 2 papers not in list A's top 3. List B starts with list
+    # A's second, so section B is list B's second and third.
+    a_ids = [c.record["id"] for c in list_a[:TOP_A]]
+    assert list_b[0].record["id"] == a_ids[1]
+    section_b = list_b[1 : 1 + TOP_B]
+    assert not {c.record["id"] for c in section_b} & set(a_ids)
+    # One call: list A's top 3, then section B, each once.
     (call,) = explainer.calls
-    a_ids = {c.record["id"] for c in list_a[:TOP_A]}
-    explained = [*list_a[:TOP_A], *(c for c in list_b[:TOP_B] if c.record["id"] not in a_ids)]
-    assert len(explained) == TOP_A + 1
-    records = [c.record for c in explained]
+    records = [c.record for c in [*list_a[:TOP_A], *section_b]]
     assert call[0]["content"] == explain_prompt(GOOD[T1], records, cfg.explain.abstract_chars)
-    # Section A: list A, its top explained; section B: list B's top, in its order.
+    # Section A: list A, its top explained.
     assert [p.id for p in report.papers] == [c.record["id"] for c in list_a]
     assert all(p.explanation is not None and p.snippet is not None for p in report.papers[:TOP_A])
     assert all(p.explanation is None and p.snippet is None for p in report.papers[TOP_A:])
+    # Section B: fully explained, with list B's ranks; list A's #2 is "also close".
     assert report.methods is not None
-    assert [p.id for p in report.methods] == [c.record["id"] for c in list_b[:TOP_B]]
-    assert [p.rank for p in report.methods] == [1, 2]
-    shared, only_b = report.methods
-    assert shared.id == report.papers[1].id and shared.rank == 1 and report.papers[1].rank == 2
-    assert (shared.explanation, shared.snippet) == (
-        report.papers[1].explanation,
-        report.papers[1].snippet,
-    )
-    assert only_b.explanation is not None and not report.in_methods(report.papers[0])
-    assert report.in_methods(report.papers[1]) and len(report.explained()) == TOP_A + 1
+    assert [p.id for p in report.methods] == [c.record["id"] for c in section_b]
+    assert [p.rank for p in report.methods] == [2, 3]
+    assert all(p.explanation is not None and p.snippet is not None for p in report.methods)
+    assert report.also_in_methods == [2] and report.papers[1].rank == 2
+    assert report.in_methods(report.papers[1]) and not report.in_methods(report.papers[0])
+    assert not any(report.in_methods(p) for p in report.methods)
+    assert len(report.explained()) == TOP_A + TOP_B
+    assert report.also_close() == f"{ALSO_CLOSE}: #2 above."
     assert report.idea == IdeaSummary(contribution=CONTRIBUTION_LINE, methods=METHODS_LINE)
+    assert report.idea_lines() == [("Contribution", CONTRIBUTION_LINE), ("Methods", METHODS_LINE)]
     assert TWO_LISTS in report.prompt_hashes and "rerank_schema" in report.prompt_hashes
     assert LISTWISE not in report.prompt_hashes and report.warnings == []
     assert CheckReport.model_validate_json(report.model_dump_json()) == report
-    # The terminal: section A, its "also found", then section B; one paper in both.
+    # The terminal: how the tool read the idea, section A and its "also found", then
+    # section B with its line.
     text = render_text(report)
-    order = [CONTRIBUTION_HEADING, CONTRIBUTION_NOTE, "Also found", METHODS_HEADING, METHODS_NOTE]
+    order = [
+        IDEA_HEADING,
+        f"   Contribution: {CONTRIBUTION_LINE}",
+        f"   Methods: {METHODS_LINE}",
+        CONTRIBUTION_HEADING,
+        CONTRIBUTION_NOTE,
+        "Also found",
+        METHODS_HEADING,
+        METHODS_NOTE,
+        f"{ALSO_CLOSE}: #2 above.",
+    ]
     assert [text.index(part) for part in order] == sorted(text.index(part) for part in order)
-    assert text.count(f"[{ALSO_IN_METHODS}]") == 1
+    assert text.count(f"[{ALSO_IN_METHODS}]") == 1 and NO_METHODS not in text
     # The Markdown export: the same order, the sections second-level, the papers third.
     md = render_markdown(report)
-    assert f"## {CONTRIBUTION_HEADING}\n\n{CONTRIBUTION_NOTE}\n" in md
-    assert f"## {METHODS_HEADING}\n\n{METHODS_NOTE}\n" in md
+    idea = f"## {IDEA_HEADING}\n\n- **Contribution**: {CONTRIBUTION_LINE}\n- **Methods**: "
+    assert idea + f"{METHODS_LINE}\n\n## {CONTRIBUTION_HEADING}\n\n{CONTRIBUTION_NOTE}\n" in md
+    assert f"## {METHODS_HEADING}\n\n{METHODS_NOTE}\n\n{ALSO_CLOSE}: #2 above.\n\n### 2. [" in md
     assert md.index(CONTRIBUTION_HEADING) < md.index("### Also found") < md.index(METHODS_HEADING)
     assert md.count(f"*{ALSO_IN_METHODS}*") == 1 and "### 1. [" in md
     assert "—" not in md and "—" not in text
+
+
+def candidate(rank: int, work: str, *aliases: str) -> Candidate:
+    """A list entry with only what methods_section reads: its rank and its work's ids."""
+    record: Any = {"id": work, "aliases": list(aliases)}
+    return Candidate(rank, record, [], [])
+
+
+def test_section_b_skips_section_a_and_its_line_names_what_it_skipped() -> None:
+    top = [candidate(1, "A1"), candidate(2, "A2", "A2v"), candidate(3, "A3")]
+    list_b = [
+        candidate(1, "A3"),
+        candidate(2, "B1"),
+        candidate(3, "A2v"),  # another version of list A's #2
+        candidate(4, "B2"),
+        candidate(5, "B3"),
+        candidate(6, "A1"),  # after section B is full: not on the line
+    ]
+    section, also = methods_section(top, list_b, 3)
+    assert [c.record["id"] for c in section] == ["B1", "B2", "B3"]
+    assert also == [2, 3]  # in list A's rank order
+    # A list B that runs out: section B is shorter, and the line has all of top in it.
+    section, also = methods_section(top, list_b[:4], 3)
+    assert [c.record["id"] for c in section] == ["B1", "B2"] and also == [2, 3]
+    assert methods_section(top, [], 3) == ([], [])
+
+
+def test_a_line_without_section_b_papers_and_a_single_idea_line(cfg: Config) -> None:
+    report = check(cfg).report
+    # A list B whose papers are all in section A: no section B papers, only the line.
+    only_a = report.model_copy(update={"methods": [], "also_in_methods": [1, 2]})
+    assert only_a.also_close() == f"{ALSO_CLOSE}: #1, #2 above."
+    for rendered in (render_text(only_a), render_markdown(only_a)):
+        assert f"{ALSO_CLOSE}: #1, #2 above." in rendered and NO_METHODS not in rendered
+    # One line on the idea, the other empty: only the line given is shown.
+    half = report.model_copy(update={"idea": IdeaSummary(contribution=None, methods="M.")})
+    assert half.idea_lines() == [("Methods", "M.")]
+    assert "Contribution:" not in render_text(half) and "- **Methods**: M." in render_markdown(half)
+    no_idea = report.model_copy(update={"idea": None})
+    assert no_idea.idea_lines() == [] and IDEA_HEADING not in render_markdown(no_idea)
 
 
 def test_a_missing_explanation_of_a_list_b_paper_names_its_list(cfg: Config) -> None:
@@ -319,6 +376,7 @@ def test_without_list_b_the_report_says_so(cfg: Config) -> None:
 
     report = check(cfg, reranker=contribution_only).report
     assert report.methods == [] and report.papers
+    assert report.also_in_methods == [] and report.also_close() is None
     assert f"{METHODS_HEADING}\n{METHODS_NOTE}\n\n{NO_METHODS}" in render_text(report)
     assert f"## {METHODS_HEADING}\n\n{METHODS_NOTE}\n\n{NO_METHODS}" in render_markdown(report)
 
@@ -331,9 +389,11 @@ def test_the_quick_check_and_one_list_checks_are_unchanged(cfg: Config, tmp_path
     assert one_list.rerank is not None and one_list.rerank.two_lists is False
     report = check(one_list, reranker=original_first).report
     assert report.methods is None and report.idea is None and report.rerank == RERANKED
+    assert report.also_in_methods is None and report.also_close() is None
     assert LISTWISE in report.prompt_hashes and TWO_LISTS not in report.prompt_hashes
     for rendered in (render_text(report), render_markdown(report)):
         assert CONTRIBUTION_HEADING not in rendered and METHODS_HEADING not in rendered
+        assert IDEA_HEADING not in rendered
 
 
 def test_the_explain_counts_are_checked(tmp_path: Path) -> None:
@@ -341,7 +401,8 @@ def test_the_explain_counts_are_checked(tmp_path: Path) -> None:
         config_from_dict(two_lists_dict(tmp_path, contribution_top_k=0))
     with pytest.raises(ConfigError, match="methods_top_k"):
         config_from_dict(two_lists_dict(tmp_path, methods_top_k=0))
-    data = two_lists_dict(tmp_path)
-    data["explain"]["methods_top_k"] = 11  # the test config's live.top_k is 10
-    with pytest.raises(ConfigError, match=r"must be <= live.top_k \(10\)"):
+    data = two_lists_dict(tmp_path, contribution_top_k=5, methods_top_k=5)
+    config_from_dict(data)  # the test config's live.top_k is 10
+    data["explain"]["methods_top_k"] = 6  # section B could run out of list B's 10
+    with pytest.raises(ConfigError, match=r"\+ methods_top_k must be <= live.top_k \(10\)"):
         config_from_dict(data)

@@ -396,8 +396,8 @@ class ExplainConfig:
     run.cache_path and run.budget_cap with every other command. `cost_cap_per_check`
     caps a whole check of `python -m rk check` (searches, agent, rerank and explainer);
     live-eval keeps live.cost_cap_per_check. A two-list check (rerank.two_lists)
-    explains the top `contribution_top_k` of its first list and the top
-    `methods_top_k` of its second, in the same call.
+    explains, in the same call, the top `contribution_top_k` of its first list and the
+    first `methods_top_k` of its second that aren't among them.
     """
 
     model: ModelConfig
@@ -405,7 +405,7 @@ class ExplainConfig:
     cost_cap_per_check: float = 0.03  # USD, method cost of the whole check; hard cap
     vocabulary_terms: int = 10  # the vocabulary map's terms, over all its groups
     contribution_top_k: int = 8  # two lists: papers explained in list A
-    methods_top_k: int = 6  # two lists: papers explained (and shown) in list B
+    methods_top_k: int = 6  # two lists: list B's papers explained, none of those in list A's
 
     def __post_init__(self) -> None:
         _require(self.abstract_chars >= 1, "abstract_chars must be >= 1")
@@ -461,11 +461,14 @@ class Config:
             check_training_cutoffs(self.bench.target_from_date, {"rerank": self.rerank.model})
         if self.explain is not None:  # nor the explainer, which grades them
             check_training_cutoffs(self.bench.target_from_date, {"explain": self.explain.model})
-        if self.explain is not None and self.live is not None:
+        two_lists = self.rerank is not None and self.rerank.two_lists
+        if two_lists and self.explain is not None and self.live is not None:
+            # List B has live.top_k papers when the pool has as many, so section B is full:
+            # methods_top_k of them outside list A's top contribution_top_k.
             top_k = self.live.top_k
             _require(
-                max(self.explain.contribution_top_k, self.explain.methods_top_k) <= top_k,
-                f"explain.contribution_top_k and methods_top_k must be <= live.top_k ({top_k})",
+                self.explain.contribution_top_k + self.explain.methods_top_k <= top_k,
+                f"explain.contribution_top_k + methods_top_k must be <= live.top_k ({top_k})",
             )
 
 

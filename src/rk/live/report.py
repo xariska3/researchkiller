@@ -5,10 +5,12 @@ check returns, as `python -m rk check` saves it and as the API will serve it. Th
 header is always HEADER: a check lists the closest work it found, and finding nothing
 close doesn't prove an idea new. `render_text` prints a report for the terminal.
 
-A two-list check (issue #22) has two sections: its `papers` are list A, closest in
-contribution, and its `methods` are list B, closest in methods. Each section has a
-heading and a one-line description; a paper of section A that is in section B too
-gets the ALSO_IN_METHODS note.
+A two-list check (issue #22) opens with how the rerank call read the idea
+(IDEA_HEADING: its contribution and its methods), then has two sections: its `papers`
+are list A, closest in contribution, and its `methods` are section B, list B's
+closest in methods that section A doesn't explain. Each section has a heading and a
+one-line description. Section B's ALSO_CLOSE line names the section A papers that list
+B ranks among section B's, and those get the ALSO_IN_METHODS note in section A.
 """
 
 from __future__ import annotations
@@ -46,8 +48,11 @@ METHODS_NOTE = (
     "Ranked by overlap with your idea's methods, tools and data, whatever problem the "
     "paper addresses."
 )
-ALSO_IN_METHODS = "also in methods"  # the note on a section A paper that is in section B
+ALSO_IN_METHODS = "also in methods"  # the note on a section A paper on the ALSO_CLOSE line
+ALSO_CLOSE = "Also close in methods"  # section B's line: "Also close in methods: #1, #3 above."
 NO_METHODS = "No methods list for this check; see the warnings."
+IDEA_HEADING = "How the tool read your idea"  # the rerank reply's lines, as LABEL: line
+CONTRIBUTION_LABEL, METHODS_LABEL = "Contribution", "Methods"
 
 
 class _Model(BaseModel):
@@ -222,9 +227,15 @@ class CheckReport(_Model):
     mode: Literal["default", "quick"]
     request: CheckRequest
     papers: list[Paper]  # the top live.top_k, in rank order (two lists: list A)
-    # Two lists only (None otherwise): list B's top explain.methods_top_k, in its rank
-    # order (empty if it couldn't be read), and the rerank reply's lines on the idea.
+    # Two lists only (None otherwise):
+    # - methods: section B, list B's first explain.methods_top_k papers that aren't
+    #   among section A's explained ones, ranked (`rank`) as in list B (empty if list B
+    #   couldn't be read);
+    # - also_in_methods: the list A ranks of section A's papers that list B ranks among
+    #   section B's (rk.live.check.methods_section), in rank order;
+    # - idea: the rerank reply's lines on the idea.
     methods: list[Paper] | None = None
+    also_in_methods: list[int] | None = None
     idea: IdeaSummary | None = None
     vocabulary: list[VocabularyGroup]
     warnings: list[str]  # for the user: a step that fell back, a lookup that failed
@@ -252,11 +263,24 @@ class CheckReport(_Model):
         return sorted(top, key=key)
 
     def in_methods(self, paper: Paper) -> bool:
-        """Whether a paper is in the methods list (two lists; False for one list)."""
-        return any(paper.same_work(m) for m in self.methods or [])
+        """Whether a paper of section A is on section B's ALSO_CLOSE line (two lists)."""
+        return paper in self.papers and paper.rank in (self.also_in_methods or [])
+
+    def also_close(self) -> str | None:
+        """Section B's line naming section A's papers close in methods, if there are any."""
+        if not self.also_in_methods:
+            return None
+        return f"{ALSO_CLOSE}: {', '.join(f'#{r}' for r in self.also_in_methods)} above."
+
+    def idea_lines(self) -> list[tuple[str, str]]:
+        """How the tool read the idea, as (label, line) pairs (two lists; may be empty)."""
+        if self.idea is None:
+            return []
+        lines = [(CONTRIBUTION_LABEL, self.idea.contribution), (METHODS_LABEL, self.idea.methods)]
+        return [(label, line) for label, line in lines if line]
 
     def explained(self) -> list[Paper]:
-        """Every paper shown with a snippet or explanation, once: shown(), then list B's others."""
+        """Every paper shown with a snippet or explanation, once: shown(), then section B's."""
         papers = self.shown()
         for m in self.methods or []:
             if not any(m.same_work(p) for p in papers):
@@ -291,7 +315,8 @@ def _paper_text(paper: Paper, also_in_methods: bool = False) -> list[str]:
 def render_text(report: CheckReport) -> str:
     """The report for a terminal: the explained papers by overlap, then the rest by rank.
 
-    A two-list check shows section A that way, then section B in its rank order.
+    A two-list check first says how the tool read the idea, then shows section A that
+    way, then section B in its rank order.
     """
     lines = [report.header, report.coverage]
     mode = "Quick check (no LLM)" if report.mode == QUICK else "Default check"
@@ -301,6 +326,9 @@ def render_text(report: CheckReport) -> str:
     )
     for warning in report.warnings:
         lines.append(f"Warning: {warning}")
+    idea = report.idea_lines()
+    if idea:
+        lines += ["", IDEA_HEADING] + [f"   {label}: {line}" for label, line in idea]
     two_lists = report.methods is not None
     if two_lists:
         lines += ["", CONTRIBUTION_HEADING, CONTRIBUTION_NOTE]
@@ -313,9 +341,12 @@ def render_text(report: CheckReport) -> str:
         lines += [f"#{p.rank} {p.title} ({_year(p)})" for p in rest]
     if report.methods is not None:
         lines += ["", METHODS_HEADING, METHODS_NOTE]
+        also = report.also_close()
+        if also:
+            lines += ["", also]
         for paper in report.methods:
             lines += _paper_text(paper)
-        if not report.methods:
+        if not report.methods and not also:
             lines += ["", NO_METHODS]
     if report.vocabulary:
         lines += ["", "Words the literature uses that your text doesn't:"]
@@ -345,7 +376,8 @@ def _paper_markdown(paper: Paper, heading: str, also_in_methods: bool = False) -
 def render_markdown(report: CheckReport) -> str:
     """The report as Markdown (the web app's export): the same order as the result page.
 
-    A two-list check has a section per list, A first, so its papers are third-level.
+    A two-list check says how the tool read the idea, then has a section per list, A
+    first, so its papers are third-level.
     """
     mode = "Quick check (no LLM)" if report.mode == QUICK else "Full check"
     lines = [
@@ -359,6 +391,10 @@ def render_markdown(report: CheckReport) -> str:
     ]
     if report.warnings:
         lines += ["", "**Warnings**", ""] + [f"- {w}" for w in report.warnings]
+    idea = report.idea_lines()
+    if idea:
+        lines += ["", f"## {IDEA_HEADING}", ""]
+        lines += [f"- **{label}**: {line}" for label, line in idea]
     two_lists = report.methods is not None
     heading = "###" if two_lists else "##"
     if two_lists:
@@ -372,9 +408,12 @@ def render_markdown(report: CheckReport) -> str:
         lines += [f"{p.rank}. [{p.title}]({p.link}) ({p.year})" for p in rest]
     if report.methods is not None:
         lines += ["", f"## {METHODS_HEADING}", "", METHODS_NOTE]
+        also = report.also_close()
+        if also:
+            lines += ["", also]
         for paper in report.methods:
             lines += _paper_markdown(paper, "###")
-        if not report.methods:
+        if not report.methods and not also:
             lines += ["", NO_METHODS]
     if report.vocabulary:
         lines += ["", "## Words the literature uses that your text doesn't", ""]
