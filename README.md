@@ -69,10 +69,17 @@ Good to know:
 1. Your idea goes to OpenAlex's semantic search, and an LLM agent (Qwen3 235B) writes
    up to 4 shorter queries in the field's own terms, each run as a keyword and a
    semantic search.
-2. The results are pooled and ranked locally with BM25 and the Qwen3-Embedding model,
-   and the same Qwen LLM reranks the top candidates by reading their abstracts.
-3. For the top 10, one call to Mistral Medium 3.1 rates the overlap (high, partial or
-   low) on problem, method, domain and claim, and says what differs.
+2. The results are pooled and ranked locally with BM25 and the Qwen3-Embedding model.
+   The same Qwen LLM then reads the top candidates' abstracts, states in one line each
+   what your idea claims as new and what methods it uses, and ranks the candidates
+   twice: by overlap with that contribution (list A, "closest in contribution:
+   possible prior art") and by overlap in methods, tools and data (list B, "closest in
+   methods: worth citing").
+3. One call to Mistral Medium 3.1 explains the top 8 of list A and the top 6 of list B
+   that aren't among them: it rates the overlap (high, partial or low) on problem,
+   method, domain and claim, and says what differs. The result opens with how the tool
+   read your idea, then shows the two lists; list B names the list A papers that also
+   rank high in methods instead of showing them twice.
 4. The code checks each quote the LLM gives against the abstract and shows the
    abstract's own sentence; a quote it can't find is marked unverified.
 5. A vocabulary map, built without an LLM, lists terms these papers use that your text
@@ -96,6 +103,10 @@ paper. ResearchKiller's settings were chosen on a separate development set.
 | Claude Sonnet 5.5 + web search | 80 | 41.3% | 47.5% | $0.157 | 22 s |
 | Semantic Scholar snippet search | 80 | 23.8% | 32.5% | free | 5 s |
 | Perplexity Sonar | 80 | 17.5% | 17.5% | $0.006 | 5 s |
+
+The table is the single-list check's; list A of the two-list check, now the default, was
+scored only on the 120 development queries, where it put the source paper first in 83.3%
+and in the top 5 in 85.0%, exactly as the single list did on every query.
 
 ![Share of 80 held-out proposals where the source paper appears in the top 5](docs/img/recall_bar.png)
 

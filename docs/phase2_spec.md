@@ -460,6 +460,19 @@ design live, and keeps the Phase 1 benchmark as a regression test.
     - **The time**: report only; the author accepted the 57.3 s max above.
     - **Report only**: the test set is not used.
     - **Spend cap**: $1.50 of new LLM spend, against an expected $0.80.
+    - **Result (2026-10-19)**, `runs/explain-20261019-130131`: it passes. All
+      120 checks finished under the cap, with no call refused at it, no fallback
+      and no cut-off reply.
+      - **Cost per check**: median $0.0156, max $0.0183 (the explainer call's:
+        median $0.0064, max $0.0072).
+      - **Time per check, estimated**: median 45.4 s, max 60.8 s (2 checks at 60 s
+        or more).
+      - **Papers explained**: 14 in every check, 6 of them in section B. Section
+        B's line names all 8 of section A's in 65 checks.
+      - **Quotes**: 92.3% exact, 6.6% matched, 1.1% unverified, of 1,680.
+      - **The original**: rated high in all 102 checks that explained it.
+      - **Spend**: $0.74.
+      - **Report**: docs/reports/phase2-two-lists.md (Section B without repeats).
 - The Phase 1 frozen benchmark stays runnable as a regression test.
 
 ## Competitive evaluation: is it better than what researchers already use?
