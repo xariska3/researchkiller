@@ -49,7 +49,7 @@ METHODS_NOTE = (
     "paper addresses."
 )
 ALSO_IN_METHODS = "also in methods"  # the note on a section A paper on the ALSO_CLOSE line
-ALSO_CLOSE = "Also close in methods"  # section B's line: "Also close in methods: #1, #3 above."
+ALSO_CLOSE = "Also close in methods"  # section B's line: "Also close in methods: #1 to #8 above."
 NO_METHODS = "No methods list for this check; see the warnings."
 IDEA_HEADING = "How the tool read your idea"  # the rerank reply's lines, as LABEL: line
 CONTRIBUTION_LABEL, METHODS_LABEL = "Contribution", "Methods"
@@ -270,7 +270,7 @@ class CheckReport(_Model):
         """Section B's line naming section A's papers close in methods, if there are any."""
         if not self.also_in_methods:
             return None
-        return f"{ALSO_CLOSE}: {', '.join(f'#{r}' for r in self.also_in_methods)} above."
+        return f"{ALSO_CLOSE}: {rank_list(self.also_in_methods)} above."
 
     def idea_lines(self) -> list[tuple[str, str]]:
         """How the tool read the idea, as (label, line) pairs (two lists; may be empty)."""
@@ -286,6 +286,21 @@ class CheckReport(_Model):
             if not any(m.same_work(p) for p in papers):
                 papers.append(m)
         return papers
+
+
+def rank_list(ranks: list[int]) -> str:
+    """Ranks in order as "#1 to #8" for a run of three or more consecutive ranks, else
+    one by one: [1, 2, 3, 5] -> "#1 to #3, #5"; [1, 2] -> "#1, #2"."""
+    runs: list[list[int]] = []
+    for r in ranks:
+        if runs and r == runs[-1][-1] + 1:
+            runs[-1].append(r)
+        else:
+            runs.append([r])
+    parts: list[str] = []
+    for run in runs:
+        parts += [f"#{run[0]} to #{run[-1]}"] if len(run) >= 3 else [f"#{r}" for r in run]
+    return ", ".join(parts)
 
 
 def _year(paper: Paper) -> str:

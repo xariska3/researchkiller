@@ -47,6 +47,7 @@ from rk.live.report import (
     CheckReport,
     CheckRequest,
     IdeaSummary,
+    rank_list,
     render_markdown,
     render_text,
 )
@@ -336,13 +337,22 @@ def test_section_b_skips_section_a_and_its_line_names_what_it_skipped() -> None:
     assert methods_section(top, [], 3) == ([], [])
 
 
+def test_the_line_shows_three_or_more_consecutive_ranks_as_a_range() -> None:
+    assert rank_list([2]) == "#2"
+    assert rank_list([1, 3]) == "#1, #3"
+    assert rank_list([1, 2]) == "#1, #2"
+    assert rank_list(list(range(1, 9))) == "#1 to #8"
+    assert rank_list([1, 2, 3, 5, 7, 8, 9, 10]) == "#1 to #3, #5, #7 to #10"
+
+
 def test_a_line_without_section_b_papers_and_a_single_idea_line(cfg: Config) -> None:
     report = check(cfg).report
     # A list B whose papers are all in section A: no section B papers, only the line.
-    only_a = report.model_copy(update={"methods": [], "also_in_methods": [1, 2]})
-    assert only_a.also_close() == f"{ALSO_CLOSE}: #1, #2 above."
+    only_a = report.model_copy(update={"methods": [], "also_in_methods": [1, 2, 3]})
+    assert only_a.also_close() == f"{ALSO_CLOSE}: #1 to #3 above."
     for rendered in (render_text(only_a), render_markdown(only_a)):
-        assert f"{ALSO_CLOSE}: #1, #2 above." in rendered and NO_METHODS not in rendered
+        assert f"{ALSO_CLOSE}: #1 to #3 above." in rendered and NO_METHODS not in rendered
+        assert rendered.count(f"[{ALSO_IN_METHODS}]") + rendered.count(f"*{ALSO_IN_METHODS}*") == 3
     # One line on the idea, the other empty: only the line given is shown.
     half = report.model_copy(update={"idea": IdeaSummary(contribution=None, methods="M.")})
     assert half.idea_lines() == [("Methods", "M.")]

@@ -620,6 +620,8 @@ automated head-to-head only.*
          rank in list B. One line names the section A papers that list B ranks
          among them ("Also close in methods: #1, #3 above"), by their numbers in
          section A.*
+       - *Later note (2026-10-19): three or more consecutive numbers show as a
+         range ("Also close in methods: #1 to #8 above").*
      - *Later note (2026-10-19): the report (page, export and terminal) opens
        with the rerank reply's two lines, under "How the tool read your idea":
        "Contribution: ..." and "Methods: ...".*

@@ -150,7 +150,8 @@ came from the caches; the keyword lookups and the 120 explainer calls were new.
 - **List A on the test set.** As declared, the test set wasn't used. The README's
   results table is still L5r's (single list) on the 80 test queries.
   - *Later note (2026-10-19): the README now says so under the table, with list A's
-    dev result.*
+    dev result. Its other cost and time figures are now the two-list check's (about
+    $0.016 and 45 s, medians on the 120 dev checks).*
 
 ## Deviations and choices
 
@@ -192,6 +193,9 @@ check costs under the $0.03 cap with no explainer call refused at it.
   - Those papers keep the "also in methods" note in section A.
   - A check whose list B can't be read has neither section B nor the line, and says
     so as before.
+  - *Later note (2026-10-19): at the author's request, three or more consecutive
+    numbers show as a range, as in "Also close in methods: #1 to #8 above". Two are
+    still listed ("#1, #2").*
 - **"How the tool read your idea"**: the page, the export and the terminal open the
   results with the reply's two lines, as "Contribution: ..." and "Methods: ...".
   - A missing line is left out.
@@ -226,6 +230,7 @@ came from the cache: in those checks, list B's top 6 shared no paper with list A
   - The max, 60.8 s, is above the 57.3 s the author accepted and the spec's 60 s.
   - 2 of 120 checks are estimated at 60 s or more.
   - As declared, nothing was changed for time.
+  - *Later note (2026-10-19): the author accepted the 60.8 s max.*
 - **Section B**: 6 papers in all 120 checks.
   - **The line** names all 8 of section A's papers in 65 checks (the median is 8),
     and none in 3.

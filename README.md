@@ -5,7 +5,7 @@ describe your idea in 40 to 500 words; it searches OpenAlex, ranks what it finds
 with an LLM, and shows the closest papers, each with an overlap rating, a sentence
 from its abstract and what it does differently. It is for researchers and students
 who want to see the closest published work before they invest in an idea. It runs on
-your own machine with your own API keys, for about $0.015 a check. It never declares
+your own machine with your own API keys, for about $0.016 a check. It never declares
 an idea novel: a missing match is not proof of novelty.
 
 Designed and evaluated by Charalampos Karatzas, built with Claude Code as the coding agent.
@@ -42,10 +42,11 @@ python -m rk serve
 ```
 
 What a check costs:
-- **Full check**: about $0.015, capped at $0.03. In the live check I timed, $0.007
-  went to LLM calls on OpenRouter and $0.009 to OpenAlex searches. Those come out of
-  OpenAlex's free daily allowance: about 10 full checks a day without an OpenAlex key,
-  about 100 with one. That check took 38 s on a GPU.
+- **Full check**: about $0.016, capped at $0.03. On 120 development checks (medians),
+  about $0.0085 went to LLM calls on OpenRouter and $0.007 to OpenAlex searches. Those
+  come out of OpenAlex's free daily allowance: about 10 full checks a day without an
+  OpenAlex key, about 100 with one. A check takes about 45 s on a GPU (the estimated
+  median on those checks; at most about 61 s).
 - **Quick check**: one OpenAlex search and no LLM call, about $0.001 of the OpenAlex
   allowance, in a few seconds.
 
@@ -115,9 +116,9 @@ and in the top 5 in 85.0%, exactly as the single list did on every query.
   run on only 33 of the queries, where ResearchKiller found 88% against its 70%
   (p = 0.18).
 - **Semantic Scholar's paper search** found none of the 80 and isn't shown.
-- **The full check's cost and time** in the table cover finding the papers. The
-  explanations add about $0.005 and 9 s, so a whole check costs about $0.014 and takes
-  about 32 s (medians, estimated on 20 development checks).
+- **The full check's cost and time** in the table cover finding the papers with the
+  single list. A whole two-list check, with its explanations, costs about $0.016 and
+  takes about 45 s (medians, estimated on 120 development checks).
 - **The explanations**: on 20 development checks, 95.5% of quotes were found verbatim
   in the abstract, 4.0% matched an abstract sentence, and 0.5% were unverified. The
   source paper was in the top 10, rated high, in all 20.
