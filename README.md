@@ -119,9 +119,11 @@ and in the top 5 in 85.0%, exactly as the single list did on every query.
 - **The full check's cost and time** in the table cover finding the papers with the
   single list. A whole two-list check, with its explanations, costs about $0.016 and
   takes about 45 s (medians, estimated on 120 development checks).
-- **The explanations**: on 20 development checks, 95.5% of quotes were found verbatim
-  in the abstract, 4.0% matched an abstract sentence, and 0.5% were unverified. The
-  source paper was in the top 10, rated high, in all 20.
+- **The explanations**: on 120 development checks with two lists, the quotes of 92.3%
+  of the 1,680 explained papers were found verbatim in the abstract, 6.6% matched an
+  abstract sentence, and 1.1% were unverified. The source paper was rated high in all
+  102 checks that explained it
+  ([details](docs/reports/phase2-two-lists.md#section-b-without-repeats-2026-10-19)).
 - **A view of recall against cost** is in
   [docs/img/recall_vs_cost.png](docs/img/recall_vs_cost.png).
 
