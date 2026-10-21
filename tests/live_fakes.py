@@ -17,7 +17,9 @@ from rk.text import content_stems, reconstruct_abstract
 SEARCH_CREDITS = 10  # what one keyword or semantic search costs (1 credit = $0.0001)
 LIST_COST = 0.0001  # what a list call by id reports (meta.cost_usd)
 RESETS_IN_S = 3600
-SEARCH_MAX_CHARS = 1500  # OpenAlex rejects a longer search (HTTP 400, seen 2026-10-21)
+# OpenAlex rejects a longer search (HTTP 400, seen 2026-10-21). Its message counts
+# characters; we take the stricter reading, UTF-8 bytes (decided 2026-10-21).
+SEARCH_MAX_BYTES = 1500
 
 
 def oa_work(record: dict[str, Any], published: str = "2025-03-01", **extra: Any) -> dict[str, Any]:
@@ -51,7 +53,7 @@ class FakeLiveOpenAlex:
     `hide_from_semantic`. Both apply has_abstract, type (unless `honour_types`
     is off) and to_publication_date, honour per_page and select, report
     meta.cost_usd, and reject what OpenAlex rejects (semantic per_page over 50, a
-    search longer than SEARCH_MAX_CHARS) with HTTP 400. `fail_with` status codes are
+    search longer than SEARCH_MAX_BYTES in UTF-8) with HTTP 400. `fail_with` status codes are
     returned first, one per request.
 
     With `budget_credits`, each search costs SEARCH_CREDITS of a daily budget,
@@ -121,12 +123,9 @@ class FakeLiveOpenAlex:
         per_page = int(params.get("per_page", "25"))
         filters = params.get("filter", "")
         searching = "search" in params or "search.semantic" in params
-        query = params.get("search", params.get("search.semantic", ""))
-        if len(query) > SEARCH_MAX_CHARS:  # OpenAlex's reply, 2026-10-21
-            message = (
-                f"Your search is too long ({len(query)} characters; the limit is "
-                f"{SEARCH_MAX_CHARS})."
-            )
+        size = len(params.get("search", params.get("search.semantic", "")).encode("utf-8"))
+        if size > SEARCH_MAX_BYTES:  # as OpenAlex replied on 2026-10-21, in bytes
+            message = f"Your search is too long ({size} bytes; the limit is {SEARCH_MAX_BYTES})."
             return httpx.Response(400, json={"error": "Search query too long", "message": message})
         if not searching and "ids.openalex:" in filters:
             if self.fail_lookups:

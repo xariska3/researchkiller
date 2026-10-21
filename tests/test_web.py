@@ -195,12 +195,13 @@ def test_a_long_idea_is_checked_with_a_visible_warning(client: TestClient) -> No
     status = check(client, long_idea())
     assert status["status"] == DONE
     (cut,) = status["warnings"]
-    assert cut.startswith("Your idea is longer than OpenAlex's 1,500-character search limit")
+    assert cut.startswith("Your idea is longer than OpenAlex's search limit of 1,500 bytes")
     assert str(escape(cut)) in client.get(f"/checks/{status['id']}").text
-    # The form counts characters next to words, against live.max_search_chars.
+    # The form counts characters next to words; its note uses live.max_search_bytes.
     front = client.get("/").text
     assert '<div id="count" class="muted">0 words · 0 characters</div>' in front
-    assert "const maxSearchChars = 1500;" in front
+    assert "const maxSearchBytes = 1500;" in front
+    assert "new TextEncoder().encode(idea).length" in front
 
 
 def test_the_idea_length_is_checked_with_a_plain_message(client: TestClient) -> None:

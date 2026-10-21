@@ -51,18 +51,21 @@ const button = document.getElementById("submit");
 const progress = document.getElementById("progress");
 const stage = document.getElementById("stage");
 const error = document.getElementById("error");
-const maxSearchChars = {{ max_search_chars }};  // live.max_search_chars
+const maxSearchBytes = {{ max_search_bytes }};  // live.max_search_bytes
 
-// The idea's words and characters as the server counts them (trimmed; code points).
+// The idea's words and characters as the server counts them (trimmed; code points),
+// and a note once its UTF-8 bytes are over OpenAlex's search limit.
 text.addEventListener("input", () => {
   const idea = text.value.trim();
   const n = idea ? idea.split(/\s+/).length : 0;
   const chars = Array.from(idea).length;
+  const bytes = new TextEncoder().encode(idea).length;
   let line = n + (n === 1 ? " word" : " words") + " · " + chars.toLocaleString("en")
     + (chars === 1 ? " character" : " characters");
-  if (chars > maxSearchChars) {
-    line += " (over OpenAlex's " + maxSearchChars.toLocaleString("en")
-      + "-character search limit: the first search will use only the first part)";
+  if (bytes > maxSearchBytes) {
+    line += " (" + bytes.toLocaleString("en") + " bytes, over OpenAlex's search limit of "
+      + maxSearchBytes.toLocaleString("en")
+      + " bytes: the first search will use only the first part)";
   }
   count.textContent = line;
 });

@@ -19,7 +19,7 @@ import pytest
 import yaml
 from bench_data import ABSTRACTS, GOOD, T1, T2, T3, TITLES, corpus_records, judge_reply, target_rows
 from conftest import TEST_API_KEY_ENV, FakeEncoder, FakeLLM
-from live_fakes import LIST_COST, SEARCH_MAX_CHARS, FakeLiveOpenAlex, oa_work
+from live_fakes import LIST_COST, SEARCH_MAX_BYTES, FakeLiveOpenAlex, oa_work
 from pydantic import ValidationError
 from test_live_eval import (
     AGENT_QUERY,
@@ -693,14 +693,31 @@ class AgentQueryRejected(AgentQueryTimesOut):
 
 
 class IdeaSearchRejected(FakeLiveOpenAlex):
-    """OpenAlex rejecting every search but the agent's (HTTP 400): the idea's own search."""
+    """OpenAlex rejecting every search but the agent's (HTTP 400): the idea's own search.
+
+    Those requests are recorded too.
+    """
+
+    status = 400
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         params = dict(request.url.params)
         query = params.get("search", params.get("search.semantic"))
         if query is not None and query != AGENT_QUERY:
-            return httpx.Response(400, json={"error": "Invalid query"})
+            self.requests.append(params)
+            return httpx.Response(self.status, json={"error": "simulated"})
         return super().handle(request)
+
+
+class IdeaSearchTimesOut(IdeaSearchRejected):
+    """OpenAlex timing out (HTTP 504) on every search but the agent's."""
+
+    status = 504
+
+
+def idea_attempts(fake: FakeLiveOpenAlex) -> int:
+    """How many times the fake was sent the search of GOOD[T1]."""
+    return sum(r.get("search.semantic") == GOOD[T1] for r in fake.requests)
 
 
 LONG_TAIL = "Finally, we will release the code, the data and every prompt under an open licence."
@@ -710,9 +727,16 @@ def long_idea() -> str:
     """GOOD[T1] made longer than OpenAlex's search limit; it ends with LONG_TAIL."""
     filler = " We will also compare the method with strong baselines on several more datasets."
     text = GOOD[T1]
-    while len(text) + len(LONG_TAIL) < SEARCH_MAX_CHARS + 400:
+    while len(text) + len(LONG_TAIL) < SEARCH_MAX_BYTES + 400:
         text += filler
     return f"{text} {LONG_TAIL}"
+
+
+LONG_IDEA_WARNING = (
+    "Your idea is longer than OpenAlex's search limit of 1,500 bytes (about 1,500 characters "
+    "of English text), so the first search used its first {n:,} characters; the rest of the "
+    "check used the full text."
+)
 
 
 def sent_queries(fake: FakeLiveOpenAlex) -> list[str]:
@@ -765,10 +789,10 @@ def test_a_rejected_search_of_the_idea_is_skipped_unless_nothing_else_is_found(
     # Nothing else found (a cache of its own, without the agent's results): the check fails.
     with pytest.raises(OpenAlexError, match="the agent's searches found nothing: HTTP 400"):
         check(nothing, fake=IdeaSearchRejected([]))
-    # Another failure of the idea's own search still fails the check (504: retried, then
+    # Another failure of the idea's own search still fails the check (503: retried, then
     # given up), and evaluation fails on a rejected one.
-    with pytest.raises(OpenAlexError, match="HTTP 504"):
-        check(cfg, fake=FakeLiveOpenAlex(works(), fail_with=[504] * 6))
+    with pytest.raises(OpenAlexError, match="HTTP 503"):
+        check(cfg, fake=FakeLiveOpenAlex(works(), fail_with=[503] * 6))
     with pytest.raises(OpenAlexError, match="HTTP 400"):
         run_check(
             CheckRequest(text=GOOD[T1]),
@@ -782,11 +806,49 @@ def test_a_rejected_search_of_the_idea_is_skipped_unless_nothing_else_is_found(
         )
 
 
+def test_a_timed_out_search_of_the_idea_is_retried_once_then_skipped(
+    cfg: Config, tmp_path: Path
+) -> None:
+    assert cfg.live is not None
+    nothing = replace(cfg, live=replace(cfg.live, cache_path=tmp_path / "empty.sqlite"))
+    fake = IdeaSearchTimesOut(works())
+    run = check(cfg, fake=fake)
+    (skipped,) = [w for w in run.report.warnings if "search of your idea" in w]
+    assert skipped.startswith(
+        "OpenAlex timed out on the search of your idea, so it was skipped (semantic search: "
+        "giving up after 2 attempts"
+    )
+    assert idea_attempts(fake) == 2  # one retry
+    assert run.report.papers and {s.query for s in run.result.searches} == {AGENT_QUERY}
+    # Evaluation keeps the client's usual 5 retries, then fails.
+    fake = IdeaSearchTimesOut(works())
+    with pytest.raises(OpenAlexError, match="giving up after 6 attempts"):
+        run_check(
+            CheckRequest(text=GOOD[T1]),
+            cfg,
+            search=_search(cfg, fake),
+            encoder=FakeEncoder(),
+            agent=fake_agent(),
+            reranker=FakeLLM(original_first),
+            explainer=FakeLLM(explainer_reply),
+            strict=True,
+        )
+    assert idea_attempts(fake) == 6
+    # Nothing else found (a cache of its own): the check fails.
+    with pytest.raises(OpenAlexError, match="timed out on the search of your idea, and the"):
+        check(nothing, fake=IdeaSearchTimesOut([]))
+    # One timeout, then an answer: the retry finds it, and nothing is skipped.
+    fake = FakeLiveOpenAlex(works(), fail_with=[504])
+    retried = check(cfg, fake=fake)
+    assert idea_attempts(fake) == 2 and not retried.report.warnings
+    assert GOOD[T1] in {s.query for s in retried.result.searches}
+
+
 def test_an_idea_over_the_search_limit_runs_and_warns(cfg: Config) -> None:
-    assert cfg.live is not None and cfg.live.max_search_chars == SEARCH_MAX_CHARS
+    assert cfg.live is not None and cfg.live.max_search_bytes == SEARCH_MAX_BYTES
     text = long_idea()
-    sent = search_text(text, SEARCH_MAX_CHARS)
-    assert len(text) > SEARCH_MAX_CHARS and text.startswith(sent) and sent.endswith(".")
+    sent = search_text(text, SEARCH_MAX_BYTES)
+    assert len(text) > SEARCH_MAX_BYTES and text.startswith(sent) and sent.endswith(".")
     fake = FakeLiveOpenAlex(works())  # rejects a search over the limit, as OpenAlex does
     agent, reranker, explainer = fake_agent(), FakeLLM(original_first), FakeLLM(explainer_reply)
     run = run_check(
@@ -798,11 +860,7 @@ def test_an_idea_over_the_search_limit_runs_and_warns(cfg: Config) -> None:
         reranker=reranker,
         explainer=explainer,
     )
-    warning = (
-        "Your idea is longer than OpenAlex's 1,500-character search limit, so the first "
-        f"search used its first {len(sent):,} characters; the rest of the check used the "
-        "full text."
-    )
+    warning = LONG_IDEA_WARNING.format(n=len(sent))
     assert run.report.warnings == [warning]
     assert run.report.papers and run.report.explainer == EXPLAINED
     assert sent_queries(fake)[0] == sent and LONG_TAIL not in sent
@@ -839,8 +897,9 @@ def test_no_query_is_sent_longer_than_the_search_limit(cfg: Config) -> None:
         explainer=FakeLLM(explainer_reply),
     )
     queries = sent_queries(fake)
-    assert len(queries) == 2 and all(len(q) <= SEARCH_MAX_CHARS for q in queries)
-    assert queries[1] == search_text(long_query, SEARCH_MAX_CHARS)  # cut, not skipped
+    assert len(queries) == 2
+    assert all(len(q.encode("utf-8")) <= SEARCH_MAX_BYTES for q in queries)
+    assert queries[1] == search_text(long_query, SEARCH_MAX_BYTES)  # cut, not skipped
     assert [s.query for s in run.result.searches] == [long_idea(), long_query]
     assert len(run.report.warnings) == 1  # the idea's: an agent query is cut silently
 

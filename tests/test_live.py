@@ -18,22 +18,29 @@ import numpy as np
 import pytest
 from bench_data import ABSTRACTS, GOOD, T1, T2, T3, TITLES, corpus_records, target_rows
 from conftest import FakeEncoder, FakeLLM, corpus_config_dict
-from live_fakes import SEARCH_MAX_CHARS, WORKS, FakeLiveOpenAlex, oa_work
+from live_fakes import SEARCH_MAX_BYTES, WORKS, FakeLiveOpenAlex, oa_work
 
 from rk.cli import load_env_file
 from rk.config import Config, ConfigError, LiveConfig, config_from_dict, load_config
-from rk.corpus import OpenAlexBudgetExhausted, freeze
+from rk.corpus import OpenAlexBudgetExhausted, OpenAlexError, freeze
 from rk.live.openalex_search import (
     KEYWORD,
     SELECT,
     SEMANTIC,
+    SENTENCE_CUT_MAX_LOSS,
     Budget,
     LiveSearchClient,
     OpenAlexCache,
     live_record,
     search_text,
 )
-from rk.live.pipeline import CheckCostCapExceeded, CheckLedger, LiveRanker, live_search
+from rk.live.pipeline import (
+    CheckCostCapExceeded,
+    CheckLedger,
+    LiveRanker,
+    live_search,
+    long_text_warning,
+)
 from rk.live.pool import CandidatePool, Hit, match_original, same_author, title_jaccard
 from rk.retrieval import (
     BM25Retriever,
@@ -113,7 +120,7 @@ def test_the_project_config_has_a_live_section() -> None:
     )
     assert live.work_types == LiveConfig(cache_path=Path("x")).work_types  # the default
     assert live.cache_ttl_days == 7
-    assert live.max_search_chars == LiveConfig(cache_path=Path("x")).max_search_chars == 1500
+    assert live.max_search_bytes == LiveConfig(cache_path=Path("x")).max_search_bytes == 1500
 
 
 def test_the_live_section_is_optional(tmp_path: Path) -> None:
@@ -128,7 +135,7 @@ def test_the_live_section_is_optional(tmp_path: Path) -> None:
         ("explain_top_k", 6, "explain_top_k"),
         ("cost_cap_per_check", 0, "cost_cap_per_check"),
         ("keyword_max_words", 0, "keyword_max_words"),
-        ("max_search_chars", 0, "max_search_chars"),
+        ("max_search_bytes", 3, "max_search_bytes"),
         ("work_types", [], "work_types"),
         ("work_types", ["article", " dataset"], "work_types"),
         ("cache_ttl_days", 0, "cache_ttl_days"),
@@ -171,21 +178,27 @@ def test_keyword_search_sends_the_documented_parameters(cfg: Config) -> None:
     )
 
 
-def test_no_search_sends_more_than_max_search_chars(cfg: Config) -> None:
-    assert cfg.live is not None and cfg.live.max_search_chars == SEARCH_MAX_CHARS
+def test_no_search_sends_more_than_max_search_bytes(cfg: Config) -> None:
+    assert cfg.live is not None and cfg.live.max_search_bytes == SEARCH_MAX_BYTES
     fake = FakeLiveOpenAlex()  # rejects a longer search with HTTP 400, as OpenAlex does
     text = "memory " * 600  # 4,200 characters, no sentence end
     client = _client(cfg, fake)
     response = client.search(text, SEMANTIC)
     client.search(text, KEYWORD)
     semantic, keyword = fake.requests
-    assert semantic["search.semantic"] == keyword["search"] == search_text(text, SEARCH_MAX_CHARS)
+    assert semantic["search.semantic"] == keyword["search"] == search_text(text, SEARCH_MAX_BYTES)
     assert len(semantic["search.semantic"]) == 1497  # 214 whole words, cut at a space
     assert (semantic["per_page"], semantic["filter"]) == ("50", f"has_abstract:true,{TYPES}")
     assert response.query == text  # the result keeps the full query
     assert response.records  # memory appears in several abstracts
     client.search(text, SEMANTIC)  # the cut query is the cache key
     assert len(fake.requests) == 2
+    # The limit is in UTF-8 bytes: 1,249 characters of "café" use 1,499 of them.
+    accented = "café " * 400
+    client.search(accented, SEMANTIC)
+    sent = fake.requests[-1]["search.semantic"]
+    assert sent == ("café " * 250).rstrip()
+    assert (len(sent), len(sent.encode("utf-8"))) == (1249, 1499)
 
 
 def test_a_long_query_is_cut_at_its_last_sentence_that_fits() -> None:
@@ -200,6 +213,67 @@ def test_a_long_query_is_cut_at_its_last_sentence_that_fits() -> None:
     assert search_text(text, 35) == "We extend BERT (Devlin et al. 2019)"  # a space at 35
     assert search_text(text, 33) == "We extend BERT (Devlin et al."  # inside "2019)"
     assert search_text("x" * 20, 5) == "xxxxx"
+
+
+def test_a_cut_counts_bytes_and_never_splits_a_character() -> None:
+    assert search_text("é" * 1000, 1500) == "é" * 750  # 2 bytes each
+    assert search_text("é" * 1000, 1501) == "é" * 750  # not half of the 751st
+    assert search_text("😀" * 10, 7) == "😀"  # 4 bytes each
+    text = "Ünïcödé wörds hère. Thé sécond sentence"
+    assert search_text(text, len(text)) == "Ünïcödé wörds hère."  # 39 characters, 47 bytes
+    assert search_text(text, len(text.encode("utf-8"))) == text
+
+
+def test_a_sentence_cut_that_loses_over_300_characters_falls_back_to_a_word() -> None:
+    assert SENTENCE_CUT_MAX_LOSS == 300
+    text = "A short opening. Then " + "word " * 120  # a sentence, then 605 characters, no end
+    assert search_text(text, 300) == "A short opening."  # 280 characters short of the word cut
+    cut = search_text(text, 400)  # the sentence cut would be 380 short of it
+    assert cut == text[:396] and cut.endswith(" word")
+
+
+def test_timeout_retries_caps_the_retries_of_a_timeout_only(cfg: Config) -> None:
+    assert cfg.live is not None
+    fake = FakeLiveOpenAlex(fail_with=[504, 504])
+    with pytest.raises(OpenAlexError, match="giving up after 2 attempts .*HTTP 504") as caught:
+        _client(cfg, fake).search("memory", SEMANTIC, timeout_retries=1)
+    assert caught.value.timed_out and len(fake.requests) == 2
+    # Other errors keep the usual retries; without the cap, so do timeouts.
+    fake = FakeLiveOpenAlex(fail_with=[503, 429, 504])
+    assert _client(cfg, fake).search("memory", SEMANTIC, timeout_retries=1).records
+    fake = FakeLiveOpenAlex(fail_with=[504] * 5)
+    assert _client(cfg, fake).search("memory", KEYWORD).records and len(fake.requests) == 6
+    # No answer in time is a timeout too; a rejected request isn't.
+    attempts: list[httpx.Request] = []
+
+    def silent(request: httpx.Request) -> httpx.Response:
+        attempts.append(request)
+        raise httpx.ReadTimeout("no answer", request=request)
+
+    client = LiveSearchClient(
+        cfg.live,
+        OpenAlexCache(":memory:"),
+        transport=httpx.MockTransport(silent),
+        sleep=lambda seconds: None,
+        clock=lambda: 0.0,
+    )
+    with pytest.raises(OpenAlexError, match="ReadTimeout") as caught:
+        client.search("memory", SEMANTIC, timeout_retries=1)
+    assert caught.value.timed_out and len(attempts) == 2
+    with pytest.raises(OpenAlexError, match="HTTP 400") as caught:
+        _client(cfg, FakeLiveOpenAlex(fail_with=[400])).search("accuracy", SEMANTIC)
+    assert (caught.value.status, caught.value.timed_out) == (400, False)
+
+
+def test_the_long_idea_warning_counts_bytes(cfg: Config) -> None:
+    assert cfg.live is not None
+    assert long_text_warning("Café au lait. " * 100, cfg.live) is None  # exactly 1,500 bytes
+    idea = "Café au lait. " * 105  # 1,470 characters, 1,575 bytes
+    assert long_text_warning(idea, cfg.live) == (
+        "Your idea is longer than OpenAlex's search limit of 1,500 bytes (about 1,500 "
+        "characters of English text), so the first search used its first 1,399 characters; "
+        "the rest of the check used the full text."
+    )
 
 
 def test_published_before_filters_on_the_day_before(cfg: Config) -> None:

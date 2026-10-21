@@ -177,9 +177,10 @@ class LiveConfig:
     # Keyword search ANDs every word, so a longer query (the user's own text) gets
     # semantic search only.
     keyword_max_words: int = 32
-    # OpenAlex rejects a longer search (HTTP 400), so a longer query is cut before it is
-    # sent (rk.live.openalex_search.search_text); the check uses the full text otherwise.
-    max_search_chars: int = 1500
+    # OpenAlex rejects a longer search (HTTP 400), so a longer query is cut to this many
+    # bytes of UTF-8 before it is sent (rk.live.openalex_search.search_text); the check
+    # uses the full text otherwise.
+    max_search_bytes: int = 1500
     max_pool_size: int = 500  # distinct candidates kept, in order of arrival
     top_k: int = 20  # kept after the local rerank
     explain_top_k: int = 10  # papers with a snippet and an explanation (Step 5)
@@ -230,7 +231,7 @@ class LiveConfig:
             f"semantic_results_per_query must be in [1, {SEMANTIC_MAX_RESULTS}]",
         )
         _require(self.keyword_max_words >= 1, "keyword_max_words must be >= 1")
-        _require(self.max_search_chars >= 1, "max_search_chars must be >= 1")
+        _require(self.max_search_bytes >= 4, "max_search_bytes must be >= 4 (one character)")
         _require(self.max_pool_size >= 1, "max_pool_size must be >= 1")
         _require(self.top_k >= 1, "top_k must be >= 1")
         _require(1 <= self.explain_top_k <= self.top_k, "explain_top_k must be in [1, top_k]")

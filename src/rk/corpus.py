@@ -88,12 +88,16 @@ MANIFEST_FILE = "manifest.json"
 class OpenAlexError(RuntimeError):
     """An OpenAlex request failed: rejected, malformed, or retries exhausted.
 
-    `status` is the HTTP status of a rejected request (e.g. 400), None otherwise.
+    `status` is the HTTP status of a rejected request (e.g. 400), None otherwise;
+    `timed_out` is whether the last attempt timed out (HTTP 504, or no answer in time).
     """
 
-    def __init__(self, message: str, *, status: int | None = None) -> None:
+    def __init__(
+        self, message: str, *, status: int | None = None, timed_out: bool = False
+    ) -> None:
         super().__init__(message)
         self.status = status
+        self.timed_out = timed_out
 
 
 class OpenAlexBudgetExhausted(OpenAlexError):
@@ -162,18 +166,27 @@ class OpenAlexClient:
         mailto = os.environ.get(corpus.mailto_env) if corpus.mailto_env else None
         return cls(api_key=api_key or None, mailto=mailto or None, **kwargs)
 
-    def get_works(self, params: dict[str, str]) -> dict[str, Any]:
-        """One GET /works page, throttled, retrying 429, 5xx and transport errors."""
+    def get_works(
+        self, params: dict[str, str], *, timeout_retries: int | None = None
+    ) -> dict[str, Any]:
+        """One GET /works page, throttled, retrying 429, 5xx and transport errors.
+
+        With `timeout_retries`, a timeout (HTTP 504, or no answer in time) is retried
+        at most that many times, however many retries are left for other errors.
+        """
         if self._mailto:
             params = {**params, "mailto": self._mailto}
+        timeouts = 0
         for attempt in range(self.max_retries + 1):
             self._throttle()
             self.calls += 1
             retry_after: float | None = None
+            timed_out = False
             try:
                 response = self._http.get("/works", params=params)
             except httpx.TransportError as exc:  # timeouts are transport errors in httpx
                 problem = f"{type(exc).__name__}: {exc}"
+                timed_out = isinstance(exc, httpx.TimeoutException)
             else:
                 status = response.status_code
                 if status == 429 and self._budget_spent(response):
@@ -186,6 +199,7 @@ class OpenAlexClient:
                 if status == 429 or status >= 500:
                     problem = f"HTTP {status}: {response.text[:300]}"
                     retry_after = retry_after_seconds(response)
+                    timed_out = status == 504
                 elif response.is_error:
                     raise OpenAlexError(
                         f"HTTP {status} for filter {params.get('filter')!r}: {response.text[:500]}",
@@ -199,10 +213,13 @@ class OpenAlexClient:
                     if not isinstance(data, dict):
                         raise OpenAlexError(f"unexpected response: {str(data)[:300]}")
                     return data
-            if attempt == self.max_retries:
+            timeouts += timed_out
+            timeouts_spent = timeout_retries is not None and timeouts > timeout_retries
+            if attempt == self.max_retries or (timed_out and timeouts_spent):
                 raise OpenAlexError(
                     f"giving up after {attempt + 1} attempts for filter "
-                    f"{params.get('filter')!r}; last error: {problem}"
+                    f"{params.get('filter')!r}; last error: {problem}",
+                    timed_out=timed_out,
                 )
             delay = self.backoff_base * 2**attempt
             if retry_after is not None:
