@@ -58,6 +58,10 @@ Good to know:
   runs on a CPU, but I haven't timed that.
 - **Access**: the server listens on 127.0.0.1 only (`--host` to change it) and has
   no accounts.
+- **Long ideas**: OpenAlex rejects searches longer than 1,500 characters. So the
+  search of a longer idea sends only its start, up to 1,500 bytes of UTF-8
+  (`live.max_search_bytes`; accented and non-Latin letters take 2 to 4 bytes each), with
+  a warning. The agent, the reranker and the explainer read the full text.
 - **Stored checks**: checks are kept in `data/web.sqlite`. The same idea, mode and
   date within 7 days shows the stored result, at no cost.
 - **Daily cap**: new checks are refused once a UTC day's spending could pass $1.00

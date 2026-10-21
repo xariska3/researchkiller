@@ -56,6 +56,7 @@ from rk.live.openalex_search import (
     LiveSearchClient,
     SearchResponse,
     WorkDetails,
+    search_text,
 )
 from rk.live.pool import CandidatePool, Hit, same_text
 from rk.live.reranker import (
@@ -92,6 +93,8 @@ SKIPPED = "skipped"  # no candidates, so no call
 # Stages a check reports to its `progress` callback (the web app shows them).
 SEARCHING = "searching"  # the user's own search; then "agent query n of m"
 RERANKING = "reranking"
+# The tool retries a timeout of the idea's own search this many times, then skips it.
+OWN_SEARCH_TIMEOUT_RETRIES = 1
 
 
 class CheckCostCapExceeded(RuntimeError):
@@ -175,8 +178,11 @@ class LiveRanker:
     """The agent's search tool (an rk.retrieval Ranker): search OpenAlex, then rank the pool.
 
     With `skip_failed` (the tool, not evaluation), a failed agent search is skipped with
-    a warning (`warnings`) instead of failing the check; the user's own search (the
-    first query) still fails it. `progress` is told the stage of each query.
+    a warning (`warnings`) instead of failing the check. The user's own search (the
+    first query) is skipped the same way only if OpenAlex rejects it (HTTP 400) or it
+    times out again after OWN_SEARCH_TIMEOUT_RETRIES retries, and `own_search_error`
+    keeps the error; any other failure of it fails the check. `progress` is told the
+    stage of each query.
     """
 
     def __init__(
@@ -202,6 +208,7 @@ class LiveRanker:
         self.queries: list[str] = []
         self.searches: list[SearchResponse] = []
         self.warnings: list[str] = []
+        self.own_search_error: OpenAlexError | None = None  # the user's search, skipped
 
     def kinds(self, query: str) -> list[str]:
         """The searches a query gets: keyword unless it's long, semantic if enabled."""
@@ -214,17 +221,30 @@ class LiveRanker:
         if self.progress is not None:
             agent = f"agent query {query_index} of {max(self.max_queries - 1, query_index)}"
             self.progress(SEARCHING if query_index == 0 else agent)
+        own = query_index == 0
+        timeout_retries = OWN_SEARCH_TIMEOUT_RETRIES if self.skip_failed and own else None
         for kind in self.kinds(query):
             self.ledger.require(SEARCH_COST_USD, f"a {kind} search")
             try:
-                response = self.search.search(query, kind, before=self.before)
-            except OpenAlexError as exc:
-                if not self.skip_failed or query_index == 0:
-                    raise
-                self.warnings.append(
-                    f"An agent search failed and was skipped ({kind} search for "
-                    f"{query[:80]!r}: {str(exc)[:200]}); the results come from the others."
+                response = self.search.search(
+                    query, kind, before=self.before, timeout_retries=timeout_retries
                 )
+            except OpenAlexError as exc:
+                rejected = exc.status == 400  # the request itself: sending it again can't help
+                if not self.skip_failed or (own and not (rejected or exc.timed_out)):
+                    raise
+                if own:
+                    self.own_search_error = self.own_search_error or exc
+                    what = "timed out on" if exc.timed_out else "rejected"
+                    self.warnings.append(
+                        f"OpenAlex {what} the search of your idea, so it was skipped ({kind} "
+                        f"search: {str(exc)[:200]}); the results come from the agent's searches."
+                    )
+                else:
+                    self.warnings.append(
+                        f"An agent search failed and was skipped ({kind} search for "
+                        f"{query[:80]!r}: {str(exc)[:200]}); the results come from the others."
+                    )
                 continue
             self.ledger.add_search(response)
             self.searches.append(response)
@@ -335,6 +355,19 @@ def _candidate_dict(c: Candidate) -> dict[str, Any]:
         "publication_date": c.record["publication_date"],
         "found_by": [asdict(h) for h in c.hits],
     }
+
+
+def long_text_warning(text: str, live: LiveConfig) -> str | None:
+    """The warning for an idea OpenAlex's search limit cuts (search_text), if it does."""
+    sent = search_text(text, live.max_search_bytes)
+    if sent == text:
+        return None
+    limit = f"{live.max_search_bytes:,}"
+    return (
+        f"Your idea is longer than OpenAlex's search limit of {limit} bytes (about {limit} "
+        f"characters of English text), so the first search used its first {len(sent):,} "
+        "characters; the rest of the check used the full text."
+    )
 
 
 def proposal_records(text: str, searches: Sequence[SearchResponse]) -> list[Record]:
@@ -527,9 +560,13 @@ def live_search(
 
     `before` restricts the search to works published before that date; `fusion`
     is how the final pool is ranked (rk.live.fusion; B5's by default). With
-    `skip_failed_searches` (the tool), a failed agent search is skipped with a warning
-    (LiveRanker); evaluation leaves it off, so the check fails. `progress` gets each
-    stage (SEARCHING, then "agent query n of m").
+    `skip_failed_searches` (the tool), a failed agent search, or a search of `text`
+    that OpenAlex rejects (HTTP 400) or that times out twice, is skipped with a warning
+    (LiveRanker); the check still fails if `text`'s search was skipped and no other
+    search found anything. Evaluation leaves it off, so the check fails. Every search
+    sends at most live.max_search_bytes (search_text); a `text` that is cut gets a
+    warning, and everything else uses it in full. `progress` gets each stage
+    (SEARCHING, then "agent query n of m").
     """
     live = cfg.live
     if live is None:
@@ -557,8 +594,18 @@ def live_search(
         name="B5-live",
     )
     trace = b5.retrieve(text).trace
+    skipped = ranker.own_search_error
+    if skipped is not None and not len(pool):
+        what = "timed out on" if skipped.timed_out else "rejected"
+        raise OpenAlexError(
+            f"OpenAlex {what} the search of your idea, and the agent's searches found "
+            f"nothing: {skipped}",
+            status=skipped.status,
+            timed_out=skipped.timed_out,
+        ) from skipped
     l1 = _l1(text, ranker.searches, encoder, live) if fusion == L1_L5 else []
     candidates = final_candidates(pool, trace.queries, fusion, live.top_k, l1=l1)
+    cut = long_text_warning(text, live)
     return LiveSearchResult(
         text=text,
         before=before,
@@ -573,7 +620,7 @@ def live_search(
         encoder_device=encoder.device,
         pool=pool,
         fusion=fusion,
-        warnings=tuple(ranker.warnings),
+        warnings=(*([cut] if cut else []), *ranker.warnings),
     )
 
 
@@ -638,7 +685,10 @@ def quick_check(
     """The quick check, L1: one OpenAlex semantic search of `text`, reranked locally. No LLM.
 
     The results go into a pool of their own, ranked by its hybrid ranker for `text`
-    (the final pool ranked by the proposal alone), as live-eval's L1 ranks them.
+    (the final pool ranked by the proposal alone), as live-eval's L1 ranks them. The
+    search sends at most live.max_search_bytes of `text` (with a warning if it is cut);
+    the ranking uses all of it. A failed search fails the check: there is no other, so
+    it keeps the client's usual retries.
     """
     live = cfg.live
     if live is None:
@@ -652,6 +702,7 @@ def quick_check(
     response = search.search(text, SEMANTIC, before=before)
     ledger.add_search(response)
     pool.add(response.records, query_index=0, kind=SEMANTIC)
+    cut = long_text_warning(text, live)
     return LiveSearchResult(
         text=text,
         before=before,
@@ -666,6 +717,7 @@ def quick_check(
         encoder_device=encoder.device,
         pool=pool,
         fusion=PROPOSAL_ONLY,
+        warnings=(cut,) if cut else (),
     )
 
 
@@ -683,10 +735,12 @@ def default_check(
 ) -> LiveSearchResult:
     """The tool's default check, L5r: live_search ranked by DEFAULT_FUSION, then with_rerank.
 
-    A failed agent search is skipped, and a rerank call that fails or can't be read
-    leaves L5w's order, each with a warning in the result's `warnings`. With `strict`
-    (evaluation), a failed agent search or rerank call raises instead. With
-    rerank.two_lists, the rerank call returns two lists (with_rerank's `two_lists`).
+    A failed agent search, or a search of the idea that is rejected (HTTP 400) or times
+    out twice when the agent's searches still find something, is skipped, and a rerank
+    call that fails or can't be read leaves L5w's order, each with a warning in the
+    result's `warnings`. With `strict` (evaluation), a failed search or rerank call
+    raises instead. With rerank.two_lists, the rerank call returns two lists
+    (with_rerank's `two_lists`).
     """
     if cfg.rerank is None:
         raise ValueError("the default check needs the config's rerank: section")

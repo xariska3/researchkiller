@@ -17,15 +17,25 @@ and with six live probes (one Phase 1 proposal and a short query):
 - Semantic search (https://help.openalex.org/api/semantic-search/,
   https://help.openalex.org/guides/semantic-search): `search.semantic=` on
   /works embeds the query with GTE Large EN (1,024 dimensions) and ranks works
-  by cosine similarity to their embedded title and abstract. The first 2,000
-  characters are used (longer input is truncated, so we truncate before
-  sending), at most 50 results come back, and it is limited to 1 request per
+  by cosine similarity to their embedded title and abstract. The docs say the
+  first 2,000 characters are used, but longer queries are now rejected (next
+  item). At most 50 results come back, and it is limited to 1 request per
   second. Most filters work with it (not cited_by_count or the country-code
   filters); it can't be combined with another search parameter or rerank.
   Probes: per_page=100 returns HTTP 400 "per_page cannot exceed 50 for
   semantic search"; page=2 with per_page=25 returns results 26-50; the
   relevance_score is the cosine (0.79-0.93 in the probe); has_abstract:true
   works with it. The Phase 1 proposal found its original paper at rank 1.
+- Query length: OpenAlex rejects a search longer than 1,500 characters with
+  HTTP 400 ("Search query too long": "Your search is too long (1905
+  characters; the limit is 1500)"), seen on the web app's semantic searches of
+  ideas of 1,506-1,905 characters (2026-10-16 and 2026-10-21). Whether it
+  counts characters or bytes is untested, so we take the stricter reading: every
+  query, keyword or semantic, is cut to live.max_search_bytes of UTF-8 before it
+  is sent (search_text), at a character boundary. The cut is at the end of its
+  last sentence that fits, or at its last word boundary that fits when that
+  keeps more than SENTENCE_CUT_MAX_LOSS characters more. The check uses the
+  full text everywhere else.
 - Filters (https://help.openalex.org/how-to-use-the-api/get-lists-of-entities/filter-entity-lists):
   has_abstract:true keeps works with an abstract; to_publication_date:<date>
   is inclusive, so "published before D" is to_publication_date:D-1.
@@ -80,6 +90,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import time
 from collections.abc import Callable, Collection, Sequence
@@ -100,13 +111,16 @@ from rk.corpus import (
     to_record,
 )
 from rk.targets import Record
+from rk.text import sentence_spans
 
 KEYWORD, SEMANTIC = "keyword", "semantic"
 SEARCH_COST_USD = 0.001  # documented price of one keyword or semantic search call
 # The OpenAlex keywords (for the vocabulary map) and venues of a check's papers: one list
 # call by id. Searches don't select them, so that their cached responses stay valid.
 DETAILS_SELECT = "id,keywords,primary_location"
-SEMANTIC_MAX_CHARS = 2000  # OpenAlex uses only the first 2,000 characters
+# A cut query ends at its last sentence that fits unless that loses more than this many
+# characters against its last word that fits (search_text).
+SENTENCE_CUT_MAX_LOSS = 300
 KEYWORD_REQUESTS_PER_SECOND = 10.0  # the keyless limit, so it holds with or without a key
 SEMANTIC_REQUESTS_PER_SECOND = 1.0
 SELECT = (
@@ -288,6 +302,27 @@ def search_filter(before: date | None, types: Collection[str] = ()) -> str:
     return ",".join(clauses)
 
 
+def search_text(query: str, max_bytes: int) -> str:
+    """The query as a search sends it: its start, at most max_bytes long in UTF-8.
+
+    A longer query is cut at the end of its last sentence that fits (rk.text.sentences).
+    If no sentence fits, or that cut is more than SENTENCE_CUT_MAX_LOSS characters
+    shorter than the cut at its last word boundary that fits, it is cut there instead
+    (mid-word only for one word longer than the limit). No cut splits a character.
+    """
+    encoded = query.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return query
+    fits = len(encoded[:max_bytes].decode("utf-8", errors="ignore"))  # whole characters
+    head = query[: fits + 1]  # a space right after the limit ends a word that fits
+    spaces = [m.start() for m in re.finditer(r"\s", head)]
+    word = (head[: spaces[-1]].rstrip() if spaces else "") or query[:fits]
+    ends = [end for _, end in sentence_spans(query) if end <= fits]
+    if ends and len(word) - ends[-1] <= SENTENCE_CUT_MAX_LOSS:
+        return query[: ends[-1]]
+    return word
+
+
 class LiveSearchClient:
     """Keyword and semantic /works search, each throttled to its own documented rate.
 
@@ -356,12 +391,16 @@ class LiveSearchClient:
         return self._clients[KEYWORD].authenticated
 
     def params(self, query: str, kind: str, before: date | None = None) -> dict[str, str]:
-        """The /works parameters of one search, as sent and as cached."""
+        """The /works parameters of one search, as sent and as cached.
+
+        The query is cut to live.max_search_bytes (search_text).
+        """
+        text = search_text(query, self.live.max_search_bytes)
         if kind == KEYWORD:
-            search = {"search": query}
+            search = {"search": text}
             per_page = self.live.results_per_query
         elif kind == SEMANTIC:
-            search = {"search.semantic": query[:SEMANTIC_MAX_CHARS]}
+            search = {"search.semantic": text}
             per_page = min(self.live.semantic_results_per_query, SEMANTIC_MAX_RESULTS)
         else:
             raise ValueError(f"unknown search kind {kind!r}")
@@ -372,14 +411,24 @@ class LiveSearchClient:
             "select": SELECT,
         }
 
-    def search(self, query: str, kind: str, *, before: date | None = None) -> SearchResponse:
-        """One page of results for `query`, from the cache when possible."""
+    def search(
+        self,
+        query: str,
+        kind: str,
+        *,
+        before: date | None = None,
+        timeout_retries: int | None = None,
+    ) -> SearchResponse:
+        """One page of results for `query`, from the cache when possible.
+
+        `timeout_retries` caps the retries of a timeout (rk.corpus.OpenAlexClient.get_works).
+        """
         params = self.params(query, kind, before)
         hit = self.cache.get(params, max_age=self.max_age)
         if hit is None and self.offline:
             raise OpenAlexError(f"offline, and this {kind} search isn't cached: {query[:100]!r}")
         if hit is None:
-            data = self._clients[kind].get_works(params)
+            data = self._clients[kind].get_works(params, timeout_retries=timeout_retries)
             cost = _reported_cost(data)
             fetched_at = self.cache.put(params, data, cost)
         else:

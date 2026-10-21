@@ -55,6 +55,7 @@ live:
   semantic_search: true           # OpenAlex search.semantic, merged into the pool
   semantic_results_per_query: 50  # OpenAlex maximum
   keyword_max_words: 32           # longer queries (the user's text) get semantic search only
+  max_search_bytes: 1500          # UTF-8; OpenAlex rejects longer searches, so they are cut
   max_pool_size: 500              # distinct candidates; 5 queries x 100 results never exceed it
   top_k: 20                       # kept after the local hybrid rerank
   explain_top_k: 10               # snippets and the overlap explainer (Step 5)

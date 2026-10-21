@@ -167,9 +167,10 @@ def create_app(
 ) -> FastAPI:
     """The app; `store` and `services` default to the config's database and live services."""
     web = cfg.web or WebConfig()
-    if cfg.explain is None:
-        raise ValueError("the web app needs the config's explain: section")
+    if cfg.live is None or cfg.explain is None:
+        raise ValueError("the web app needs the config's live: and explain: sections")
     per_check_cap = cfg.explain.cost_cap_per_check
+    max_search_bytes = cfg.live.max_search_bytes  # the form's note on long ideas
     store = store or Store(web.db_path)
     redact = Redactor(api_key_names(cfg))
     worker = Worker(
@@ -201,6 +202,7 @@ def create_app(
             header=HEADER,
             min_words=MIN_WORDS,
             max_words=MAX_WORDS,
+            max_search_bytes=max_search_bytes,
             facets=FACETS,
             facet_labels=FACET_LABELS,
             sections={

@@ -51,6 +51,17 @@ design live, and keeps the Phase 1 benchmark as a regression test.
    Keyword search ANDs every word, so queries longer than
    `live.keyword_max_words` (32; in practice the user's text) get semantic
    search only. Details in `src/rk/live/openalex_search.py`.
+   *Found on 2026-10-21:* OpenAlex rejects a search longer than 1,500 characters
+   (HTTP 400). Three web checks of ideas of 1,506-1,905 characters failed on it.
+   Every query is now cut to `live.max_search_bytes` (1,500 bytes of UTF-8, the
+   stricter reading of the limit) before it is sent, at a character boundary. The
+   cut is at its last sentence end that fits, or at its last word boundary if
+   that keeps more than 300 characters more. A cut idea gets a warning; the
+   agent, the reranker and the explainer still get the full text. In the tool,
+   the idea's own search is skipped with a warning, like a failed agent search,
+   if OpenAlex rejects it (HTTP 400) or if it times out twice (one retry). The
+   check then fails only if no other search found anything. Agent searches that
+   time out keep the client's usual 5 retries. Evaluation stays strict.
    *Step 1 decisions:*
    - **Work types:** keep `article`, `preprint`, `conference-paper`,
      `book-chapter`, `dissertation`, `review`, `book`, `report` and (since
