@@ -86,7 +86,14 @@ MANIFEST_FILE = "manifest.json"
 
 
 class OpenAlexError(RuntimeError):
-    """An OpenAlex request failed: rejected, malformed, or retries exhausted."""
+    """An OpenAlex request failed: rejected, malformed, or retries exhausted.
+
+    `status` is the HTTP status of a rejected request (e.g. 400), None otherwise.
+    """
+
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 class OpenAlexBudgetExhausted(OpenAlexError):
@@ -181,7 +188,8 @@ class OpenAlexClient:
                     retry_after = retry_after_seconds(response)
                 elif response.is_error:
                     raise OpenAlexError(
-                        f"HTTP {status} for filter {params.get('filter')!r}: {response.text[:500]}"
+                        f"HTTP {status} for filter {params.get('filter')!r}: {response.text[:500]}",
+                        status=status,
                     )
                 else:
                     try:

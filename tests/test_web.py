@@ -28,7 +28,7 @@ from fastapi.testclient import TestClient
 from live_fakes import FakeLiveOpenAlex
 from markupsafe import escape
 from sqlalchemy import update
-from test_explain import VENUE_OF_T1, config_dict, explainer_reply, works
+from test_explain import VENUE_OF_T1, config_dict, explainer_reply, long_idea, works
 from test_live_eval import AGENT_QUERY, _search
 from test_live_eval import agent as fake_agent
 from test_rerank import CONTRIBUTION_LINE, METHODS_LINE, original_first, two_lists_reply
@@ -189,6 +189,18 @@ def test_a_quick_check_makes_no_llm_call(client: TestClient, fakes: Fakes) -> No
     report = CheckReport.model_validate(status["report"])
     assert report.mode == "quick" and all(p.explanation is None for p in report.papers)
     assert report.papers[0].snippet is not None
+
+
+def test_a_long_idea_is_checked_with_a_visible_warning(client: TestClient) -> None:
+    status = check(client, long_idea())
+    assert status["status"] == DONE
+    (cut,) = status["warnings"]
+    assert cut.startswith("Your idea is longer than OpenAlex's 1,500-character search limit")
+    assert str(escape(cut)) in client.get(f"/checks/{status['id']}").text
+    # The form counts characters next to words, against live.max_search_chars.
+    front = client.get("/").text
+    assert '<div id="count" class="muted">0 words · 0 characters</div>' in front
+    assert "const maxSearchChars = 1500;" in front
 
 
 def test_the_idea_length_is_checked_with_a_plain_message(client: TestClient) -> None:

@@ -18,7 +18,7 @@ import numpy as np
 import pytest
 from bench_data import ABSTRACTS, GOOD, T1, T2, T3, TITLES, corpus_records, target_rows
 from conftest import FakeEncoder, FakeLLM, corpus_config_dict
-from live_fakes import WORKS, FakeLiveOpenAlex, oa_work
+from live_fakes import SEARCH_MAX_CHARS, WORKS, FakeLiveOpenAlex, oa_work
 
 from rk.cli import load_env_file
 from rk.config import Config, ConfigError, LiveConfig, config_from_dict, load_config
@@ -27,11 +27,11 @@ from rk.live.openalex_search import (
     KEYWORD,
     SELECT,
     SEMANTIC,
-    SEMANTIC_MAX_CHARS,
     Budget,
     LiveSearchClient,
     OpenAlexCache,
     live_record,
+    search_text,
 )
 from rk.live.pipeline import CheckCostCapExceeded, CheckLedger, LiveRanker, live_search
 from rk.live.pool import CandidatePool, Hit, match_original, same_author, title_jaccard
@@ -43,6 +43,7 @@ from rk.retrieval import (
     fuse_runs,
     load_index,
 )
+from rk.text import sentences
 
 LIVE = {
     "cache_path": "openalex.sqlite",
@@ -112,6 +113,7 @@ def test_the_project_config_has_a_live_section() -> None:
     )
     assert live.work_types == LiveConfig(cache_path=Path("x")).work_types  # the default
     assert live.cache_ttl_days == 7
+    assert live.max_search_chars == LiveConfig(cache_path=Path("x")).max_search_chars == 1500
 
 
 def test_the_live_section_is_optional(tmp_path: Path) -> None:
@@ -126,6 +128,7 @@ def test_the_live_section_is_optional(tmp_path: Path) -> None:
         ("explain_top_k", 6, "explain_top_k"),
         ("cost_cap_per_check", 0, "cost_cap_per_check"),
         ("keyword_max_words", 0, "keyword_max_words"),
+        ("max_search_chars", 0, "max_search_chars"),
         ("work_types", [], "work_types"),
         ("work_types", ["article", " dataset"], "work_types"),
         ("cache_ttl_days", 0, "cache_ttl_days"),
@@ -168,15 +171,35 @@ def test_keyword_search_sends_the_documented_parameters(cfg: Config) -> None:
     )
 
 
-def test_semantic_search_truncates_long_input_and_respects_its_page_limit(cfg: Config) -> None:
-    fake = FakeLiveOpenAlex()
-    text = "memory " * 600  # 4,200 characters
-    response = _client(cfg, fake).search(text, SEMANTIC)
-    (params,) = fake.requests
-    assert params["search.semantic"] == text[:SEMANTIC_MAX_CHARS]
-    assert (params["per_page"], params["filter"]) == ("50", f"has_abstract:true,{TYPES}")
+def test_no_search_sends_more_than_max_search_chars(cfg: Config) -> None:
+    assert cfg.live is not None and cfg.live.max_search_chars == SEARCH_MAX_CHARS
+    fake = FakeLiveOpenAlex()  # rejects a longer search with HTTP 400, as OpenAlex does
+    text = "memory " * 600  # 4,200 characters, no sentence end
+    client = _client(cfg, fake)
+    response = client.search(text, SEMANTIC)
+    client.search(text, KEYWORD)
+    semantic, keyword = fake.requests
+    assert semantic["search.semantic"] == keyword["search"] == search_text(text, SEARCH_MAX_CHARS)
+    assert len(semantic["search.semantic"]) == 1497  # 214 whole words, cut at a space
+    assert (semantic["per_page"], semantic["filter"]) == ("50", f"has_abstract:true,{TYPES}")
     assert response.query == text  # the result keeps the full query
     assert response.records  # memory appears in several abstracts
+    client.search(text, SEMANTIC)  # the cut query is the cache key
+    assert len(fake.requests) == 2
+
+
+def test_a_long_query_is_cut_at_its_last_sentence_that_fits() -> None:
+    text = "We extend BERT (Devlin et al. 2019) to long inputs. It works. A third one runs on"
+    first, second = sentences(text)[:2]
+    assert search_text(text, len(text)) == text  # it fits: unchanged
+    assert search_text(text, len(first) + len(second)) == first  # the second doesn't fit
+    assert search_text(text, len(first) + 1 + len(second)) == f"{first} {second}"
+    assert search_text(text, len(text) - 1) == f"{first} {second}"
+    # No sentence fits: the last word boundary that does ("et al." ends no sentence), or
+    # mid-word for one long word.
+    assert search_text(text, 35) == "We extend BERT (Devlin et al. 2019)"  # a space at 35
+    assert search_text(text, 33) == "We extend BERT (Devlin et al."  # inside "2019)"
+    assert search_text("x" * 20, 5) == "xxxxx"
 
 
 def test_published_before_filters_on_the_day_before(cfg: Config) -> None:

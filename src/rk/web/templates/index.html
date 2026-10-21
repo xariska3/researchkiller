@@ -9,7 +9,7 @@ It never declares an idea novel: a missing match is not proof of novelty.</p>
   <label for="text">Your idea ({{ min_words }}–{{ max_words }} words)</label>
   <textarea id="text" name="text" rows="9" required
     placeholder="Describe the problem, the method and what you expect to show."></textarea>
-  <div id="count" class="muted">0 words</div>
+  <div id="count" class="muted">0 words · 0 characters</div>
   <fieldset>
     <legend>Check</legend>
     <label><input type="radio" name="mode" value="full" checked> Full: an agent searches,
@@ -51,10 +51,20 @@ const button = document.getElementById("submit");
 const progress = document.getElementById("progress");
 const stage = document.getElementById("stage");
 const error = document.getElementById("error");
+const maxSearchChars = {{ max_search_chars }};  // live.max_search_chars
 
+// The idea's words and characters as the server counts them (trimmed; code points).
 text.addEventListener("input", () => {
-  const n = text.value.trim() ? text.value.trim().split(/\s+/).length : 0;
-  count.textContent = n + (n === 1 ? " word" : " words");
+  const idea = text.value.trim();
+  const n = idea ? idea.split(/\s+/).length : 0;
+  const chars = Array.from(idea).length;
+  let line = n + (n === 1 ? " word" : " words") + " · " + chars.toLocaleString("en")
+    + (chars === 1 ? " character" : " characters");
+  if (chars > maxSearchChars) {
+    line += " (over OpenAlex's " + maxSearchChars.toLocaleString("en")
+      + "-character search limit: the first search will use only the first part)";
+  }
+  count.textContent = line;
 });
 
 function fail(message) {
